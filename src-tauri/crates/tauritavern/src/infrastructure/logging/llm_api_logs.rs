@@ -4,7 +4,7 @@ mod repository;
 mod store;
 mod types;
 
-pub use repository::LoggingChatCompletionRepository;
+pub use repository::{LoggingChatCompletionRepository, LoggingStableDiffusionRepository};
 pub use store::LlmApiLogStore;
 #[allow(unused_imports)]
 pub use types::{LlmApiLogEntryPreview, LlmApiLogEntryRaw, LlmApiLogIndexEntry, LlmApiRawKind};

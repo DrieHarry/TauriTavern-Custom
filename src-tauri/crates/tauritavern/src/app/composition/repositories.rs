@@ -4,7 +4,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::infrastructure::apis::github_update_repository::GitHubUpdateRepository;
 use crate::infrastructure::logging::llm_api_logs::{
-    LlmApiLogStore, LoggingChatCompletionRepository,
+    LlmApiLogStore, LoggingChatCompletionRepository, LoggingStableDiffusionRepository,
 };
 use crate::infrastructure::paths::RuntimePaths;
 use crate::infrastructure::repositories::file_content_repository::FileContentRepository;
@@ -284,7 +284,7 @@ pub(super) async fn build(
     let chat_completion_repository: Arc<dyn ChatCompletionRepository> =
         Arc::new(LoggingChatCompletionRepository::new(
             Arc::new(HttpChatCompletionRepository::new(http_client_pool.clone())),
-            llm_api_log_store,
+            llm_api_log_store.clone(),
         ));
     let provider_metadata_repository: Arc<dyn ProviderMetadataRepository> = Arc::new(
         HttpProviderMetadataRepository::new(http_client_pool.clone()),
@@ -296,9 +296,12 @@ pub(super) async fn build(
     );
 
     let stable_diffusion_repository: Arc<dyn StableDiffusionRepository> =
-        Arc::new(HttpStableDiffusionRepository::new(
-            http_client_pool.clone(),
-            default_user_dir.join("user").join("workflows"),
+        Arc::new(LoggingStableDiffusionRepository::new(
+            Arc::new(HttpStableDiffusionRepository::new(
+                http_client_pool.clone(),
+                default_user_dir.join("user").join("workflows"),
+            )),
+            llm_api_log_store,
         ));
 
     let translate_repository: Arc<dyn TranslateRepository> =
