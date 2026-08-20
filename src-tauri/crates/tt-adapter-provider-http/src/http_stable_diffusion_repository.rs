@@ -1741,19 +1741,19 @@ async fn custom_openai_models(
             DomainError::InternalError(format!("Failed to parse Codex models JSON: {error}"))
         })?;
 
-        let mut models = Vec::new();
-        if let Some(items) = raw_json.get("models").or_else(|| raw_json.get("data")).and_then(Value::as_array) {
-            for item in items {
-                let id = item.get("id").or_else(|| item.get("name")).and_then(Value::as_str);
-                if let Some(id) = id {
-                    let name = item.get("name").or_else(|| item.get("display_name")).and_then(Value::as_str).unwrap_or(id);
-                    models.push(json!({
-                        "value": id,
-                        "text": name,
-                    }));
-                }
-            }
-        }
+        let parsed_models = crate::http_chat_completion_repository::codex::parse_codex_models_json(&raw_json);
+        let models: Vec<Value> = parsed_models
+            .into_iter()
+            .filter_map(|item| {
+                let id = item.get("id").and_then(Value::as_str)?;
+                let name = item.get("name").and_then(Value::as_str).unwrap_or(id);
+                Some(json!({
+                    "value": id,
+                    "text": name,
+                }))
+            })
+            .collect();
+
         return Ok(json_response(200, json!({ "data": models })));
     }
 
@@ -1920,23 +1920,16 @@ async fn codex_image_generate(
     let version = crate::codex_auth::client_version();
     let headers = crate::codex_auth::build_codex_headers(&auth, Some(&version), true)?;
 
-    let model = request
+    let raw_model = request
         .body
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("gpt-5.1");
+        .unwrap_or("")
+        .trim();
+    let model = if raw_model.is_empty() { "gpt-5.1" } else { raw_model };
 
-    let size = request
-        .body
-        .get("size")
-        .and_then(Value::as_str)
-        .unwrap_or("1024x1024");
-
-    let quality = request
-        .body
-        .get("quality")
-        .and_then(Value::as_str)
-        .unwrap_or("standard");
+    let size = normalize_codex_image_size(request.body.get("size").and_then(Value::as_str));
+    let quality = normalize_codex_image_quality(request.body.get("quality").and_then(Value::as_str));
 
     let image_tool = json!({
         "type": "image_generation",
@@ -1986,6 +1979,7 @@ async fn codex_image_generate(
     let mut stream = upstream.bytes_stream();
     let mut buffer = String::new();
     let mut image_base64: Option<String> = None;
+    let mut partial_image_base64: Option<String> = None;
 
     loop {
         if *cancel.borrow() {
@@ -2025,11 +2019,27 @@ async fn codex_image_generate(
                 }
 
                 if let Ok(event_json) = serde_json::from_str::<Value>(data_str) {
+                    if let Some(err_msg) = event_json
+                        .get("error")
+                        .or_else(|| event_json.get("response").and_then(|r| r.get("error")))
+                        .and_then(|e| e.get("message"))
+                        .and_then(Value::as_str)
+                    {
+                        return Ok(json_response(502, json!({ "error": { "message": err_msg } })));
+                    }
+
+                    if let Some(partial) = event_json.get("partial_image_b64").and_then(Value::as_str)
+                        && !partial.is_empty()
+                    {
+                        partial_image_base64 = Some(partial.to_string());
+                    }
+
                     if let Some(item) = event_json.get("item")
                         && let Some(b64) = extract_image_base64_from_item(item)
                     {
                         image_base64 = Some(b64);
                     }
+
                     if let Some(res) = event_json.get("response")
                         && let Some(output) = res.get("output").and_then(Value::as_array)
                     {
@@ -2044,14 +2054,62 @@ async fn codex_image_generate(
         }
     }
 
-    let Some(data_b64) = image_base64 else {
+    let Some(data_b64) = image_base64.or(partial_image_base64) else {
         return Ok(json_response(502, json!({ "error": { "message": "Codex completed request but did not return image data" } })));
     };
 
     Ok(json_response(200, json!({ "format": "png", "data": data_b64 })))
 }
 
+fn normalize_codex_image_size(value: Option<&str>) -> &'static str {
+    let Some(raw) = value else {
+        return "1024x1024";
+    };
+
+    let trimmed = raw.trim();
+    let Some((w_str, h_str)) = trimmed.split_once('x').or_else(|| trimmed.split_once('X')) else {
+        return "1024x1024";
+    };
+
+    let (Ok(w), Ok(h)) = (w_str.trim().parse::<f64>(), h_str.trim().parse::<f64>()) else {
+        return "1024x1024";
+    };
+
+    if w <= 0.0 || h <= 0.0 {
+        return "1024x1024";
+    }
+
+    let ratio = w / h;
+    if ratio > 1.2 {
+        "1536x1024"
+    } else if ratio < 0.83 {
+        "1024x1536"
+    } else {
+        "1024x1024"
+    }
+}
+
+fn normalize_codex_image_quality(value: Option<&str>) -> &'static str {
+    match value.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("low") => "low",
+        Some("medium") => "medium",
+        Some("high") => "high",
+        _ => "auto",
+    }
+}
+
 fn extract_image_base64_from_item(item: &Value) -> Option<String> {
+    if let Some(res_str) = item.get("result").and_then(Value::as_str) {
+        if res_str.starts_with("data:image/")
+            && let Some((_, data)) = res_str.split_once(',')
+        {
+            return Some(data.to_string());
+        }
+        if !res_str.is_empty() {
+            return Some(res_str.to_string());
+        }
+    }
+
     if let Some(b64) = item.get("result").and_then(|r| r.get("base64")).and_then(Value::as_str) {
         return Some(b64.to_string());
     }
@@ -2066,6 +2124,7 @@ fn extract_image_base64_from_item(item: &Value) -> Option<String> {
         }
         return Some(b64.to_string());
     }
+
     if let Some(b64) = item.get("base64").and_then(Value::as_str) {
         return Some(b64.to_string());
     }
@@ -2100,6 +2159,12 @@ mod tests {
 
     #[test]
     fn test_extract_image_base64_from_item() {
+        let item_string_result = json!({ "type": "image_generation_call", "result": "rawbase64pngstring" });
+        assert_eq!(
+            super::extract_image_base64_from_item(&item_string_result),
+            Some("rawbase64pngstring".to_string())
+        );
+
         let item_result_b64 = json!({ "result": { "base64": "abc123b64" } });
         assert_eq!(
             super::extract_image_base64_from_item(&item_result_b64),
@@ -2111,5 +2176,14 @@ mod tests {
             super::extract_image_base64_from_item(&item_data_url),
             Some("rawimagebytes".to_string())
         );
+    }
+
+    #[test]
+    fn test_normalize_codex_image_size() {
+        assert_eq!(super::normalize_codex_image_size(Some("512x512")), "1024x1024");
+        assert_eq!(super::normalize_codex_image_size(Some("1024x1024")), "1024x1024");
+        assert_eq!(super::normalize_codex_image_size(Some("1920x1080")), "1536x1024");
+        assert_eq!(super::normalize_codex_image_size(Some("1080x1920")), "1024x1536");
+        assert_eq!(super::normalize_codex_image_size(None), "1024x1024");
     }
 }

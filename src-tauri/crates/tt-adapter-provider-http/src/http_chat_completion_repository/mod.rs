@@ -16,7 +16,7 @@ use tt_ports::repositories::chat_completion_repository::{
 
 mod aws_bedrock;
 mod claude;
-mod codex;
+pub(crate) mod codex;
 mod cohere;
 mod gemini_interactions;
 mod makersuite;
