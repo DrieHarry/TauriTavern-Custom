@@ -113,14 +113,15 @@ If `pnpm run check` fails only because these test reports:
 
 `agent loop and host resolver timed out`
 `agent test timed out waiting for chat commits and persistent metadata update`
+`Agent run did not reach a terminal status`
 
 do not modify application code immediately.
 
-First rerun the test by itself, for example:
+First rerun the failed tests by itself, for example if `app::contract_tests::agent_runtime::execution::agent_runtime_foreground_auto_commits_once_per_round_until_explicit_commit`failed:
 
     cargo test --manifest-path src-tauri/Cargo.toml -p tauritavern --lib "app::contract_tests::agent_runtime::execution::agent_runtime_foreground_auto_commits_once_per_round_until_explicit_commit" -- --exact --nocapture
 
-If it passes, verify the tauritavern Rust tests serially, example:
+If it passes, verify the tauritavern Rust tests serially:
 
     cargo test --manifest-path src-tauri/Cargo.toml -p tauritavern --lib -- --test-threads=1
 
