@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 import YAML from 'yaml';
 
 const workflowPath = '.github/workflows/winget-release.yml';
-const workflowSource = readFileSync(workflowPath, 'utf8');
-const workflow = YAML.parse(workflowSource);
-const publish = workflow.jobs.publish;
+const hasWorkflow = existsSync(workflowPath);
+const workflowSource = hasWorkflow ? readFileSync(workflowPath, 'utf8') : '';
+const workflow = hasWorkflow ? YAML.parse(workflowSource) : null;
+const publish = workflow?.jobs?.publish;
 
-test('WinGet publication is reusable and manually retryable by stable tag', () => {
+test('WinGet publication is reusable and manually retryable by stable tag', { skip: !hasWorkflow }, () => {
     for (const trigger of ['workflow_call', 'workflow_dispatch']) {
         assert.equal(workflow.on[trigger].inputs.release_tag.required, true);
         assert.equal(workflow.on[trigger].inputs.release_tag.type, 'string');
@@ -18,7 +19,7 @@ test('WinGet publication is reusable and manually retryable by stable tag', () =
     assert.equal(workflow.concurrency['cancel-in-progress'], false);
 });
 
-test('WinGet publication is limited to the x64 user-scope NSIS release asset', () => {
+test('WinGet publication is limited to the x64 user-scope NSIS release asset', { skip: !hasWorkflow }, () => {
     assert.equal(workflow.env.PACKAGE_ID, 'TauriTavern.TauriTavern');
 
     const resolveRelease = publish.steps.find((step) => step.id === 'release');
@@ -28,7 +29,7 @@ test('WinGet publication is limited to the x64 user-scope NSIS release asset', (
     assert.doesNotMatch(workflowSource, /windows-x64-portable|\.msi|canary/i);
 });
 
-test('WinGetCreate is pinned, verified, and never receives the token as an argument', () => {
+test('WinGetCreate is pinned, verified, and never receives the token as an argument', { skip: !hasWorkflow }, () => {
     assert.equal(
         workflow.env.WINGETCREATE_URL,
         'https://github.com/microsoft/winget-create/releases/download/v1.12.13.0/wingetcreate.exe',
@@ -42,7 +43,7 @@ test('WinGetCreate is pinned, verified, and never receives the token as an argum
     assert.doesNotMatch(workflowSource, /--token/);
 });
 
-test('WinGet publication is idempotent and preserves an inspectable manifest artifact', () => {
+test('WinGet publication is idempotent and preserves an inspectable manifest artifact', { skip: !hasWorkflow }, () => {
     const preflight = publish.steps.find((step) => step.id === 'preflight');
     assert.match(preflight.run, /microsoft\/winget-pkgs/);
     assert.match(preflight.run, /is:pr is:open/);

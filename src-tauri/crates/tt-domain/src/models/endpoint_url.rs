@@ -2,6 +2,16 @@ use url::Url;
 
 use crate::errors::DomainError;
 
+pub const CODEX_LOCAL_ENDPOINT: &str = "http://codex.local/v1";
+
+pub fn is_codex_endpoint(raw: &str) -> bool {
+    let trimmed = raw.trim().trim_end_matches('/');
+    trimmed.eq_ignore_ascii_case("http://codex.local/v1")
+        || trimmed.eq_ignore_ascii_case("http://codex.local")
+        || trimmed.eq_ignore_ascii_case("https://codex.local/v1")
+        || trimmed.eq_ignore_ascii_case("https://codex.local")
+}
+
 pub fn parse_user_http_endpoint(raw: &str) -> Result<Url, DomainError> {
     let mut url = parse_endpoint_base(raw)?;
 

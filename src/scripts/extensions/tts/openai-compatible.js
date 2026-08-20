@@ -15,6 +15,7 @@ class OpenAICompatibleTtsProvider {
         voiceMap: {},
         model: 'tts-1',
         speed: 1,
+        instructions: '',
         available_voices: ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'],
         provider_endpoint: 'http://127.0.0.1:8000/v1/audio/speech',
     };
@@ -33,6 +34,12 @@ class OpenAICompatibleTtsProvider {
         </div>
         <label for="openai_compatible_model">Model:</label>
         <input id="openai_compatible_model" type="text" class="text_pole" maxlength="500" value="${this.defaultSettings.model}"/>
+        <label for="openai_compatible_tts_instructions">Voice Instructions:</label>
+        <textarea
+            id="openai_compatible_tts_instructions"
+            class="text_pole textarea_compact"
+            placeholder="e.g. Speak softly, warmly, and with a playful tone"
+        ></textarea>
         <label for="openai_compatible_tts_voices">Available Voices (comma separated):</label>
         <input id="openai_compatible_tts_voices" type="text" class="text_pole" value="${this.defaultSettings.available_voices.join()}"/>
         <label for="openai_compatible_tts_speed">Speed: <span id="openai_compatible_tts_speed_output"></span></label>
@@ -77,6 +84,11 @@ class OpenAICompatibleTtsProvider {
         $('#openai_compatible_model').val(this.defaultSettings.model);
         $('#openai_compatible_model').on('input', () => { this.onSettingsChange(); });
 
+        $('#openai_compatible_tts_instructions').val(this.settings.instructions || '');
+        $('#openai_compatible_tts_instructions').on('input', () => {
+            this.onSettingsChange();
+        });
+
         $('#openai_compatible_tts_voices').val(this.settings.available_voices.join());
         $('#openai_compatible_tts_voices').on('input', () => { this.onSettingsChange(); });
 
@@ -101,6 +113,7 @@ class OpenAICompatibleTtsProvider {
         // Update dynamically
         this.settings.provider_endpoint = String($('#openai_compatible_tts_endpoint').val());
         this.settings.model = String($('#openai_compatible_model').val());
+        this.settings.instructions = String($('#openai_compatible_tts_instructions').val());
         this.settings.available_voices = String($('#openai_compatible_tts_voices').val()).split(',');
         this.settings.speed = Number($('#openai_compatible_tts_speed').val());
         $('#openai_compatible_tts_speed_output').text(this.settings.speed);
@@ -168,6 +181,7 @@ class OpenAICompatibleTtsProvider {
                 voice: voiceId,
                 response_format: 'mp3',
                 speed: this.settings.speed,
+                instructions: this.settings.instructions,
             }),
         });
 

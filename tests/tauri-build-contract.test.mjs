@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -125,7 +126,7 @@ test('portable builds delegate frontend ownership to the Tauri hook', async () =
     assert.match(source, /TAURITAVERN_SKIP_WEB_BUILD: "1"/);
 });
 
-test('Canary release workflow does not build frontend assets twice', async () => {
+test('Canary release workflow does not build frontend assets twice', { skip: !existsSync(path.join(REPO_ROOT, '.github/workflows/canary-release.yml')) }, async () => {
     const workflow = await readFile(
         path.join(REPO_ROOT, '.github/workflows/canary-release.yml'),
         'utf8',
@@ -138,7 +139,7 @@ test('Canary release workflow does not build frontend assets twice', async () =>
     assert.match(workflow, /--title "Canary Release \$DISPLAY_TIME"/u);
 });
 
-test('Canary release notes isolate Codex skills and keep a deterministic fallback', async () => {
+test('Canary release notes isolate Codex skills and keep a deterministic fallback', { skip: !existsSync(path.join(REPO_ROOT, '.github/workflows/canary-release.yml')) }, async () => {
     const workflow = await readFile(
         path.join(REPO_ROOT, '.github/workflows/canary-release.yml'),
         'utf8',

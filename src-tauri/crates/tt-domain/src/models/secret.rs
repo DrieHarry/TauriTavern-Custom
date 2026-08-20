@@ -201,6 +201,7 @@ impl SecretKeys {
     pub const HUGGINGFACE: &'static str = "api_key_huggingface";
     pub const STABILITY: &'static str = "api_key_stability";
     pub const CUSTOM_OPENAI_TTS: &'static str = "api_key_custom_openai_tts";
+    pub const CUSTOM_OPENAI_SD: &'static str = "api_key_custom_openai_sd";
     pub const CHUTES: &'static str = "api_key_chutes";
     pub const ELECTRONHUB: &'static str = "api_key_electronhub";
     pub const NANOGPT: &'static str = "api_key_nanogpt";

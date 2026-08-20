@@ -138,7 +138,16 @@ impl ChatCompletionService {
             return Ok(None);
         };
 
-        config::resolve_user_configured_endpoint(source, &dto.reverse_proxy, &dto.custom_url)
+        let endpoint =
+            config::resolve_user_configured_endpoint(source, &dto.reverse_proxy, &dto.custom_url)?;
+        if endpoint
+            .as_ref()
+            .is_some_and(|url| tt_domain::models::endpoint_url::is_codex_endpoint(url))
+        {
+            return Ok(None);
+        }
+
+        Ok(endpoint)
     }
 
     pub fn resolve_generate_user_endpoint(
@@ -148,11 +157,19 @@ impl ChatCompletionService {
         let source = self.resolve_generate_source(dto)?;
         let custom_url = config::get_payload_string(&dto.payload, "custom_url")?;
 
-        config::resolve_user_configured_endpoint(
+        let endpoint = config::resolve_user_configured_endpoint(
             source,
             dto.get_string("reverse_proxy").unwrap_or_default(),
             &custom_url,
-        )
+        )?;
+        if endpoint
+            .as_ref()
+            .is_some_and(|url| tt_domain::models::endpoint_url::is_codex_endpoint(url))
+        {
+            return Ok(None);
+        }
+
+        Ok(endpoint)
     }
 
     fn ensure_chat_completion_source_allowed(

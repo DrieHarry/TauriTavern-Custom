@@ -79,11 +79,12 @@ fn apply_nanogpt_overrides(
 
 fn map_reasoning_effort(value: &str) -> Result<&'static str, ApplicationError> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "min" => Ok("none"),
-        "low" => Ok("minimal"),
+        "min" | "none" => Ok("none"),
+        "low" | "minimal" => Ok("minimal"),
         "medium" => Ok("low"),
         "high" => Ok("medium"),
-        "max" | "xhigh" => Ok("high"),
+        "xhigh" => Ok("high"),
+        "max" => Ok("xhigh"),
         other => Err(ApplicationError::ValidationError(format!(
             "Unsupported NanoGPT reasoning_effort: {other}"
         ))),
@@ -161,8 +162,8 @@ mod tests {
     }
 
     #[test]
-    fn nanogpt_payload_maps_xhigh_like_max() {
-        let payload = json!({
+    fn nanogpt_payload_maps_xhigh_and_max() {
+        let payload_xhigh = json!({
             "chat_completion_source": "nanogpt",
             "model": "gpt-4o-mini",
             "messages": [{"role": "user", "content": "hello"}],
@@ -172,12 +173,30 @@ mod tests {
         .cloned()
         .expect("payload must be object");
 
-        let (_endpoint, upstream) = build(payload).expect("build must succeed");
+        let (_endpoint, upstream) = build(payload_xhigh).expect("build must succeed");
         assert_eq!(
             upstream
                 .pointer("/reasoning/effort")
                 .and_then(Value::as_str),
             Some("high")
+        );
+
+        let payload_max = json!({
+            "chat_completion_source": "nanogpt",
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "max"
+        })
+        .as_object()
+        .cloned()
+        .expect("payload must be object");
+
+        let (_endpoint, upstream) = build(payload_max).expect("build must succeed");
+        assert_eq!(
+            upstream
+                .pointer("/reasoning/effort")
+                .and_then(Value::as_str),
+            Some("xhigh")
         );
     }
 

@@ -1,3 +1,4 @@
+pub mod codex_auth;
 mod endpoint_url;
 mod file_replace;
 mod http_chat_completion_repository;

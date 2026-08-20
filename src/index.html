@@ -2168,10 +2168,16 @@
                                                 <option data-i18n="openai_reasoning_effort_medium" value="medium">Medium</option>
                                                 <option data-i18n="openai_reasoning_effort_high" value="high">High</option>
                                                 <option data-i18n="openai_reasoning_effort_xhigh" value="xhigh">XHigh</option>
-                                                <option data-i18n="openai_reasoning_effort_maximum" value="max">Maximum</option>
+                                                 <option data-i18n="openai_reasoning_effort_maximum" value="max">Maximum</option>
                                             </select>
-                                            <div class="toggle-description justifyLeft marginBot5" data-source="openai,custom,xai,aimlapi,openrouter,pollinations,perplexity,cometapi,electronhub,azure_openai,chutes" data-i18n="Reasoning effort is ordered High, XHigh, Maximum. Provider adapters map these project levels to the nearest supported upstream value. Auto does not send an effort level.">
+                                            <div id="openai_reasoning_effort_description" class="toggle-description justifyLeft marginBot5" data-source="openai,custom,xai,aimlapi,openrouter,pollinations,perplexity,cometapi,electronhub,azure_openai,chutes" data-i18n="Reasoning effort is ordered High, XHigh, Maximum. Provider adapters map these project levels to the nearest supported upstream value. Auto does not send an effort level.">
                                                 Reasoning effort is ordered High, XHigh, Maximum. Provider adapters map these project levels to the nearest supported upstream value. Auto does not send an effort level.
+                                            </div>
+                                            <div id="codex_reasoning_effort_description" class="toggle-description justifyLeft marginBot5" style="display: none;">
+                                                Codex: Auto omits the setting. Minimum sends none, Extra High sends xhigh, and Maximum sends max on GPT-5.6 models.
+                                            </div>
+                                            <div id="nanogpt_reasoning_effort_description" class="toggle-description justifyLeft marginBot5" style="display: none;">
+                                                NanoGPT mapping: Auto omits the setting; Minimum through Maximum send none, minimal, low, medium, high, and xhigh.
                                             </div>
                                             <div class="toggle-description justifyLeft marginBot5" data-source="deepseek" data-i18n="DeepSeek options: Auto omits the effort field, Minimum through XHigh request high effort, and Maximum requests max effort.">
                                                 DeepSeek options: Auto omits the effort field, Minimum through XHigh request high effort, and Maximum requests max effort.

@@ -328,6 +328,17 @@ export const reasoning_effort_types = {
     max: 'max',
 };
 
+export const LOCAL_CODEX_API_URL = 'http://codex.local/v1';
+
+export function isLocalCodexConnection(settings = oai_settings) {
+    const customUrl = String(settings?.custom_url || '').replace(/\/+$/, '');
+    return settings?.chat_completion_source === chat_completion_sources.CUSTOM && customUrl === LOCAL_CODEX_API_URL;
+}
+
+export function codexModelSupportsMaximumReasoning(model) {
+    return /^gpt-5\.6(?:$|-(?:luna|terra|sol)(?:$|-))/i.test(String(model || ''));
+}
+
 const OPENAI_GPT56_MODEL_PATTERN = /^gpt-5\.6(?:-(?:sol|terra|luna))?$/;
 
 export const verbosity_levels = {
@@ -4068,6 +4079,23 @@ function getReasoningEffort(settings = null, model = null) {
         return getZaiReasoningEffort(settings, model);
     }
 
+    if (isLocalCodexConnection(settings)) {
+        switch (settings.reasoning_effort) {
+            case reasoning_effort_types.auto:
+                return undefined;
+            case reasoning_effort_types.min:
+                return 'none';
+            case reasoning_effort_types.max:
+                return codexModelSupportsMaximumReasoning(model) ? 'max' : 'xhigh';
+            default:
+                return settings.reasoning_effort;
+        }
+    }
+
+    if (settings.chat_completion_source === chat_completion_sources.NANOGPT) {
+        return settings.reasoning_effort === reasoning_effort_types.auto ? undefined : settings.reasoning_effort;
+    }
+
     if (usesClaudeMessagesSemantics(settings, model)) {
         if (settings.reasoning_effort === reasoning_effort_types.auto) {
             return undefined;
@@ -4830,6 +4858,12 @@ export function getStreamingReply(data, state, { chatCompletionSource = null, mo
         });
         return data.choices?.[0]?.delta?.content ?? data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text ?? '';
     } else if ([chat_completion_sources.CUSTOM, chat_completion_sources.POLLINATIONS, chat_completion_sources.AIMLAPI, chat_completion_sources.MOONSHOT, chat_completion_sources.COMETAPI, chat_completion_sources.ELECTRONHUB, chat_completion_sources.NANOGPT, chat_completion_sources.ZAI, chat_completion_sources.SILICONFLOW, chat_completion_sources.CHUTES, chat_completion_sources.WORKERS_AI].includes(chat_completion_source)) {
+        const imageUrls = data?.choices?.[0]?.delta?.images?.filter(x => x.type === 'image_url')?.map(x => x?.image_url?.url)
+            || data?.choices?.[0]?.message?.images?.filter(x => x.type === 'image_url')?.map(x => x?.image_url?.url)
+            || [];
+        if (Array.isArray(imageUrls) && imageUrls.length > 0) {
+            state.images.push(...imageUrls.filter(isDataURL));
+        }
         if (show_thoughts) {
             state.reasoning +=
                 data.choices?.filter(x => x?.delta?.reasoning_content)?.[0]?.delta?.reasoning_content ??
@@ -8624,6 +8658,42 @@ function updateVertexAIServiceAccountStatus(isValid = false, message = '') {
     }
 }
 
+export function updateReasoningEffortOptions() {
+    const select = $('#openai_reasoning_effort');
+    if (!select.length) {
+        return;
+    }
+
+    const isCodex = isLocalCodexConnection();
+    const isNanoGpt = oai_settings.chat_completion_source === chat_completion_sources.NANOGPT;
+    const showExtraHigh = isCodex || isNanoGpt;
+    const showMaximum = !isCodex || codexModelSupportsMaximumReasoning(getChatCompletionModel());
+
+    select.find(`option[value="${reasoning_effort_types.xhigh}"]`)
+        .prop('hidden', !showExtraHigh)
+        .prop('disabled', !showExtraHigh);
+    select.find(`option[value="${reasoning_effort_types.max}"]`)
+        .prop('hidden', !showMaximum)
+        .prop('disabled', !showMaximum);
+
+    let selectedEffort = oai_settings.reasoning_effort || reasoning_effort_types.auto;
+    if (isCodex && selectedEffort === reasoning_effort_types.max && !showMaximum) {
+        selectedEffort = reasoning_effort_types.xhigh;
+    } else if (!showExtraHigh && selectedEffort === reasoning_effort_types.xhigh) {
+        selectedEffort = reasoning_effort_types.max;
+    }
+
+    if (selectedEffort !== oai_settings.reasoning_effort) {
+        oai_settings.reasoning_effort = selectedEffort;
+        saveSettingsDebounced();
+    }
+    select.val(selectedEffort);
+
+    $('#openai_reasoning_effort_description').toggle(!isCodex && !isNanoGpt);
+    $('#codex_reasoning_effort_description').toggle(isCodex);
+    $('#nanogpt_reasoning_effort_description').toggle(isNanoGpt);
+}
+
 function updateFeatureSupportFlags() {
     const featureFlags = {
         openai_function_calling_supported: ToolManager.isToolCallingSupported(),
@@ -8641,6 +8711,7 @@ function updateFeatureSupportFlags() {
 
     const model = getChatCompletionModel();
     $('#continue_prefill_block').toggle(!isDirectGeminiSource() || !['gemini-3.5-flash-lite', 'gemini-3.6-flash'].includes(model));
+    updateReasoningEffortOptions();
 }
 
 export function initOpenAI() {
@@ -8997,6 +9068,7 @@ export function initOpenAI() {
     $('#custom_api_url_text').on('input', function () {
         oai_settings.custom_url = String($(this).val());
         updateCustomEndpointPreview();
+        updateFeatureSupportFlags();
         saveSettingsDebounced();
     });
 
@@ -9012,6 +9084,7 @@ export function initOpenAI() {
 
     $('#custom_model_id').on('input', function () {
         oai_settings.custom_model = String($(this).val());
+        updateFeatureSupportFlags();
         saveSettingsDebounced();
     });
 

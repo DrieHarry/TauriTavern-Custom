@@ -16,6 +16,7 @@ use tt_ports::repositories::chat_completion_repository::{
 
 mod aws_bedrock;
 mod claude;
+mod codex;
 mod cohere;
 mod gemini_interactions;
 mod makersuite;
@@ -139,7 +140,9 @@ impl HttpChatCompletionRepository {
         config: &ChatCompletionApiConfig,
         profile: HttpClientProfile,
     ) -> Result<Client, DomainError> {
-        if config.user_configured_endpoint {
+        if config.user_configured_endpoint
+            && !tt_domain::models::endpoint_url::is_codex_endpoint(&config.base_url)
+        {
             self.http_clients
                 .user_endpoint_client(profile, &config.base_url)
         } else {
@@ -148,7 +151,9 @@ impl HttpChatCompletionRepository {
     }
 
     fn stream_client(&self, config: &ChatCompletionApiConfig) -> Result<Client, DomainError> {
-        if config.user_configured_endpoint {
+        if config.user_configured_endpoint
+            && !tt_domain::models::endpoint_url::is_codex_endpoint(&config.base_url)
+        {
             self.http_clients
                 .user_endpoint_client(HttpClientProfile::ChatCompletionStream, &config.base_url)
         } else {
@@ -161,7 +166,9 @@ impl HttpChatCompletionRepository {
         &self,
         config: &ChatCompletionApiConfig,
     ) -> Result<(Client, u64), DomainError> {
-        if config.user_configured_endpoint {
+        if config.user_configured_endpoint
+            && !tt_domain::models::endpoint_url::is_codex_endpoint(&config.base_url)
+        {
             self.http_clients.user_endpoint_client_with_revision(
                 HttpClientProfile::ChatCompletionWebSocket,
                 &config.base_url,
@@ -539,17 +546,23 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
         source: ChatCompletionSource,
         config: &ChatCompletionApiConfig,
     ) -> Result<Value, DomainError> {
+        if tt_domain::models::endpoint_url::is_codex_endpoint(&config.base_url) {
+            return codex::list_models(self, config, "ChatGPT Codex").await;
+        }
+
         let source_name = source.display_name();
 
         match source {
             ChatCompletionSource::OpenAi
             | ChatCompletionSource::OpenRouter
-            | ChatCompletionSource::Custom
             | ChatCompletionSource::DeepSeek
             | ChatCompletionSource::Groq
             | ChatCompletionSource::Moonshot
             | ChatCompletionSource::Chutes
             | ChatCompletionSource::Zai => openai::list_models(self, config, source_name).await,
+            ChatCompletionSource::Custom => {
+                openai::list_models(self, config, source_name).await
+            }
             ChatCompletionSource::SiliconFlow => {
                 openai::list_models_with_path(
                     self,
@@ -582,6 +595,10 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
         endpoint_path: &str,
         payload: &Value,
     ) -> Result<ChatCompletionRepositoryGenerateResponse, DomainError> {
+        if tt_domain::models::endpoint_url::is_codex_endpoint(&config.base_url) {
+            return codex::generate(self, config, endpoint_path, payload, "ChatGPT Codex").await;
+        }
+
         let source_name = source.display_name();
 
         match source {
@@ -661,6 +678,19 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
         sender: ChatCompletionStreamSender,
         cancel: ChatCompletionCancelReceiver,
     ) -> Result<(), DomainError> {
+        if tt_domain::models::endpoint_url::is_codex_endpoint(&config.base_url) {
+            return codex::generate_stream(
+                self,
+                config,
+                endpoint_path,
+                payload,
+                "ChatGPT Codex",
+                sender,
+                cancel,
+            )
+            .await;
+        }
+
         let source_name = source.display_name();
 
         match source {

@@ -173,6 +173,7 @@ impl TtsService {
                     model: string_or_default(&body, "model", "tts-1"),
                     response_format: string_or_default(&body, "response_format", "mp3"),
                     speed: finite_f64_or_default(&body, "speed", 1.0).unwrap_or(1.0),
+                    instructions: optional_content(&body, "instructions"),
                 })
             }
             "openai/electronhub/models" => {

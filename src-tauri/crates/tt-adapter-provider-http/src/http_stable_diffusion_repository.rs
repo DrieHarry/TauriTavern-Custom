@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
 use tokio::fs;
@@ -16,7 +17,7 @@ use crate::workers_ai_endpoint::workers_ai_run_url;
 use crate::workers_ai_models::{fetch_workers_ai_models, workers_ai_model_name};
 use tt_adapter_http::{HttpClientPool, HttpClientProfile};
 use tt_domain::errors::DomainError;
-use tt_domain::models::endpoint_url::append_endpoint_path;
+use tt_domain::models::endpoint_url::{append_endpoint_path, parse_user_http_endpoint};
 use tt_domain::models::filename::sanitize_filename;
 use tt_ports::repositories::stable_diffusion_repository::{
     SdRouteCredentials, SdRouteRequest, SdRouteResponse, SdRouteResponseKind,
@@ -99,6 +100,12 @@ impl StableDiffusionRepository for HttpStableDiffusionRepository {
             }
             "drawthings/generate" => {
                 drawthings_generate(&self.http_clients, &request.body, cancel).await
+            }
+
+            // Custom OpenAI-compatible / Codex
+            "custom-openai/models" => custom_openai_models(&self.http_clients, &request).await,
+            "custom-openai/generate" => {
+                custom_openai_generate(&self.http_clients, &request, cancel).await
             }
 
             // Cloud endpoints intentionally not implemented in this build.
@@ -1336,7 +1343,9 @@ fn workers_ai_api_key(request: &SdRouteRequest) -> Result<&str, SdRouteResponse>
                 Ok(api_key)
             }
         }
-        SdRouteCredentials::None => Err(text(400, "Cloudflare Workers AI API key is required")),
+        SdRouteCredentials::None | SdRouteCredentials::CustomOpenAi { .. } => {
+            Err(text(400, "Cloudflare Workers AI API key is required"))
+        }
     }
 }
 
@@ -1693,6 +1702,387 @@ async fn drawthings_generate(
     Ok(json_response(200, value))
 }
 
+async fn custom_openai_models(
+    http_clients: &Arc<HttpClientPool>,
+    request: &SdRouteRequest,
+) -> Result<SdRouteResponse, DomainError> {
+    let url_str = match required_body_string_response(
+        &request.body,
+        "url",
+        "Custom OpenAI-compatible URL is required",
+    ) {
+        Ok(url) => url,
+        Err(response) => return Ok(response),
+    };
+
+    if tt_domain::models::endpoint_url::is_codex_endpoint(&url_str) {
+        let client = http_clients.client(HttpClientProfile::ProviderMetadata)?;
+        let auth_mgr = crate::codex_auth::CodexAuthManager::default();
+        let auth = auth_mgr.load_auth(&client).await?;
+        let version = crate::codex_auth::client_version();
+        let headers = crate::codex_auth::build_codex_headers(&auth, Some(&version), false)?;
+
+        let url = format!("{}/models?client_version={version}", crate::codex_auth::CODEX_BASE_URL);
+        let response = client
+            .get(&url)
+            .headers(headers)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|error| DomainError::InternalError(format!("Codex model lookup failed: {error}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Ok(json_response(status, json!({ "error": { "message": text } })));
+        }
+
+        let raw_json: Value = response.json().await.map_err(|error| {
+            DomainError::InternalError(format!("Failed to parse Codex models JSON: {error}"))
+        })?;
+
+        let mut models = Vec::new();
+        if let Some(items) = raw_json.get("models").or_else(|| raw_json.get("data")).and_then(Value::as_array) {
+            for item in items {
+                let id = item.get("id").or_else(|| item.get("name")).and_then(Value::as_str);
+                if let Some(id) = id {
+                    let name = item.get("name").or_else(|| item.get("display_name")).and_then(Value::as_str).unwrap_or(id);
+                    models.push(json!({
+                        "value": id,
+                        "text": name,
+                    }));
+                }
+            }
+        }
+        return Ok(json_response(200, json!({ "data": models })));
+    }
+
+    let base_url = parse_user_http_endpoint(&url_str)?;
+    let target = append_endpoint_path(base_url.as_str(), "/models")?;
+    let client = http_clients.client(HttpClientProfile::ProviderMetadata)?;
+    let mut builder = client.get(target).header(reqwest::header::ACCEPT, "application/json");
+
+    if let SdRouteCredentials::CustomOpenAi { api_key: Some(ref key) } = request.credentials
+        && !key.is_empty()
+    {
+        builder = builder.bearer_auth(key);
+    }
+
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| DomainError::InternalError(format!("Failed to fetch custom models: {error}")))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text_content = response.text().await.unwrap_or_default();
+        return Ok(text(status, text_content));
+    }
+
+    let data: Value = response
+        .json()
+        .await
+        .map_err(|error| DomainError::InternalError(format!("Failed to parse custom models JSON: {error}")))?;
+
+    let models = (data.get("data").and_then(Value::as_array))
+        .map(|arr| {
+            arr.iter()
+                .filter(|m| {
+                    m.get("type")
+                        .and_then(Value::as_str)
+                        .is_none_or(|t| t == "image")
+                })
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(Value::as_str)?;
+                    let name = m.get("name").and_then(Value::as_str).unwrap_or(id);
+                    Some(json!({ "value": id, "text": name }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(json_response(200, json!({ "data": models })))
+}
+
+async fn custom_openai_generate(
+    http_clients: &Arc<HttpClientPool>,
+    request: &SdRouteRequest,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<SdRouteResponse, DomainError> {
+    let url_str = match required_body_string_response(
+        &request.body,
+        "url",
+        "Custom OpenAI-compatible URL is required",
+    ) {
+        Ok(url) => url,
+        Err(response) => return Ok(response),
+    };
+
+    if tt_domain::models::endpoint_url::is_codex_endpoint(&url_str) {
+        return codex_image_generate(http_clients, request, cancel).await;
+    }
+
+    let prompt = match required_body_string_response(
+        &request.body,
+        "prompt",
+        "An image prompt is required",
+    ) {
+        Ok(prompt) => prompt,
+        Err(response) => return Ok(response),
+    };
+    let _ = prompt;
+
+    let base_url = parse_user_http_endpoint(&url_str)?;
+    let target = append_endpoint_path(base_url.as_str(), "/images/generations")?;
+
+    let mut body = request.body.clone();
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("url");
+    }
+
+    let client = http_client(http_clients)?;
+    let mut builder = client
+        .post(target)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&body);
+
+    if let SdRouteCredentials::CustomOpenAi { api_key: Some(ref key) } = request.credentials
+        && !key.is_empty()
+    {
+        builder = builder.bearer_auth(key);
+    }
+
+    let response = tokio::select! {
+        res = builder.send() => res.map_err(|error| DomainError::InternalError(error.to_string()))?,
+        changed = cancel.changed() => {
+            let _ = changed;
+            return Err(DomainError::generation_cancelled_by_user());
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text_content = response.text().await.unwrap_or_default();
+        return Ok(text(status, text_content));
+    }
+
+    let data: Value = response
+        .json()
+        .await
+        .map_err(|error| DomainError::InternalError(format!("Failed to parse image response: {error}")))?;
+
+    let image = data
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first());
+
+    let Some(image) = image else {
+        return Ok(text(500, "Custom endpoint returned no image data"));
+    };
+
+    let mut b64_str = image.get("b64_json").and_then(Value::as_str).map(str::to_string);
+
+    if b64_str.is_none() && let Some(image_url) = image.get("url").and_then(Value::as_str) {
+        let img_resp = client.get(image_url).send().await.map_err(|error| {
+            DomainError::InternalError(format!("Failed to download image URL: {error}"))
+        })?;
+        let bytes = img_resp.bytes().await.map_err(|error| {
+            DomainError::InternalError(format!("Failed to read image bytes: {error}"))
+        })?;
+        b64_str = Some(base64::engine::general_purpose::STANDARD.encode(&bytes));
+    }
+
+    let Some(data_b64) = b64_str else {
+        return Ok(text(500, "Unsupported image response format"));
+    };
+
+    Ok(json_response(200, json!({ "format": "png", "data": data_b64 })))
+}
+
+async fn codex_image_generate(
+    http_clients: &Arc<HttpClientPool>,
+    request: &SdRouteRequest,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<SdRouteResponse, DomainError> {
+    let prompt = match required_body_string_response(
+        &request.body,
+        "prompt",
+        "An image prompt is required",
+    ) {
+        Ok(prompt) => prompt,
+        Err(response) => return Ok(response),
+    };
+
+    let client = http_clients.client(HttpClientProfile::ImageGeneration)?;
+    let auth_mgr = crate::codex_auth::CodexAuthManager::default();
+    let auth = auth_mgr.load_auth(&client).await?;
+    let version = crate::codex_auth::client_version();
+    let headers = crate::codex_auth::build_codex_headers(&auth, Some(&version), true)?;
+
+    let model = request
+        .body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("gpt-5.1");
+
+    let size = request
+        .body
+        .get("size")
+        .and_then(Value::as_str)
+        .unwrap_or("1024x1024");
+
+    let quality = request
+        .body
+        .get("quality")
+        .and_then(Value::as_str)
+        .unwrap_or("standard");
+
+    let image_tool = json!({
+        "type": "image_generation",
+        "action": "generate",
+        "size": size,
+        "quality": quality,
+        "output_format": "png",
+        "background": "auto",
+    });
+
+    let request_body = json!({
+        "model": model,
+        "instructions": "Generate exactly one image from the user prompt. Use the image generation tool. Do not answer with a textual description instead.",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": prompt,
+                    }
+                ]
+            }
+        ],
+        "store": false,
+        "stream": true,
+        "tools": [image_tool],
+        "tool_choice": { "type": "image_generation" },
+    });
+
+    let target = format!("{}/responses", crate::codex_auth::CODEX_BASE_URL);
+    let upstream = client
+        .post(&target)
+        .headers(headers)
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|error| DomainError::InternalError(format!("Codex image request failed: {error}")))?;
+
+    if !upstream.status().is_success() {
+        let status = upstream.status().as_u16();
+        let text = upstream.text().await.unwrap_or_default();
+        return Ok(json_response(status, json!({ "error": { "message": text } })));
+    }
+
+    let mut stream = upstream.bytes_stream();
+    let mut buffer = String::new();
+    let mut image_base64: Option<String> = None;
+
+    loop {
+        if *cancel.borrow() {
+            return Err(DomainError::generation_cancelled_by_user());
+        }
+
+        let chunk = tokio::select! {
+            _ = cancel.changed() => {
+                if *cancel.borrow() {
+                    return Err(DomainError::generation_cancelled_by_user());
+                }
+                continue;
+            }
+            chunk = stream.next() => chunk,
+        };
+
+        let Some(chunk_result) = chunk else {
+            break;
+        };
+
+        let chunk = chunk_result.map_err(|error| {
+            DomainError::InternalError(format!("Error reading Codex image stream: {error}"))
+        })?;
+
+        let text = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&text);
+
+        while let Some(newline_pos) = buffer.find('\n') {
+            let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
+            buffer.drain(..=newline_pos);
+
+            let line = line.trim();
+            if let Some(data_str) = line.strip_prefix("data:") {
+                let data_str = data_str.trim();
+                if data_str.is_empty() || data_str == "[DONE]" {
+                    continue;
+                }
+
+                if let Ok(event_json) = serde_json::from_str::<Value>(data_str) {
+                    if let Some(item) = event_json.get("item")
+                        && let Some(b64) = extract_image_base64_from_item(item)
+                    {
+                        image_base64 = Some(b64);
+                    }
+                    if let Some(res) = event_json.get("response")
+                        && let Some(output) = res.get("output").and_then(Value::as_array)
+                    {
+                        for item in output {
+                            if let Some(b64) = extract_image_base64_from_item(item) {
+                                image_base64 = Some(b64);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let Some(data_b64) = image_base64 else {
+        return Ok(json_response(502, json!({ "error": { "message": "Codex completed request but did not return image data" } })));
+    };
+
+    Ok(json_response(200, json!({ "format": "png", "data": data_b64 })))
+}
+
+fn extract_image_base64_from_item(item: &Value) -> Option<String> {
+    if let Some(b64) = item.get("result").and_then(|r| r.get("base64")).and_then(Value::as_str) {
+        return Some(b64.to_string());
+    }
+    if let Some(b64) = item.get("result").and_then(|r| r.get("image_base64")).and_then(Value::as_str) {
+        return Some(b64.to_string());
+    }
+    if let Some(b64) = item.get("result").and_then(|r| r.get("image")).and_then(Value::as_str) {
+        if b64.starts_with("data:image/")
+            && let Some((_, data)) = b64.split_once(',')
+        {
+            return Some(data.to_string());
+        }
+        return Some(b64.to_string());
+    }
+    if let Some(b64) = item.get("base64").and_then(Value::as_str) {
+        return Some(b64.to_string());
+    }
+    if let Some(b64) = item.get("image_base64").and_then(Value::as_str) {
+        return Some(b64.to_string());
+    }
+    if let Some(b64) = item.get("image").and_then(Value::as_str) {
+        if b64.starts_with("data:image/")
+            && let Some((_, data)) = b64.split_once(',')
+        {
+            return Some(data.to_string());
+        }
+        return Some(b64.to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::optional_nonnegative_number_value;
@@ -1705,6 +2095,21 @@ mod tests {
         assert_eq!(
             optional_nonnegative_number_value(&body, "seed").expect("read seed"),
             None
+        );
+    }
+
+    #[test]
+    fn test_extract_image_base64_from_item() {
+        let item_result_b64 = json!({ "result": { "base64": "abc123b64" } });
+        assert_eq!(
+            super::extract_image_base64_from_item(&item_result_b64),
+            Some("abc123b64".to_string())
+        );
+
+        let item_data_url = json!({ "result": { "image": "data:image/png;base64,rawimagebytes" } });
+        assert_eq!(
+            super::extract_image_base64_from_item(&item_data_url),
+            Some("rawimagebytes".to_string())
         );
     }
 }

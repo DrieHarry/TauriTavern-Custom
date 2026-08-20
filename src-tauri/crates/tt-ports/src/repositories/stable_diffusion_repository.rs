@@ -15,6 +15,7 @@ pub struct SdRouteRequest {
 pub enum SdRouteCredentials {
     None,
     WorkersAi { api_key: String },
+    CustomOpenAi { api_key: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

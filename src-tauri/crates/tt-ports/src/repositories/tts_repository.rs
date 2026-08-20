@@ -77,6 +77,7 @@ pub enum OpenAiTtsRequest {
         model: String,
         response_format: String,
         speed: f64,
+        instructions: Option<String>,
     },
 }
 

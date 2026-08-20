@@ -51,6 +51,14 @@ impl StableDiffusionService {
                 ));
             };
             SdRouteCredentials::WorkersAi { api_key }
+        } else if matches!(path.as_str(), "custom-openai/models" | "custom-openai/generate") {
+            let api_key = self
+                .secret_repository
+                .read_secret(SecretKeys::CUSTOM_OPENAI_SD, None)
+                .await?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            SdRouteCredentials::CustomOpenAi { api_key }
         } else {
             SdRouteCredentials::None
         };

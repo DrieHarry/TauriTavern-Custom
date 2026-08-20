@@ -199,6 +199,7 @@ async fn resolve_api_config(
     match source {
         ChatCompletionSource::Custom => {
             let base_url = user_endpoint.expect("custom sources require a configured endpoint");
+            let is_codex = tt_domain::models::endpoint_url::is_codex_endpoint(&base_url);
             let extra_headers = source_extra_headers(source);
             let uses_reverse_proxy = custom_url.is_empty() && !reverse_proxy.is_empty();
 
@@ -212,7 +213,7 @@ async fn resolve_api_config(
 
             Ok(ChatCompletionApiConfig {
                 base_url,
-                user_configured_endpoint: true,
+                user_configured_endpoint: !is_codex,
                 api_key,
                 authorization_header: None,
                 vertexai_service_account_json: None,
@@ -224,7 +225,9 @@ async fn resolve_api_config(
             })
         }
         _ => {
-            let user_configured_endpoint = user_endpoint.is_some();
+            let user_configured_endpoint = user_endpoint
+                .as_ref()
+                .is_some_and(|url| !tt_domain::models::endpoint_url::is_codex_endpoint(url));
             let base_url = match user_endpoint {
                 Some(endpoint) => endpoint,
                 None => default_base_url(source, purpose, &hints)?,
@@ -1711,5 +1714,47 @@ mod tests {
                 .map(String::as_str),
             Some("Bearer hacked")
         );
+    }
+
+    #[tokio::test]
+    async fn codex_status_config_sets_user_configured_endpoint_to_false() {
+        let secret_repository: Arc<dyn SecretRepository> =
+            Arc::new(TestSecretRepository::with_entries(&[]));
+        let dto = ChatCompletionStatusRequestDto {
+            chat_completion_source: "custom".to_string(),
+            custom_url: "http://codex.local/v1".to_string(),
+            ..Default::default()
+        };
+
+        let config =
+            resolve_status_api_config(ChatCompletionSource::Custom, &dto, &secret_repository)
+                .await
+                .expect("status config should resolve");
+
+        assert_eq!(config.base_url, "http://codex.local/v1");
+        assert!(!config.user_configured_endpoint);
+    }
+
+    #[tokio::test]
+    async fn codex_generate_config_sets_user_configured_endpoint_to_false() {
+        let secret_repository: Arc<dyn SecretRepository> =
+            Arc::new(TestSecretRepository::with_entries(&[]));
+        let dto = ChatCompletionGenerateRequestDto {
+            payload: json!({
+                "chat_completion_source": "custom",
+                "custom_url": "http://codex.local/v1"
+            })
+            .as_object()
+            .cloned()
+            .expect("payload should be object"),
+        };
+
+        let config =
+            resolve_generate_for_test(ChatCompletionSource::Custom, &dto, &secret_repository)
+                .await
+                .expect("generate config should resolve");
+
+        assert_eq!(config.base_url, "http://codex.local/v1");
+        assert!(!config.user_configured_endpoint);
     }
 }
