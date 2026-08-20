@@ -51,7 +51,7 @@ jobs:
 
       # Build only NSIS so the normal installer output is an .exe, not an MSI.
       - name: Build Windows installer EXE
-        run: pnpm run tauri:build -- --bundles nsis
+        run: node scripts/tauri-app.mjs --prepare-frontend build --bundles nsis
 
       - name: Collect Windows installer
         shell: pwsh
@@ -207,7 +207,10 @@ jobs:
         env:
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: >-
-          pnpm run android:build --
+          node scripts/tauri-app.mjs
+          --prepare-frontend
+          android
+          build
           --verbose
           --apk
           --split-per-abi
