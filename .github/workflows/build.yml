@@ -1,0 +1,260 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TAURITAVERN_BUILD_BRANCH: ${{ github.ref_name }}
+  TAURITAVERN_BUILD_REVISION: ${{ github.sha }}
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build only NSIS so the normal installer output is an .exe, not an MSI.
+      - name: Build Windows installer EXE
+        run: pnpm run tauri:build -- --bundles nsis
+
+      - name: Collect Windows installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
+
+          $installers = @(
+            Get-ChildItem `
+              -Path "src-tauri\target\release\bundle\nsis" `
+              -Filter "*.exe" `
+              -File
+          )
+
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer EXE, found $($installers.Count)."
+          }
+
+          Copy-Item `
+            $installers[0].FullName `
+            "artifacts\TauriTavern-Windows-x64-Setup.exe"
+
+      # The upstream portable script builds --no-bundle with the portable feature.
+      # Reuse the frontend that was already built by the installer step.
+      - name: Build Windows portable EXE
+        run: node scripts/build-portable.mjs --skip-web-build --output-dir artifacts
+
+      - name: Verify Windows artifacts
+        shell: pwsh
+        run: |
+          $required = @(
+            "artifacts\TauriTavern-Windows-x64-Setup.exe",
+            "artifacts\TauriTavern-windows-x64-portable.exe"
+          )
+
+          foreach ($file in $required) {
+            if (-not (Test-Path $file -PathType Leaf)) {
+              throw "Missing expected artifact: $file"
+            }
+          }
+
+      - name: Upload Windows installer EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: TauriTavern-Windows-x64-Setup
+          path: artifacts/TauriTavern-Windows-x64-Setup.exe
+          if-no-files-found: error
+
+      - name: Upload Windows portable EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: TauriTavern-Windows-x64-Portable
+          path: artifacts/TauriTavern-windows-x64-portable.exe
+          if-no-files-found: error
+
+  android:
+    name: Android arm64-v8a signed release
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Android host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev
+
+      - name: Install stable Rust with Android ARM64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+          cache-dependency-path: |
+            src-tauri/crates/tauritavern/gen/android/**/*.gradle*
+            src-tauri/crates/tauritavern/gen/android/**/gradle-wrapper.properties
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+          link-to-sdk: true
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Same signing approach used by upstream:
+      #   ANDROID_KEY_ALIAS
+      #   ANDROID_KEY_PASSWORD
+      #   ANDROID_KEY_BASE64
+      - name: Setup Android release signing
+        shell: bash
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          : "${ANDROID_KEY_ALIAS:?Missing ANDROID_KEY_ALIAS repository secret}"
+          : "${ANDROID_KEY_PASSWORD:?Missing ANDROID_KEY_PASSWORD repository secret}"
+          : "${ANDROID_KEY_BASE64:?Missing ANDROID_KEY_BASE64 repository secret}"
+
+          cd src-tauri/crates/tauritavern/gen/android
+
+          {
+            echo "keyAlias=$ANDROID_KEY_ALIAS"
+            echo "password=$ANDROID_KEY_PASSWORD"
+            echo "storeFile=$RUNNER_TEMP/keystore.jks"
+          } > keystore.properties
+
+          printf '%s' "$ANDROID_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/keystore.jks"
+
+      # Upstream enables this before its normal signed Android bundle build.
+      - name: Enable Android HTTP access
+        shell: bash
+        run: ./scripts/ci/configure-mobile-http.sh enable android
+
+      # Release build: no --debug.
+      # aarch64 = Android arm64-v8a.
+      # --split-per-abi + one target gives only the ARM64 APK.
+      - name: Build signed Android arm64-v8a APK
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: >-
+          pnpm run android:build --
+          --verbose
+          --apk
+          --split-per-abi
+          --target aarch64
+
+      - name: Collect signed Android arm64-v8a APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts
+
+          mapfile -t apks < <(
+            find src-tauri/crates/tauritavern/gen/android/app/build/outputs/apk \
+              -type f \
+              -path '*/release/*.apk' \
+              -print
+          )
+
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo "Expected exactly one release APK, found ${#apks[@]}:"
+            printf '  %s\n' "${apks[@]:-}"
+            exit 1
+          fi
+
+          cp "${apks[0]}" "artifacts/TauriTavern-Android-arm64-v8a.apk"
+
+      - name: Verify Android APK signature
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+
+          if [ -z "$APKSIGNER" ]; then
+            echo "Unable to locate apksigner."
+            exit 1
+          fi
+
+          "$APKSIGNER" verify \
+            --verbose \
+            --print-certs \
+            artifacts/TauriTavern-Android-arm64-v8a.apk
+
+      - name: Upload signed Android arm64-v8a APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TauriTavern-Android-arm64-v8a
+          path: artifacts/TauriTavern-Android-arm64-v8a.apk
+          if-no-files-found: error
