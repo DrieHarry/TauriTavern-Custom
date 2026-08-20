@@ -101,44 +101,26 @@ Before considering a task complete, run:
 
     pnpm run check
 
-For Windows desktop development:
-
-    pnpm run tauri:dev
-
-For a Windows build:
-
-    pnpm run tauri:build
-
-For Android development:
-
-    pnpm run android:dev
-
-For an Android debug APK:
-
-    pnpm run android:build -- --debug --apk --target aarch64
-
 Report which checks were actually run and whether they passed.
 
 Do not claim a build or test passed unless it was actually executed successfully.
 
 ### Known Windows test flake
 
-On Windows, the following agent runtime contract test can occasionally hit its
-5-second timeout when the Rust test suite runs in parallel:
+On Windows, the test can occasionally hit its timeout when the Rust test suite runs in parallel
 
-`app::contract_tests::agent_runtime::execution::agent_runtime_foreground_auto_commits_once_per_round_until_explicit_commit`
-
-If `pnpm run check` fails only because this exact test reports:
+If `pnpm run check` fails only because these test reports:
 
 `agent loop and host resolver timed out`
+`agent test timed out waiting for chat commits and persistent metadata update`
 
 do not modify application code immediately.
 
-First rerun the test by itself:
+First rerun the test by itself, for example:
 
     cargo test --manifest-path src-tauri/Cargo.toml -p tauritavern --lib "app::contract_tests::agent_runtime::execution::agent_runtime_foreground_auto_commits_once_per_round_until_explicit_commit" -- --exact --nocapture
 
-If it passes, verify the tauritavern Rust tests serially:
+If it passes, verify the tauritavern Rust tests serially, example:
 
     cargo test --manifest-path src-tauri/Cargo.toml -p tauritavern --lib -- --test-threads=1
 
