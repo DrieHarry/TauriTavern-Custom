@@ -1,22 +1,20 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import YAML from 'yaml';
 
-const workflowPath = '.github/workflows/canary-release.yml';
-const hasWorkflow = existsSync(workflowPath);
-const workflowSource = hasWorkflow ? readFileSync(workflowPath, 'utf8') : '';
-const workflow = hasWorkflow ? YAML.parse(workflowSource) : null;
-const publisherSource = existsSync('distribution/apt-rpm/publish.sh') ? readFileSync('distribution/apt-rpm/publish.sh', 'utf8') : '';
-const nixPublisherSource = existsSync('distribution/nix-cache/publish.sh') ? readFileSync('distribution/nix-cache/publish.sh', 'utf8') : '';
-const flakeSource = existsSync('flake.nix') ? readFileSync('flake.nix', 'utf8') : '';
+const workflowSource = readFileSync('.github/workflows/canary-release.yml', 'utf8');
+const workflow = YAML.parse(workflowSource);
+const publisherSource = readFileSync('distribution/apt-rpm/publish.sh', 'utf8');
+const nixPublisherSource = readFileSync('distribution/nix-cache/publish.sh', 'utf8');
+const flakeSource = readFileSync('flake.nix', 'utf8');
 
-test('Canary artifact names use the China-local calendar date without a time', { skip: !hasWorkflow }, () => {
+test('Canary artifact names use the China-local calendar date without a time', () => {
     assert.match(workflowSource, /asset_time=.*date \+'%Y%m%d'/);
     assert.doesNotMatch(workflowSource, /asset_time=.*%H%M/);
 });
 
-test('Canary Linux package versions derive from the latest stable release', { skip: !hasWorkflow }, () => {
+test('Canary Linux package versions derive from the latest stable release', () => {
     assert.equal(workflow.env.NEXT_STABLE_VERSION, undefined);
     assert.match(workflowSource, /releases\/latest/);
     assert.match(workflowSource, /\+canary\.\$\{GITHUB_RUN_NUMBER\}\.g/);
@@ -25,7 +23,7 @@ test('Canary Linux package versions derive from the latest stable release', { sk
     assert.match(workflowSource, /rewrite-deb-version\.sh/);
 });
 
-test('Canary repositories run only after the GitHub release is published', { skip: !hasWorkflow }, () => {
+test('Canary repositories run only after the GitHub release is published', () => {
     for (const jobName of ['publish-package-repositories', 'publish-nix-cache']) {
         const job = workflow.jobs[jobName];
         assert.deepEqual(job.needs, ['prepare', 'publish']);
@@ -33,7 +31,7 @@ test('Canary repositories run only after the GitHub release is published', { ski
     }
 });
 
-test('Canary APT and RPM use isolated repository paths', { skip: !hasWorkflow }, () => {
+test('Canary APT and RPM use isolated repository paths', () => {
     const job = workflow.jobs['publish-package-repositories'];
     assert.equal(job.env.REPOSITORY_CHANNEL, 'canary');
     assert.match(workflowSource, /apt\/dists\/canary\/InRelease/);
@@ -43,7 +41,7 @@ test('Canary APT and RPM use isolated repository paths', { skip: !hasWorkflow },
     assert.match(publisherSource, /repository-manifest-canary\.json/);
 });
 
-test('Canary Nix builds an explicit output and shares the content-addressed cache', { skip: !hasWorkflow }, () => {
+test('Canary Nix builds an explicit output and shares the content-addressed cache', () => {
     const job = workflow.jobs['publish-nix-cache'];
     assert.equal(job.env.NIX_R2_BUCKET, 'tauritavern-nix-cache');
     assert.match(workflowSource, /build\s+\.#canary/);
@@ -55,7 +53,7 @@ test('Canary Nix builds an explicit output and shares the content-addressed cach
     assert.match(flakeSource, /canary = packageFor "dev"/);
 });
 
-test('Canary repository credentials remain in GitHub secrets', { skip: !hasWorkflow }, () => {
+test('Canary repository credentials remain in GitHub secrets', () => {
     assert.match(workflowSource, /secrets\.R2_ACCESS_KEY_ID/);
     assert.match(workflowSource, /secrets\.R2_SECRET_ACCESS_KEY/);
     assert.match(workflowSource, /secrets\.LINUX_REPOSITORY_GPG_PRIVATE_KEY_BASE64/);

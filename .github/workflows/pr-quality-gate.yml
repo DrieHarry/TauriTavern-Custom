@@ -1,32 +1,46 @@
-name: CI
+name: PR quality gate
 
 on:
   pull_request:
-    branches:
-      - dev
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: pr-quality-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  windows:
-    name: Windows checks
-    runs-on: windows-latest
+  checks:
+    name: checks-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-22.04
+          - name: windows
+            os: windows-latest
+          - name: macos
+            os: macos-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install stable Rust and Clippy
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libdbus-1-dev libwebkit2gtk-4.1-dev librsvg2-dev pkg-config
+
+      - name: Install latest stable Rust and Clippy
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -48,33 +62,55 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      - name: Setup uv
+        if: runner.os == 'Linux'
+        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          version: latest-known
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Run project checks and tests
+      - name: Verify generated Flatpak dependency sources
+        if: runner.os == 'Linux'
+        run: pnpm run flatpak:sources:check
+
+      - name: Run checks and tests
         run: pnpm run check
 
-  android:
-    name: Android ARM64 Rust check
-    runs-on: ubuntu-latest
+  mobile-cargo-check:
+    name: cargo-check-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: android
+            os: ubuntu-latest
+            target: aarch64-linux-android
+          - name: ios
+            os: macos-latest
+            target: aarch64-apple-ios
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install stable Rust with Android ARM64 target
+      - name: Install latest stable Rust target
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: ${{ matrix.target }}
 
       - name: Setup Android NDK
+        if: matrix.name == 'android'
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r29
 
-      - name: Configure Android ARM64 compiler
+      - name: Configure Android compiler
+        if: matrix.name == 'android'
         shell: bash
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -95,10 +131,10 @@ jobs:
         with:
           workspaces: "src-tauri -> target"
 
-      - name: Check Android ARM64 Rust target
+      - name: Check ${{ matrix.name }} Rust target
         run: >-
           cargo check
           --manifest-path src-tauri/Cargo.toml
           -p tauritavern
-          --target aarch64-linux-android
+          --target ${{ matrix.target }}
           --no-default-features
