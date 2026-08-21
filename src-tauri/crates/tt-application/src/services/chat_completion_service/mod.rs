@@ -673,8 +673,12 @@ impl ChatCompletionService {
             match self.stream_sessions.append(&stream_id, chunk).await {
                 Ok(StreamAppendOutcome::Appended) => {}
                 Ok(StreamAppendOutcome::ProviderDone) => {
-                    generation_task.abort();
-                    break Ok(());
+                    break match generation_task.await {
+                        Ok(result) => result,
+                        Err(error) => Err(ApplicationError::InternalError(format!(
+                            "Streaming task join failed: {error}"
+                        ))),
+                    };
                 }
                 Ok(StreamAppendOutcome::SessionClosed) => {
                     generation_task.abort();

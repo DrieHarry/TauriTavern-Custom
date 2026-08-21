@@ -130,9 +130,13 @@ impl ChatCompletionRepository for LoggingChatCompletionRepository {
 
         let request_raw = pretty_json(&log_payload);
         let request_readable = format_request_readable(source, &log_payload);
-        let request_path = request_raw_path(self.store.log_root(), id);
+        let log_root = self.store.log_root().to_path_buf();
+        let _ = tokio::fs::create_dir_all(&log_root).await;
+
+        let request_path = request_raw_path(&log_root, id);
+        let request_raw_for_file = request_raw.clone();
         tauri::async_runtime::spawn(async move {
-            if let Err(error) = tokio::fs::write(&request_path, request_raw).await {
+            if let Err(error) = tokio::fs::write(&request_path, request_raw_for_file).await {
                 tracing::error!(
                     "Failed to write LLM API request log file {}: {}",
                     request_path.display(),
@@ -141,7 +145,7 @@ impl ChatCompletionRepository for LoggingChatCompletionRepository {
             }
         });
 
-        let response_path = response_raw_sse_path(self.store.log_root(), id);
+        let response_path = response_raw_sse_path(&log_root, id);
         let response_writer = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)

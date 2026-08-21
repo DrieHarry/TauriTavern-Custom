@@ -62,6 +62,24 @@ impl SseEventAccumulator {
 
         let (field, value) = split_sse_field(line);
         if field == b"data" {
+            let value = trim_trailing_whitespace(value);
+            if value.is_empty() {
+                return Ok(());
+            }
+
+            if value == b"[DONE]" {
+                self.dispatch(sender, hook)?;
+                self.data.extend_from_slice(value);
+                return self.dispatch(sender, hook);
+            }
+
+            if !self.data.is_empty()
+                && (self.data.first().is_some_and(|b| *b == b'{' || *b == b'[')
+                    || value.first().is_some_and(|b| *b == b'{' || *b == b'['))
+            {
+                self.dispatch(sender, hook)?;
+            }
+
             if !self.data.is_empty() {
                 self.data.push(b'\n');
             }
@@ -101,6 +119,17 @@ impl SseEventAccumulator {
 
         Ok(())
     }
+}
+
+fn trim_trailing_whitespace(mut slice: &[u8]) -> &[u8] {
+    while let Some(last) = slice.last() {
+        if matches!(*last, b' ' | b'\t' | b'\r' | b'\n') {
+            slice = &slice[..slice.len() - 1];
+        } else {
+            break;
+        }
+    }
+    slice
 }
 
 fn split_sse_field(line: &[u8]) -> (&[u8], &[u8]) {
@@ -1073,5 +1102,30 @@ mod tests {
 
         assert_eq!(receiver.try_recv().ok(), Some("tail".to_string()));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn forward_sse_events_separates_consecutive_json_data_events() {
+        let (sender, mut receiver) = mpsc::unbounded_channel::<String>();
+        let mut buffer = b"data: {\"chunk\":1}\ndata: {\"chunk\":2}\ndata: [DONE]\n".to_vec();
+
+        fn noop(_: &[u8]) -> Result<(), DomainError> {
+            Ok(())
+        }
+        let mut hook = noop;
+        let mut accumulator = super::SseEventAccumulator::default();
+        HttpChatCompletionRepository::forward_sse_events(
+            &mut buffer,
+            &mut accumulator,
+            &sender,
+            &mut hook,
+        )
+        .unwrap();
+
+        assert_eq!(receiver.try_recv().ok(), Some("{\"chunk\":1}".to_string()));
+        assert_eq!(receiver.try_recv().ok(), Some("{\"chunk\":2}".to_string()));
+        assert_eq!(receiver.try_recv().ok(), Some("[DONE]".to_string()));
+        assert!(receiver.try_recv().is_err());
+        assert!(buffer.is_empty());
     }
 }
