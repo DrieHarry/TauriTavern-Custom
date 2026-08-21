@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, verify } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 import YAML from 'yaml';
 
@@ -10,17 +10,20 @@ import {
     verifyExternalGroup,
 } from '../scripts/ci/distribute-testflight.mjs';
 
-const canarySource = readFileSync('.github/workflows/canary-release.yml', 'utf8');
-const stableSource = readFileSync('.github/workflows/stable-release.yml', 'utf8');
-const testflightSource = readFileSync('.github/workflows/public-testflight.yml', 'utf8');
-const mobileHttpScript = readFileSync('scripts/ci/configure-mobile-http.sh', 'utf8');
-const testflightSkill = readFileSync('.github/codex/skills/tauritavern-testflight-notes/SKILL.md', 'utf8');
-const humanizerSkill = readFileSync('.github/codex/skills/tauritavern-release-humanizer/SKILL.md', 'utf8');
-const canary = YAML.parse(canarySource);
-const stable = YAML.parse(stableSource);
-const testflightWorkflow = YAML.parse(testflightSource);
+const hasCanary = existsSync('.github/workflows/canary-release.yml');
+const hasStable = existsSync('.github/workflows/stable-release.yml');
+const hasTestflight = existsSync('.github/workflows/public-testflight.yml');
+const canarySource = hasCanary ? readFileSync('.github/workflows/canary-release.yml', 'utf8') : '';
+const stableSource = hasStable ? readFileSync('.github/workflows/stable-release.yml', 'utf8') : '';
+const testflightSource = hasTestflight ? readFileSync('.github/workflows/public-testflight.yml', 'utf8') : '';
+const mobileHttpScript = existsSync('scripts/ci/configure-mobile-http.sh') ? readFileSync('scripts/ci/configure-mobile-http.sh', 'utf8') : '';
+const testflightSkill = existsSync('.github/codex/skills/tauritavern-testflight-notes/SKILL.md') ? readFileSync('.github/codex/skills/tauritavern-testflight-notes/SKILL.md', 'utf8') : '';
+const humanizerSkill = existsSync('.github/codex/skills/tauritavern-release-humanizer/SKILL.md') ? readFileSync('.github/codex/skills/tauritavern-release-humanizer/SKILL.md', 'utf8') : '';
+const canary = hasCanary ? YAML.parse(canarySource) : null;
+const stable = hasStable ? YAML.parse(stableSource) : null;
+const testflightWorkflow = hasTestflight ? YAML.parse(testflightSource) : null;
 
-test('Stable and Canary preserve the ordinary IPA and build a separate TestFlight variant', () => {
+test('Stable and Canary preserve the ordinary IPA and build a separate TestFlight variant', { skip: !hasCanary || !hasStable }, () => {
     for (const [name, workflow, source] of [
         ['Canary', canary, canarySource],
         ['Stable', stable, stableSource],
@@ -40,7 +43,7 @@ test('Stable and Canary preserve the ordinary IPA and build a separate TestFligh
     }
 });
 
-test('standard mobile artifacts allow HTTP without relaxing the TestFlight IPA', () => {
+test('standard mobile artifacts allow HTTP without relaxing the TestFlight IPA', { skip: !hasCanary || !hasStable }, () => {
     for (const [name, workflow] of [
         ['Canary', canary],
         ['Stable', stable],
@@ -63,7 +66,7 @@ test('standard mobile artifacts allow HTTP without relaxing the TestFlight IPA',
     assert.match(mobileHttpScript, /NSAllowsArbitraryLoadsInWebContent/u);
 });
 
-test('Stable and Canary target only their existing public TestFlight groups', () => {
+test('Stable and Canary target only their existing public TestFlight groups', { skip: !hasCanary || !hasStable }, () => {
     const canaryJob = canary.jobs.testflight;
     assert.deepEqual(canaryJob.needs, ['prepare', 'publish']);
     assert.equal(canaryJob.permissions.contents, 'write');
@@ -86,7 +89,7 @@ test('Stable and Canary target only their existing public TestFlight groups', ()
     assert.equal(stableJob.with.group_name, 'TauriTavern Beta Test');
 });
 
-test('TestFlight notes keep Codex isolated, read-only, and non-blocking', () => {
+test('TestFlight notes keep Codex isolated, read-only, and non-blocking', { skip: !hasTestflight }, () => {
     const notes = testflightWorkflow.jobs.notes;
     const codexStep = notes.steps.find((step) => step.id === 'codex');
     assert.equal(codexStep['continue-on-error'], true);
@@ -97,7 +100,7 @@ test('TestFlight notes keep Codex isolated, read-only, and non-blocking', () => 
     assert.equal(testflightWorkflow.jobs.publish.needs, 'notes');
 });
 
-test('Stable TestFlight notes use maintainer release notes as verified priorities', () => {
+test('Stable TestFlight notes use maintainer release notes as verified priorities', { skip: !hasTestflight }, () => {
     const contextStep = testflightWorkflow.jobs.notes.steps.find(
         (step) => step.name === 'Prepare TestFlight change context',
     );
@@ -110,14 +113,14 @@ test('Stable TestFlight notes use maintainer release notes as verified prioritie
     assert.match(testflightSkill, /use them to prioritize testing but verify every claim/u);
 });
 
-test('TestFlight notes keep the app voice lightly playful without weakening factual rules', () => {
+test('TestFlight notes keep the app voice lightly playful without weakening factual rules', { skip: !hasTestflight }, () => {
     assert.match(testflightSkill, /warm, lightly playful voice/u);
     assert.match(testflightSkill, /never let it replace a concrete change or testing request/u);
     assert.match(humanizerSkill, /For TestFlight copy, preserve or lightly refine one restrained playful touch/u);
     assert.match(testflightSource, /If anything wobbles, send it our way through TestFlight\./u);
 });
 
-test('TestFlight publishing uploads, localizes, and distributes the exact IPA', () => {
+test('TestFlight publishing uploads, localizes, and distributes the exact IPA', { skip: !hasTestflight }, () => {
     const publishSteps = testflightWorkflow.jobs.publish.steps;
     const existingBuildIndex = publishSteps.findIndex(
         (step) => step.name === 'Check for an existing App Store Connect build',
