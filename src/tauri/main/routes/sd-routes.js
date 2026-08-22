@@ -36,8 +36,7 @@ function normalizeRouteResponse(value) {
 }
 
 export function registerSdRoutes(router, context, { jsonResponse, textResponse }) {
-    router.post('/api/sd/*', async ({ body, wildcard, init }) => {
-        const path = normalizeSubpath(wildcard);
+    const handleRequest = async ({ body, init }, path) => {
         const requestId = createRequestId();
 
         const signal = init?.signal;
@@ -86,5 +85,17 @@ export function registerSdRoutes(router, context, { jsonResponse, textResponse }
                 signal.removeEventListener('abort', abortHandler);
             }
         }
+    };
+
+    router.post('/api/sd/*', ({ body, wildcard, init }) => {
+        return handleRequest({ body, init }, normalizeSubpath(wildcard));
+    });
+
+    router.post('/api/openrouter/models/image', ({ body, init }) => {
+        return handleRequest({ body, init }, 'openrouter/models');
+    });
+
+    router.post('/api/openrouter/image/generate', ({ body, init }) => {
+        return handleRequest({ body, init }, 'openrouter/generate');
     });
 }

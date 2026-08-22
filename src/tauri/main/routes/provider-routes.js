@@ -29,6 +29,16 @@ export function registerProviderRoutes(router, context, { jsonResponse }) {
         return jsonResponse(credits);
     });
 
+    router.post('/api/openrouter/models/embedding', async () => {
+        const models = await context.safeInvoke('get_openrouter_embedding_models');
+        return jsonResponse(models);
+    });
+
+    router.post('/api/openai/nanogpt/models/embedding', async () => {
+        const models = await context.safeInvoke('get_nanogpt_embedding_models');
+        return jsonResponse(models);
+    });
+
     router.post('/api/openai/siliconflow/models/embedding', async ({ body }) => {
         const payload = asObject(body);
         const models = await context.safeInvoke('get_siliconflow_embedding_models', {

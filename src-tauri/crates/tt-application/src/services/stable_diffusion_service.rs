@@ -37,7 +37,29 @@ impl StableDiffusionService {
         body: Value,
     ) -> Result<SdRouteResponseDto, ApplicationError> {
         let path = path.trim().trim_matches('/').to_ascii_lowercase();
-        let credentials = if matches!(path.as_str(), "workersai/models" | "workersai/generate") {
+        let credentials = if matches!(path.as_str(), "nanogpt/models" | "nanogpt/generate") {
+            let Some(api_key) = self
+                .secret_repository
+                .read_secret(SecretKeys::NANOGPT, None)
+                .await?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(text_response(400, "NanoGPT API key is required"));
+            };
+            SdRouteCredentials::NanoGpt { api_key }
+        } else if matches!(path.as_str(), "openrouter/models" | "openrouter/generate") {
+            let Some(api_key) = self
+                .secret_repository
+                .read_secret(SecretKeys::OPENROUTER, None)
+                .await?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(text_response(400, "OpenRouter API key is required"));
+            };
+            SdRouteCredentials::OpenRouter { api_key }
+        } else if matches!(path.as_str(), "workersai/models" | "workersai/generate") {
             let Some(api_key) = self
                 .secret_repository
                 .read_secret(SecretKeys::WORKERS_AI, None)
@@ -51,7 +73,10 @@ impl StableDiffusionService {
                 ));
             };
             SdRouteCredentials::WorkersAi { api_key }
-        } else if matches!(path.as_str(), "custom-openai/models" | "custom-openai/generate") {
+        } else if matches!(
+            path.as_str(),
+            "custom-openai/models" | "custom-openai/generate"
+        ) {
             let api_key = self
                 .secret_repository
                 .read_secret(SecretKeys::CUSTOM_OPENAI_SD, None)

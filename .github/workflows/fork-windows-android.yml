@@ -1,7 +1,7 @@
 # Derived from .github/workflows/canary-release.yml.
 # Intentional fork-only differences:
 # - manual Windows x64 + Android ARM64 release only
-# - Windows publishes MSI, NSIS setup EXE, and portable EXE
+# - Windows publishes MSI, NSIS setup EXE, and portable ZIP
 # - Android publishes one ARM64 APK
 # - no macOS, Linux, iOS, TestFlight, package repository, or Nix publishing
 # - validates/publishes exactly four release assets without changing shared scripts
@@ -122,12 +122,17 @@ jobs:
         if: matrix.portable
         run: node scripts/build-portable.mjs --skip-web-build --output-dir portable
 
+      - name: Archive portable binary
+        if: matrix.portable
+        shell: pwsh
+        run: Compress-Archive -Path portable\*.exe -DestinationPath portable\TauriTavern-portable.zip
+
       - name: Upload portable binary
         if: matrix.portable
         uses: actions/upload-artifact@v4
         with:
           name: TauriTavern-${{ needs.prepare.outputs.asset_time }}-canary-${{ matrix.portable_name }}-portable
-          path: portable/*
+          path: portable/*.zip
           if-no-files-found: error
 
   mobile:
@@ -440,7 +445,7 @@ jobs:
 
           copy_single_file windows-x64-msi .msi windows-x64.msi
           copy_single_file windows-x64-nsis .exe windows-x64-setup.exe
-          copy_single_file windows-x64-portable .exe windows-x64-portable.exe
+          copy_single_file windows-x64-portable .zip windows-x64-portable.zip
           copy_single_file android-arm64-apk .apk android-arm64-v8a.apk
 
           mapfile -t release_files < <(find release-assets -mindepth 1 -maxdepth 1 -type f -print | sort)

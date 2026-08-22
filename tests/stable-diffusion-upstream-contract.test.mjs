@@ -56,6 +56,29 @@ test('Stable Diffusion backend request uses explicit credentials instead of prov
     assert.match(repositorySource, /pub enum SdRouteCredentials \{/);
     assert.doesNotMatch(repositorySource, /workers_ai_api_key/);
     assert.match(serviceSource, /SdRouteCredentials::WorkersAi \{ api_key \}/);
+    assert.match(serviceSource, /SdRouteCredentials::NanoGpt \{ api_key \}/);
+    assert.match(serviceSource, /SdRouteCredentials::OpenRouter \{ api_key \}/);
+});
+
+test('NanoGPT and OpenRouter image routes use provider APIs and guarded JSON parsing', async () => {
+    const adapterSource = await readFile(
+        path.join(REPO_ROOT, 'src-tauri', 'crates', 'tt-adapter-provider-http', 'src', 'http_stable_diffusion_repository.rs'),
+        'utf8',
+    );
+    const routeSource = await readFile(
+        path.join(REPO_ROOT, 'src', 'tauri', 'main', 'routes', 'sd-routes.js'),
+        'utf8',
+    );
+
+    assert.match(adapterSource, /https:\/\/nano-gpt\.com\/api\/v1\/image-models\?detailed=true/);
+    assert.match(adapterSource, /https:\/\/nano-gpt\.com\/v1\/images\/generations/);
+    assert.match(adapterSource, /OPENROUTER_API_BASE}\/images\/models/);
+    assert.match(adapterSource, /OPENROUTER_API_BASE}\/images/);
+    assert.match(routeSource, /\/api\/openrouter\/models\/image/);
+    assert.match(routeSource, /\/api\/openrouter\/image\/generate/);
+    assert.match(sdSource, /readImageProviderJson\(result, 'NanoGPT image models'\)/);
+    assert.match(sdSource, /readImageProviderJson\(result, 'OpenRouter image models'\)/);
+    assert.match(sdSource, /returned non-JSON data \(HTTP/);
 });
 
 test('Workers AI image generation requires a selected model before dispatch', () => {

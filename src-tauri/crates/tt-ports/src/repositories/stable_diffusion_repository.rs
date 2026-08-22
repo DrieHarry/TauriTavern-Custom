@@ -14,6 +14,8 @@ pub struct SdRouteRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SdRouteCredentials {
     None,
+    NanoGpt { api_key: String },
+    OpenRouter { api_key: String },
     WorkersAi { api_key: String },
     CustomOpenAi { api_key: Option<String> },
 }

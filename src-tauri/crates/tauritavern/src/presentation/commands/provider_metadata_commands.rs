@@ -75,6 +75,36 @@ pub async fn get_nanogpt_credits(
 }
 
 #[tauri::command]
+pub async fn get_openrouter_embedding_models(
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<Vec<Value>, CommandError> {
+    log_command("get_openrouter_embedding_models");
+
+    app_state
+        .services
+        .provider_metadata_service
+        .openrouter_embedding_models()
+        .await
+        .map_err(map_command_error(
+            "Failed to get OpenRouter embedding models",
+        ))
+}
+
+#[tauri::command]
+pub async fn get_nanogpt_embedding_models(
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<Vec<Value>, CommandError> {
+    log_command("get_nanogpt_embedding_models");
+
+    app_state
+        .services
+        .provider_metadata_service
+        .nanogpt_embedding_models()
+        .await
+        .map_err(map_command_error("Failed to get NanoGPT embedding models"))
+}
+
+#[tauri::command]
 pub async fn get_siliconflow_embedding_models(
     dto: SiliconFlowEmbeddingModelsRequestDto,
     app_state: State<'_, Arc<AppState>>,

@@ -85,6 +85,30 @@ impl ProviderMetadataService {
             .map_err(ApplicationError::from)
     }
 
+    pub async fn openrouter_embedding_models(&self) -> Result<Vec<Value>, ApplicationError> {
+        self.ensure_chat_completion_source_allowed(ChatCompletionSource::OpenRouter)?;
+        let api_key = self
+            .read_required_secret(SecretKeys::OPENROUTER, "OpenRouter")
+            .await?;
+
+        self.provider_metadata_repository
+            .openrouter_embedding_models(&api_key)
+            .await
+            .map_err(ApplicationError::from)
+    }
+
+    pub async fn nanogpt_embedding_models(&self) -> Result<Vec<Value>, ApplicationError> {
+        self.ensure_chat_completion_source_allowed(ChatCompletionSource::NanoGpt)?;
+        let api_key = self
+            .read_required_secret(SecretKeys::NANOGPT, "NanoGPT")
+            .await?;
+
+        self.provider_metadata_repository
+            .nanogpt_embedding_models(&api_key)
+            .await
+            .map_err(ApplicationError::from)
+    }
+
     pub async fn siliconflow_embedding_models(
         &self,
         dto: SiliconFlowEmbeddingModelsRequestDto,

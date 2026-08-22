@@ -116,6 +116,22 @@ export function createHostInvokePolicies() {
             cacheLimit: 50,
             key: providerMetadataKey,
         },
+        get_openrouter_embedding_models: {
+            kind: 'dedupe',
+            maxConcurrent: 2,
+            timeoutMs: PROVIDER_METADATA_TIMEOUT_MS,
+            cacheTtlMs: 60_000,
+            cacheLimit: 10,
+            key: providerMetadataKey,
+        },
+        get_nanogpt_embedding_models: {
+            kind: 'dedupe',
+            maxConcurrent: 2,
+            timeoutMs: PROVIDER_METADATA_TIMEOUT_MS,
+            cacheTtlMs: 60_000,
+            cacheLimit: 10,
+            key: providerMetadataKey,
+        },
         get_siliconflow_embedding_models: {
             kind: 'dedupe',
             maxConcurrent: 2,

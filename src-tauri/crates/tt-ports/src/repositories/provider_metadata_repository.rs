@@ -20,6 +20,10 @@ pub trait ProviderMetadataRepository: Send + Sync {
 
     async fn nanogpt_credits(&self, api_key: &str) -> Result<NanoGptCredits, DomainError>;
 
+    async fn openrouter_embedding_models(&self, api_key: &str) -> Result<Vec<Value>, DomainError>;
+
+    async fn nanogpt_embedding_models(&self, api_key: &str) -> Result<Vec<Value>, DomainError>;
+
     async fn siliconflow_embedding_models(
         &self,
         api_key: &str,

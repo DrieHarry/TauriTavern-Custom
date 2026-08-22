@@ -11,6 +11,8 @@ import { registerVectorRoutes } from '../src/tauri/main/routes/vector-routes.js'
 const SECRET_BACKED_PROVIDER_METADATA_COMMANDS = [
     'get_openrouter_credits',
     'get_nanogpt_credits',
+    'get_openrouter_embedding_models',
+    'get_nanogpt_embedding_models',
     'get_siliconflow_embedding_models',
     'get_workers_ai_embedding_models',
     'get_workers_ai_multimodal_models',
@@ -89,6 +91,7 @@ async function getVectorsRuntimeSource() {
             .then(source => [
                 extractDeclaration(source, 'const remoteEmbeddingEndpoints = {'),
                 extractDeclaration(source, 'function getVectorsRequestBody(args = {})'),
+                extractDeclaration(source, 'async function readEmbeddingModelsResponse(response, source)'),
                 extractDeclaration(source, 'function toggleSettings()'),
                 extractDeclaration(source, 'async function loadRemoteEmbeddingModels(source)'),
             ].join('\n\n'));
@@ -147,6 +150,8 @@ async function createVectorsRuntimeHarness({
 
     const settings = {
         source: 'workers_ai',
+        nanogpt_model: '',
+        openrouter_model: '',
         enabled_files: false,
         enabled_chats: false,
         enabled_world_info: false,
@@ -178,12 +183,23 @@ async function createVectorsRuntimeHarness({
             throw response;
         }
         if (!response) {
-            return { ok: false, status: 404, json: async () => ({}) };
+            return {
+                ok: false,
+                status: 404,
+                headers: { get: () => 'application/json' },
+                text: async () => '{}',
+            };
         }
+        const hasText = Object.hasOwn(response, 'text');
+        const responseText = hasText ? String(response.text) : JSON.stringify(response.json);
+        const contentType = response.contentType || (hasText ? 'text/html' : 'application/json');
         return {
             ok: response.ok !== false,
             status: response.status ?? 200,
-            json: async () => response.json,
+            headers: {
+                get: name => String(name).toLowerCase() === 'content-type' ? contentType : null,
+            },
+            text: async () => responseText,
         };
     };
 
@@ -308,6 +324,16 @@ test('provider metadata routes map upstream request bodies to Tauri invoke DTOs'
             path: '/api/openai/workers-ai/models/embedding',
             body: { workers_ai_account_id: 'account-id' },
             expected: { command: 'get_workers_ai_embedding_models', args: { dto: { workers_ai_account_id: 'account-id' } } },
+        },
+        {
+            path: '/api/openrouter/models/embedding',
+            body: {},
+            expected: { command: 'get_openrouter_embedding_models', args: undefined },
+        },
+        {
+            path: '/api/openai/nanogpt/models/embedding',
+            body: {},
+            expected: { command: 'get_nanogpt_embedding_models', args: undefined },
         },
         {
             path: '/api/backends/chat-completions/multimodal-models/workers_ai',
@@ -448,7 +474,7 @@ test('vectors source toggle exposes remote model failures without clearing curre
     assert.equal(select.value, '@cf/existing');
     assert.deepEqual(harness.toastErrors, [
         {
-            message: 'HTTP 401',
+            message: 'unauthorized',
             title: 'Vector model list failed',
             options: { preventDuplicates: true },
         },
@@ -740,4 +766,56 @@ test('unrelated secret mutations leave provider metadata caches intact', async (
     assert.ok(response);
     assert.equal(response.status, 200);
     assert.deepEqual(invalidations, []);
+});
+
+test('vectors remote embedding loader supports OpenRouter and NanoGPT catalogs', async () => {
+    const harness = await createVectorsRuntimeHarness({
+        responses: {
+            '/api/openrouter/models/embedding': {
+                json: [
+                    { id: 'openai/text-embedding-3-small', name: 'OpenAI: Text Embedding 3 Small' },
+                ],
+            },
+            '/api/openai/nanogpt/models/embedding': {
+                json: [
+                    { id: 'text-embedding-3-small', name: 'Text Embedding 3 Small' },
+                ],
+            },
+        },
+    });
+
+    await harness.runtime.loadRemoteEmbeddingModels('openrouter');
+    await harness.runtime.loadRemoteEmbeddingModels('nanogpt');
+
+    assert.deepEqual(harness.fetchCalls.map(call => ({
+        url: call.url,
+        body: JSON.parse(call.init.body),
+    })), [
+        { url: '/api/openrouter/models/embedding', body: {} },
+        { url: '/api/openai/nanogpt/models/embedding', body: {} },
+    ]);
+    assert.deepEqual(harness.elements.get('#vectors_openrouter_model').options, [
+        { value: 'openai/text-embedding-3-small', text: 'OpenAI: Text Embedding 3 Small' },
+    ]);
+    assert.deepEqual(harness.elements.get('#vectors_nanogpt_model').options, [
+        { value: 'text-embedding-3-small', text: 'Text Embedding 3 Small' },
+    ]);
+    assert.equal(harness.settings.openrouter_model, 'openai/text-embedding-3-small');
+    assert.equal(harness.settings.nanogpt_model, 'text-embedding-3-small');
+});
+
+test('vectors remote embedding loader reports HTML responses without a JSON parse error', async () => {
+    const harness = await createVectorsRuntimeHarness({
+        responses: {
+            '/api/openrouter/models/embedding': {
+                text: '<!DOCTYPE html><html><body>Not Found</body></html>',
+                contentType: 'text/html; charset=utf-8',
+            },
+        },
+    });
+
+    await assert.rejects(
+        harness.runtime.loadRemoteEmbeddingModels('openrouter'),
+        /openrouter models endpoint returned non-JSON data \(HTTP 200, content-type text\/html; charset=utf-8\): <!DOCTYPE html>/,
+    );
 });

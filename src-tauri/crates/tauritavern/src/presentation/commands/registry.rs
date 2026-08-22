@@ -159,6 +159,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::provider_metadata_commands::get_openrouter_credits,
         super::provider_metadata_commands::get_nanogpt_model_providers,
         super::provider_metadata_commands::get_nanogpt_credits,
+        super::provider_metadata_commands::get_openrouter_embedding_models,
+        super::provider_metadata_commands::get_nanogpt_embedding_models,
         super::provider_metadata_commands::get_siliconflow_embedding_models,
         super::provider_metadata_commands::get_workers_ai_embedding_models,
         super::provider_metadata_commands::get_workers_ai_multimodal_models,

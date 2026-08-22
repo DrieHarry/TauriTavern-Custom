@@ -24,6 +24,10 @@ use tt_ports::repositories::stable_diffusion_repository::{
     StableDiffusionRepository,
 };
 
+const NANOGPT_IMAGE_MODELS_URL: &str = "https://nano-gpt.com/api/v1/image-models?detailed=true";
+const NANOGPT_IMAGE_GENERATION_URL: &str = "https://nano-gpt.com/v1/images/generations";
+const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
+
 pub struct HttpStableDiffusionRepository {
     http_clients: Arc<HttpClientPool>,
     comfy_workflows_dir: PathBuf,
@@ -85,6 +89,16 @@ impl StableDiffusionRepository for HttpStableDiffusionRepository {
             "sdcpp/ping" => sdcpp_ping(&self.http_clients, &request.body).await,
             "sdcpp/models" => sdcpp_models(&self.http_clients, &request.body).await,
             "sdcpp/generate" => sdcpp_generate(&self.http_clients, &request.body, cancel).await,
+
+            // NanoGPT (cloud chain)
+            "nanogpt/models" => nanogpt_models(&self.http_clients, &request).await,
+            "nanogpt/generate" => nanogpt_generate(&self.http_clients, &request, cancel).await,
+
+            // OpenRouter (cloud chain)
+            "openrouter/models" => openrouter_models(&self.http_clients, &request).await,
+            "openrouter/generate" => {
+                openrouter_generate(&self.http_clients, &request, cancel).await
+            }
 
             // Cloudflare Workers AI (cloud chain)
             "workersai/models" => workers_ai_models(&self.http_clients, &request).await,
@@ -1333,6 +1347,345 @@ async fn sdcpp_generate(
     Ok(json_response(200, value))
 }
 
+fn nanogpt_api_key(request: &SdRouteRequest) -> Result<&str, SdRouteResponse> {
+    match &request.credentials {
+        SdRouteCredentials::NanoGpt { api_key } if !api_key.trim().is_empty() => Ok(api_key.trim()),
+        _ => Err(text(400, "NanoGPT API key is required")),
+    }
+}
+
+fn openrouter_api_key(request: &SdRouteRequest) -> Result<&str, SdRouteResponse> {
+    match &request.credentials {
+        SdRouteCredentials::OpenRouter { api_key } if !api_key.trim().is_empty() => {
+            Ok(api_key.trim())
+        }
+        _ => Err(text(400, "OpenRouter API key is required")),
+    }
+}
+
+fn compact_response_preview(body: &str) -> String {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = compact.chars().take(240).collect::<String>();
+    if compact.chars().count() > 240 {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn provider_error_message(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    ["/error/message", "/error", "/message", "/detail"]
+        .into_iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+}
+
+async fn read_provider_json(
+    response: reqwest::Response,
+    provider: &str,
+    action: &str,
+) -> Result<Value, SdRouteResponse> {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let body = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        let message =
+            provider_error_message(&body).unwrap_or_else(|| compact_response_preview(&body));
+        return Err(text(
+            status.as_u16(),
+            format!(
+                "{provider} {action} failed (HTTP {}): {message}",
+                status.as_u16()
+            ),
+        ));
+    }
+
+    serde_json::from_str(&body).map_err(|error| {
+        text(
+            502,
+            format!(
+                "{provider} {action} returned non-JSON data (HTTP {}, content-type {content_type}): {error}; body: {}",
+                status.as_u16(),
+                compact_response_preview(&body),
+            ),
+        )
+    })
+}
+
+fn image_model_options(value: &Value, provider: &str) -> Result<Vec<Value>, SdRouteResponse> {
+    let Some(models) = value.get("data").and_then(Value::as_array) else {
+        return Err(text(
+            502,
+            format!("{provider} image model response is missing a data array"),
+        ));
+    };
+
+    Ok(models
+        .iter()
+        .filter_map(|model| {
+            let id = model.get("id").and_then(Value::as_str)?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let name = model
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(id);
+            Some(json!({ "value": id, "text": name }))
+        })
+        .collect())
+}
+
+fn generated_image(value: &Value, provider: &str) -> Result<(String, String), SdRouteResponse> {
+    let Some(image) = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|images| images.first())
+    else {
+        return Err(text(502, format!("{provider} returned no image data")));
+    };
+    let Some(data) = image
+        .get("b64_json")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(text(
+            502,
+            format!("{provider} returned an image without base64 data"),
+        ));
+    };
+
+    let format = match image.get("media_type").and_then(Value::as_str) {
+        Some("image/jpeg") => "jpg",
+        Some("image/webp") => "webp",
+        Some("image/svg+xml") => "svg",
+        _ => "png",
+    };
+    Ok((format.to_string(), data.to_string()))
+}
+
+async fn nanogpt_models(
+    http_clients: &Arc<HttpClientPool>,
+    request: &SdRouteRequest,
+) -> Result<SdRouteResponse, DomainError> {
+    let api_key = match nanogpt_api_key(request) {
+        Ok(api_key) => api_key,
+        Err(response) => return Ok(response),
+    };
+    let client = http_clients.client(HttpClientProfile::ProviderMetadata)?;
+    let response = client
+        .get(NANOGPT_IMAGE_MODELS_URL)
+        .bearer_auth(api_key)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|error| {
+            DomainError::transient(format!("NanoGPT image model request failed: {error}"))
+        })?;
+    let value = match read_provider_json(response, "NanoGPT", "image model request").await {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    match image_model_options(&value, "NanoGPT") {
+        Ok(models) => Ok(json_response(200, Value::Array(models))),
+        Err(response) => Ok(response),
+    }
+}
+
+async fn nanogpt_generate(
+    http_clients: &Arc<HttpClientPool>,
+    request: &SdRouteRequest,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<SdRouteResponse, DomainError> {
+    let api_key = match nanogpt_api_key(request) {
+        Ok(api_key) => api_key,
+        Err(response) => return Ok(response),
+    };
+    let model = match required_body_string_response(
+        &request.body,
+        "model",
+        "NanoGPT image model is required",
+    ) {
+        Ok(model) => model,
+        Err(response) => return Ok(response),
+    };
+    let prompt =
+        match required_body_string_response(&request.body, "prompt", "An image prompt is required")
+        {
+            Ok(prompt) => prompt,
+            Err(response) => return Ok(response),
+        };
+    let size = request
+        .body
+        .get("resolution")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("1024x1024");
+    let mut payload = Map::from_iter([
+        ("model".to_string(), Value::String(model)),
+        ("prompt".to_string(), Value::String(prompt)),
+        ("n".to_string(), Value::Number(Number::from(1))),
+        ("size".to_string(), Value::String(size.to_string())),
+        (
+            "response_format".to_string(),
+            Value::String("b64_json".to_string()),
+        ),
+    ]);
+    maybe_insert_number(
+        &mut payload,
+        "num_inference_steps",
+        &request.body,
+        "num_steps",
+    )?;
+    maybe_insert_number(&mut payload, "guidance_scale", &request.body, "scale")?;
+    if let Some(negative_prompt) = request
+        .body
+        .get("negative_prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        payload.insert(
+            "negative_prompt".to_string(),
+            Value::String(negative_prompt.to_string()),
+        );
+    }
+
+    let client = http_client(http_clients)?;
+    let send = client
+        .post(NANOGPT_IMAGE_GENERATION_URL)
+        .bearer_auth(api_key)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&payload)
+        .send();
+    let response = tokio::select! {
+        result = send => result.map_err(|error| DomainError::transient(format!("NanoGPT image request failed: {error}")))?,
+        changed = cancel.changed() => {
+            let _ = changed;
+            return Err(DomainError::generation_cancelled_by_user());
+        }
+    };
+    let value = match read_provider_json(response, "NanoGPT", "image generation").await {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    match generated_image(&value, "NanoGPT") {
+        Ok((format, image)) => Ok(json_response(
+            200,
+            json!({ "format": format, "image": image }),
+        )),
+        Err(response) => Ok(response),
+    }
+}
+
+async fn openrouter_models(
+    http_clients: &Arc<HttpClientPool>,
+    request: &SdRouteRequest,
+) -> Result<SdRouteResponse, DomainError> {
+    let api_key = match openrouter_api_key(request) {
+        Ok(api_key) => api_key,
+        Err(response) => return Ok(response),
+    };
+    let client = http_clients.client(HttpClientProfile::ProviderMetadata)?;
+    let response = client
+        .get(format!("{OPENROUTER_API_BASE}/images/models"))
+        .bearer_auth(api_key)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|error| {
+            DomainError::transient(format!("OpenRouter image model request failed: {error}"))
+        })?;
+    let value = match read_provider_json(response, "OpenRouter", "image model request").await {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    match image_model_options(&value, "OpenRouter") {
+        Ok(models) => Ok(json_response(200, Value::Array(models))),
+        Err(response) => Ok(response),
+    }
+}
+
+async fn openrouter_generate(
+    http_clients: &Arc<HttpClientPool>,
+    request: &SdRouteRequest,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<SdRouteResponse, DomainError> {
+    let api_key = match openrouter_api_key(request) {
+        Ok(api_key) => api_key,
+        Err(response) => return Ok(response),
+    };
+    let model = match required_body_string_response(
+        &request.body,
+        "model",
+        "OpenRouter image model is required",
+    ) {
+        Ok(model) => model,
+        Err(response) => return Ok(response),
+    };
+    let prompt = match required_body_string_response(
+        &request.body,
+        "prompt",
+        "An image prompt is required",
+    ) {
+        Ok(prompt) => prompt,
+        Err(response) => return Ok(response),
+    };
+    let mut payload = json!({
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "output_format": "jpeg",
+    });
+    if let Some(aspect_ratio) = request
+        .body
+        .get("aspect_ratio")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        payload["aspect_ratio"] = Value::String(aspect_ratio.to_string());
+    }
+
+    let client = http_client(http_clients)?;
+    let send = client
+        .post(format!("{OPENROUTER_API_BASE}/images"))
+        .bearer_auth(api_key)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&payload)
+        .send();
+    let response = tokio::select! {
+        result = send => result.map_err(|error| DomainError::transient(format!("OpenRouter image request failed: {error}")))?,
+        changed = cancel.changed() => {
+            let _ = changed;
+            return Err(DomainError::generation_cancelled_by_user());
+        }
+    };
+    let value = match read_provider_json(response, "OpenRouter", "image generation").await {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    match generated_image(&value, "OpenRouter") {
+        Ok((format, image)) => Ok(json_response(
+            200,
+            json!({ "format": format, "image": image }),
+        )),
+        Err(response) => Ok(response),
+    }
+}
+
 fn workers_ai_api_key(request: &SdRouteRequest) -> Result<&str, SdRouteResponse> {
     match &request.credentials {
         SdRouteCredentials::WorkersAi { api_key } => {
@@ -1343,7 +1696,10 @@ fn workers_ai_api_key(request: &SdRouteRequest) -> Result<&str, SdRouteResponse>
                 Ok(api_key)
             }
         }
-        SdRouteCredentials::None | SdRouteCredentials::CustomOpenAi { .. } => {
+        SdRouteCredentials::None
+        | SdRouteCredentials::NanoGpt { .. }
+        | SdRouteCredentials::OpenRouter { .. }
+        | SdRouteCredentials::CustomOpenAi { .. } => {
             Err(text(400, "Cloudflare Workers AI API key is required"))
         }
     }

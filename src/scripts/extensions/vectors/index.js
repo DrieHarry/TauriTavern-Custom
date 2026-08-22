@@ -1425,15 +1425,41 @@ function toggleSettings() {
 }
 
 /**
- * Loads models from a remote embedding endpoint and populates the corresponding select element.
- * @param {string} source Source key matching a remoteEmbeddingEndpoints entry
- * @returns {Promise<void>}
+ * Reads a remote model catalog without losing the response body when it is not JSON.
+ * @param {Response} response Fetch response
+ * @param {string} source Vector source name
+ * @returns {Promise<any>}
  */
+async function readEmbeddingModelsResponse(response, source) {
+    const contentType = response.headers.get('content-type') || 'unknown';
+    const text = await response.text();
+    let data;
+
+    try {
+        data = JSON.parse(text);
+    } catch {
+        const preview = text.replace(/\s+/g, ' ').trim().slice(0, 240) || 'empty response body';
+        throw new Error(`${source} models endpoint returned non-JSON data (HTTP ${response.status}, content-type ${contentType}): ${preview}`);
+    }
+
+    if (!response.ok) {
+        const message = data?.error?.message || data?.error || data?.message;
+        throw new Error(typeof message === 'string' ? message : `${source} models request failed (HTTP ${response.status})`);
+    }
+
+    return data;
+}
+
 async function loadRemoteEmbeddingModels(source) {
     const config = remoteEmbeddingEndpoints[source];
     if (!config) {
         return;
     }
+/**
+ * Loads models from a remote embedding endpoint and populates the corresponding select element.
+ * @param {string} source Source key matching a remoteEmbeddingEndpoints entry
+ * @returns {Promise<void>}
+ */
 
     const { url, settingsKey, selectId, getBody, filter } = config;
     const valueProperty = config.valueProperty || 'id';
@@ -1445,12 +1471,8 @@ async function loadRemoteEmbeddingModels(source) {
         headers: getRequestHeaders(),
         body: JSON.stringify(body || {}),
     });
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-    }
-
     /** @type {Array<any>} */
-    const data = await response.json();
+    const data = await readEmbeddingModelsResponse(response, source);
     if (!Array.isArray(data)) {
         throw new Error(`${source} models response must be an array`);
     }

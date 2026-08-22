@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use reqwest::header::{ACCEPT, AUTHORIZATION};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{Map, Value};
 use url::Url;
@@ -53,8 +53,20 @@ impl HttpProviderMetadataRepository {
             return Err(Self::map_error_response(provider_name, response, action).await);
         }
 
-        response.json::<Value>().await.map_err(|error| {
-            DomainError::InternalError(format!("{action} JSON is invalid: {error}"))
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let body = response.text().await.unwrap_or_default();
+        serde_json::from_str::<Value>(&body).map_err(|error| {
+            DomainError::InternalError(format!(
+                "{provider_name} {action} returned non-JSON data (HTTP {}, content-type {content_type}): {error}; body: {}",
+                status.as_u16(),
+                response_preview(&body),
+            ))
         })
     }
 
@@ -79,8 +91,20 @@ impl HttpProviderMetadataRepository {
             return Ok(None);
         }
 
-        response.json::<Value>().await.map(Some).map_err(|error| {
-            DomainError::InternalError(format!("{action} JSON is invalid: {error}"))
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let body = response.text().await.unwrap_or_default();
+        serde_json::from_str::<Value>(&body).map(Some).map_err(|error| {
+            DomainError::InternalError(format!(
+                "{provider_name} {action} returned non-JSON data (HTTP {}, content-type {content_type}): {error}; body: {}",
+                status.as_u16(),
+                response_preview(&body),
+            ))
         })
     }
 
@@ -219,6 +243,28 @@ impl ProviderMetadataRepository for HttpProviderMetadataRepository {
         };
 
         parse_nanogpt_credits(&balance, subscription.as_ref())
+    }
+
+    async fn openrouter_embedding_models(&self, api_key: &str) -> Result<Vec<Value>, DomainError> {
+        let client = self.client()?;
+        let request = client
+            .get(format!("{OPENROUTER_API_BASE}/embeddings/models"))
+            .header(ACCEPT, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {api_key}"));
+
+        let body = Self::send_json(request, "OpenRouter", "embedding models").await?;
+        parse_data_array(body, "OpenRouter embedding models")
+    }
+
+    async fn nanogpt_embedding_models(&self, api_key: &str) -> Result<Vec<Value>, DomainError> {
+        let client = self.client()?;
+        let request = client
+            .get(format!("{NANOGPT_API_BASE}/v1/embedding-models"))
+            .header(ACCEPT, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {api_key}"));
+
+        let body = Self::send_json(request, "NanoGPT", "embedding models").await?;
+        parse_data_array(body, "NanoGPT embedding models")
     }
 
     async fn siliconflow_embedding_models(
@@ -541,6 +587,15 @@ fn extract_error_message(body: &str, fallback: &str) -> String {
     } else {
         body.to_string()
     }
+}
+
+fn response_preview(body: &str) -> String {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = compact.chars().take(240).collect::<String>();
+    if compact.chars().count() > 240 {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn invalid_response(message: impl Into<String>) -> DomainError {

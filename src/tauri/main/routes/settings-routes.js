@@ -8,6 +8,8 @@ const PROVIDER_METADATA_SECRET_KEYS = new Set([
 const SECRET_BACKED_PROVIDER_METADATA_COMMANDS = [
     'get_openrouter_credits',
     'get_nanogpt_credits',
+    'get_openrouter_embedding_models',
+    'get_nanogpt_embedding_models',
     'get_siliconflow_embedding_models',
     'get_workers_ai_embedding_models',
     'get_workers_ai_multimodal_models',

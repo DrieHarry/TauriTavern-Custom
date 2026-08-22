@@ -2314,6 +2314,32 @@ async function loadElectronHubModels() {
     return [];
 }
 
+/**
+ * Reads a provider response as JSON while preserving useful diagnostics for HTML/text responses.
+ * @param {Response} response Fetch response
+ * @param {string} provider Provider/action label
+ * @returns {Promise<any>}
+ */
+async function readImageProviderJson(response, provider) {
+    const contentType = response.headers.get('content-type') || 'unknown';
+    const text = await response.text();
+    let data;
+
+    try {
+        data = JSON.parse(text);
+    } catch {
+        const preview = text.replace(/\s+/g, ' ').trim().slice(0, 240) || 'empty response body';
+        throw new Error(`${provider} returned non-JSON data (HTTP ${response.status}, content-type ${contentType}): ${preview}`);
+    }
+
+    if (!response.ok) {
+        const message = data?.error?.message || data?.error || data?.message;
+        throw new Error(typeof message === 'string' ? message : `${provider} request failed (HTTP ${response.status})`);
+    }
+
+    return data;
+}
+
 async function loadNanoGPTModels() {
     if (!secret_state[SECRET_KEYS.NANOGPT]) {
         console.debug('NanoGPT API key is not set.');
@@ -2325,11 +2351,7 @@ async function loadNanoGPTModels() {
         headers: getRequestHeaders({ omitContentType: true }),
     });
 
-    if (result.ok) {
-        return await result.json();
-    }
-
-    return [];
+    return await readImageProviderJson(result, 'NanoGPT image models');
 }
 
 async function loadHordeModels() {
@@ -2599,11 +2621,7 @@ async function loadOpenRouterModels() {
         headers: getRequestHeaders({ omitContentType: true }),
     });
 
-    if (result.ok) {
-        return await result.json();
-    }
-
-    return [];
+    return await readImageProviderJson(result, 'OpenRouter image models');
 }
 
 function loadNovelSchedulers() {
@@ -4516,13 +4534,8 @@ async function generateNanoGPTImage(prompt, negativePrompt, signal) {
         }),
     });
 
-    if (result.ok) {
-        const data = await result.json();
-        return { format: 'jpg', data: data.image };
-    } else {
-        const text = await result.text();
-        throw new Error(text);
-    }
+    const data = await readImageProviderJson(result, 'NanoGPT image generation');
+    return { format: data.format || 'jpg', data: data.image };
 }
 
 /**
@@ -4807,13 +4820,8 @@ async function generateOpenRouterImage(prompt, signal) {
         }),
     });
 
-    if (result.ok) {
-        const data = await result.json();
-        return { format: 'jpg', data: data.image };
-    }
-
-    const text = await result.text();
-    throw new Error(text);
+    const data = await readImageProviderJson(result, 'OpenRouter image generation');
+    return { format: data.format || 'jpg', data: data.image };
 }
 
 async function generateWorkersAIImage(prompt, negativePrompt, signal) {
