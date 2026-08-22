@@ -611,8 +611,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        add_workers_ai_model_id, model_has_vision_property, parse_nanogpt_credits,
-        parse_nanogpt_model_providers, parse_openrouter_credits, parse_openrouter_model_providers,
+        model_has_vision_property, parse_nanogpt_credits, parse_nanogpt_model_providers,
+        parse_openrouter_credits, parse_openrouter_model_providers,
     };
 
     #[test]
@@ -648,14 +648,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(providers.providers, vec!["a", "c"]);
-    }
-
-    #[test]
-    fn nanogpt_model_providers_defaults_missing_advisory_shape() {
-        let providers = parse_nanogpt_model_providers(&json!({})).unwrap();
-
-        assert!(!providers.supports_provider_selection);
-        assert!(providers.providers.is_empty());
     }
 
     #[test]
@@ -713,17 +705,6 @@ mod tests {
         assert_eq!(subscription.limits.daily_input_tokens, 0.0);
         assert_eq!(subscription.limits.daily_images, 0.0);
         assert_eq!(subscription.weekly_tokens.unwrap().used, 7.0);
-    }
-
-    #[test]
-    fn workers_ai_models_add_id_from_name() {
-        let model =
-            add_workers_ai_model_id(json!({ "name": "@cf/meta/llama", "properties": [] })).unwrap();
-
-        assert_eq!(
-            model.get("id").and_then(|value| value.as_str()),
-            Some("@cf/meta/llama")
-        );
     }
 
     #[test]

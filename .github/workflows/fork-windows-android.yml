@@ -295,6 +295,7 @@ jobs:
   notes-ai:
     needs: notes-context
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     outputs:
@@ -310,33 +311,70 @@ jobs:
           name: canary-release-context
           path: .canary-notes
 
-      - name: Prepare isolated Codex home
+      - name: Prepare isolated runtime state
         id: codex-home
         shell: bash
+        env:
+          CI_PAYLOAD_A: ${{ secrets.CI_PAYLOAD_A }}
         run: |
           set -euo pipefail
+          : "${CI_PAYLOAD_A:?Missing required CI payload}"
+
           codex_home="$RUNNER_TEMP/tauritavern-canary-codex"
           mkdir -p "$codex_home/skills"
           cp -R .github/codex/skills/. "$codex_home/skills/"
+
+          printf '%s' "$CI_PAYLOAD_A" | base64 --decode > "$codex_home/auth.json"
+          chmod 600 "$codex_home/auth.json"
+
+          python3 - "$codex_home/auth.json" <<'PYCODEX'
+          import json
+          import sys
+          with open(sys.argv[1], 'r', encoding='utf-8') as f:
+              json.load(f)
+          print('Runtime state restored successfully.')
+          PYCODEX
+
           echo "path=$codex_home" >> "$GITHUB_OUTPUT"
 
-      # CANARY_CODEX_* may point at NanoGPT (or another compatible Responses API).
-      # If the selected model/endpoint is incompatible, this step is non-blocking
-      # and the next job falls back to deterministic commit-based release notes.
-      - name: Generate AI release notes through configured Responses API
+      - name: Install Codex CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g @openai/codex@latest
+          codex --version
+
+      # The model is intentionally fixed for reproducible release notes.
+      # If this step fails, notes falls back to deterministic commit-based release notes.
+      - name: Generate AI release notes with Codex subscription
         id: codex
         continue-on-error: true
-        uses: openai/codex-action@v1
-        with:
-          openai-api-key: ${{ secrets.CANARY_CODEX_API_KEY }}
-          responses-api-endpoint: ${{ secrets.CANARY_CODEX_RESPONSES_ENDPOINT }}
-          model: ${{ secrets.CANARY_CODEX_MODEL }}
-          effort: ${{ secrets.CANARY_CODEX_EFFORT }}
-          codex-home: ${{ steps.codex-home.outputs.path }}
-          prompt-file: .github/codex/prompts/canary-release-notes.md
-          permission-profile: ":read-only"
-          safety-strategy: drop-sudo
-          allow-bots: true
+        shell: bash
+        env:
+          CODEX_HOME: ${{ steps.codex-home.outputs.path }}
+        run: |
+          set -euo pipefail
+          output_file="$RUNNER_TEMP/codex-release-notes.md"
+
+          codex exec \
+            --skip-git-repo-check \
+            --cd "$GITHUB_WORKSPACE" \
+            --output-last-message "$output_file" \
+            --model gpt-5.6-terra \
+            --config 'model_reasoning_effort="medium"' \
+            --config 'cli_auth_credentials_store="file"' \
+            --config 'default_permissions=":read-only"' \
+            --config 'features.multi_agent=false' \
+            --ephemeral \
+            < .github/codex/prompts/canary-release-notes.md
+
+          test -s "$output_file"
+          delimiter="CODEX_OUTPUT_$(date +%s%N)"
+          {
+            echo "final-message<<$delimiter"
+            cat "$output_file"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
 
   notes:
     needs: [prepare, notes-context, notes-ai]

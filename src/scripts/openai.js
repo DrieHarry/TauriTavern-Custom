@@ -1043,13 +1043,15 @@ function setOpenAIMessages(chat, stripOldToolCalls = false) {
             && oai_settings.show_thoughts
             && canReplayProviderTurnMetadata;
         const reasoningContent = shouldReplayReasoningContent ? metadataMessage?.extra?.tool_reasoning_content : null;
-        // Remove provider reasoning metadata from invocations if the API/model/speaker don't match.
+        // Remove provider metadata from invocations if the API/model/speaker don't match.
         if (Array.isArray(invocations) && invocations.length > 0) {
             invocations.forEach((invocation, index) => {
-                if (!canReplayProviderTurnMetadata && (invocation.signature || invocation.reasoning)) {
+                if (!canReplayProviderTurnMetadata
+                    && (invocation.signature || invocation.reasoning || Object.hasOwn(invocation, 'extra_content'))) {
                     const cloneInvocation = structuredClone(invocation);
                     delete cloneInvocation.signature;
                     delete cloneInvocation.reasoning;
+                    delete cloneInvocation.extra_content;
                     invocations[index] = cloneInvocation;
                 }
             });
@@ -5163,6 +5165,7 @@ class Message {
                 name: i.name,
             },
             ...(includeSignature && i.signature ? { signature: i.signature } : {}),
+            ...(Object.hasOwn(i, 'extra_content') ? { extra_content: i.extra_content } : {}),
         }));
         const fallbackReasoning = invocations.find(i => typeof i.reasoning === 'string' && i.reasoning.length > 0)?.reasoning || null;
         this.reasoning = includeReasoning ? fallbackReasoning : null;
@@ -8230,6 +8233,8 @@ export function isImageInliningSupported(settings = oai_settings) {
             return visionSupportedModels.some(model => settings.vertexai_model.includes(model));
         case chat_completion_sources.CLAUDE:
             return visionSupportedModels.some(model => settings.claude_model.includes(model));
+        case chat_completion_sources.DEEPSEEK:
+            return settings.deepseek_model === 'deepseek-v4-flash-vision-exp';
         case chat_completion_sources.OPENROUTER:
             return (Array.isArray(model_list) && model_list.find(m => m.id === settings.openrouter_model)?.architecture?.input_modalities?.includes('image'));
         case chat_completion_sources.CUSTOM:
@@ -8710,7 +8715,7 @@ function updateFeatureSupportFlags() {
     }
 
     const model = getChatCompletionModel();
-    $('#continue_prefill_block').toggle(!isDirectGeminiSource() || !['gemini-3.5-flash-lite', 'gemini-3.6-flash'].includes(model));
+    $('#continue_prefill_block').toggle(!isDirectGeminiSource() || !['gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.7-flash'].includes(model));
     updateReasoningEffortOptions();
 }
 
