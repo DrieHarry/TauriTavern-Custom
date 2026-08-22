@@ -371,9 +371,9 @@ jobs:
           test -s "$output_file"
           delimiter="CODEX_OUTPUT_$(date +%s%N)"
           {
-            echo "final-message<<$delimiter"
+            printf 'final-message<<%s\n' "$delimiter"
             cat "$output_file"
-            echo "$delimiter"
+            printf '\n%s\n' "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
   notes:
@@ -393,10 +393,25 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s\n' "$AI_NOTES" > candidate.md
+
+          section_has_bullet() {
+            local heading=$1
+            local stop_at=${2:-}
+            awk -v heading="$heading" -v stop_at="$stop_at" '
+              $0 == heading { in_section = 1; next }
+              in_section && stop_at != "" && $0 == stop_at { exit found ? 0 : 1 }
+              in_section && /^[[:space:]]*-[[:space:]]+[^[:space:]]/ { found = 1 }
+              END { exit found ? 0 : 1 }
+            ' candidate.md
+          }
+
           if [[ -n "$AI_NOTES" && ${#AI_NOTES} -le 30000 ]] \
             && grep -qx '## 更新日志' candidate.md \
             && grep -qx '## Release Notes' candidate.md \
-            && ! grep -q '^```' candidate.md; then
+            && grep -qx -- '---' candidate.md \
+            && ! grep -q '^```' candidate.md \
+            && section_has_bullet '## 更新日志' '---' \
+            && section_has_bullet '## Release Notes'; then
             {
               sed -n '1p' context/fallback.md
               echo
