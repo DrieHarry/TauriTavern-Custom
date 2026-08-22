@@ -96,7 +96,7 @@ jobs:
       - uses: pnpm/setup@v2
         with:
           runtime: node@22
-          cache: pnpm
+          cache: true
           install: false
 
       - run: pnpm install --frozen-lockfile
@@ -197,7 +197,7 @@ jobs:
       - uses: pnpm/setup@v2
         with:
           runtime: node@22
-          cache: pnpm
+          cache: true
           install: false
 
       - run: pnpm install --frozen-lockfile
