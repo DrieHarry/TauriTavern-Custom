@@ -8,7 +8,7 @@
 #
 # When upstream canary-release.yml changes, compare and port relevant changes from:
 # prepare, shared/Windows desktop setup, shared/Android mobile setup,
-# notes-context, notes-ai, and Publish Canary.
+# notes-context, notes-ai, notes, and Publish Canary.
 
 name: Fork Windows + Android
 
@@ -73,7 +73,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   desktop:
-    needs: [prepare, notes-ai]
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -93,11 +93,15 @@ jobs:
         with:
           workspaces: "src-tauri -> target"
 
-      - uses: pnpm/setup@v2
+      - uses: pnpm/action-setup@v4
         with:
-          runtime: node@22
+          version: 10
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
           cache: pnpm
-          install: false
 
       - run: pnpm install --frozen-lockfile
 
@@ -132,7 +136,7 @@ jobs:
           if-no-files-found: error
 
   mobile:
-    needs: [prepare, notes-ai]
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -194,11 +198,15 @@ jobs:
         with:
           workspaces: "src-tauri -> target"
 
-      - uses: pnpm/setup@v2
+      - uses: pnpm/action-setup@v4
         with:
-          runtime: node@22
+          version: 10
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
           cache: pnpm
-          install: false
 
       - run: pnpm install --frozen-lockfile
 
@@ -273,14 +281,14 @@ jobs:
             cat changes.md
             echo
             echo "[Full comparison](https://github.com/${GITHUB_REPOSITORY}/compare/${PREVIOUS_SHA}...${GITHUB_SHA})"
-          } > release-frame.md
+          } > fallback.md
 
       - uses: actions/upload-artifact@v4
         with:
           name: canary-release-context
           path: |
             release-context.md
-            release-frame.md
+            fallback.md
           if-no-files-found: error
           retention-days: 7
 
@@ -290,6 +298,8 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -335,7 +345,10 @@ jobs:
           codex --version
 
       # The model is intentionally fixed for reproducible release notes.
-      - name: Generate AI release notes with AI
+      # If this step fails, notes falls back to deterministic commit-based release notes.
+      - name: Generate AI release notes with Codex subscription
+        id: codex
+        continue-on-error: true
         shell: bash
         env:
           CODEX_HOME: ${{ steps.codex-home.outputs.path }}
@@ -348,46 +361,53 @@ jobs:
             --cd "$GITHUB_WORKSPACE" \
             --output-last-message "$output_file" \
             --model gpt-5.6-terra \
-            --sandbox read-only \
-            --config 'approval_policy="never"' \
             --config 'model_reasoning_effort="medium"' \
             --config 'cli_auth_credentials_store="file"' \
+            --config 'default_permissions=":read-only"' \
             --config 'features.multi_agent=false' \
             --ephemeral \
             < .github/codex/prompts/canary-release-notes.md
 
           test -s "$output_file"
-
-          section_has_bullet() {
-            local heading=$1
-            local stop_at=${2:-}
-            awk -v heading="$heading" -v stop_at="$stop_at" '
-              $0 == heading { in_section = 1; next }
-              in_section && stop_at != "" && $0 == stop_at { exit found ? 0 : 1 }
-              in_section && /^[[:space:]]*-[[:space:]]+[^[:space:]]/ { found = 1 }
-              END { exit found ? 0 : 1 }
-            ' "$output_file"
-          }
-
-          output_size=$(wc -c < "$output_file")
-          if [[ "$output_size" -gt 30000 ]] \
-            || ! grep -qx '## 更新日志' "$output_file" \
-            || ! grep -qx '## Release Notes' "$output_file" \
-            || ! grep -qx -- '---' "$output_file" \
-            || grep -q '^```' "$output_file" \
-            || ! section_has_bullet '## 更新日志' '---' \
-            || ! section_has_bullet '## Release Notes'; then
-            echo "::error::AI release notes were empty or invalid." >&2
-            exit 1
-          fi
-
+          delimiter="CODEX_OUTPUT_$(date +%s%N)"
           {
-            sed -n '1p' .canary-notes/release-frame.md
-            echo
+            echo "final-message<<$delimiter"
             cat "$output_file"
-            echo
-            sed -n '/^\[Full comparison\]/,$p' .canary-notes/release-frame.md
-          } > release-notes.md
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+  notes:
+    needs: [prepare, notes-context, notes-ai]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.notes-context.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: canary-release-context
+          path: context
+
+      - name: Select validated release notes
+        env:
+          AI_NOTES: ${{ needs.notes-ai.outputs.final_message }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$AI_NOTES" > candidate.md
+          if [[ -n "$AI_NOTES" && ${#AI_NOTES} -le 30000 ]] \
+            && grep -qx '## 更新日志' candidate.md \
+            && grep -qx '## Release Notes' candidate.md \
+            && ! grep -q '^```' candidate.md; then
+            {
+              sed -n '1p' context/fallback.md
+              echo
+              cat candidate.md
+              echo
+              sed -n '/^\[Full comparison\]/,$p' context/fallback.md
+            } > release-notes.md
+          else
+            echo "::warning::AI release notes unavailable or invalid; using deterministic commit notes."
+            cp context/fallback.md release-notes.md
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -397,7 +417,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [prepare, desktop, mobile, notes-ai]
+    needs: [prepare, desktop, mobile, notes]
     runs-on: ubuntu-latest
     permissions:
       actions: read
