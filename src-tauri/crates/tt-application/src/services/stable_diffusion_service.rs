@@ -6,6 +6,7 @@ use tokio::sync::{RwLock, watch};
 
 use crate::dto::stable_diffusion_dto::{SdRouteResponseDto, SdRouteResponseKindDto};
 use crate::errors::ApplicationError;
+use tt_domain::models::endpoint_url::parse_user_http_endpoint;
 use tt_domain::models::secret::SecretKeys;
 use tt_ports::repositories::secret_repository::SecretRepository;
 use tt_ports::repositories::stable_diffusion_repository::{
@@ -115,9 +116,44 @@ impl StableDiffusionService {
         })
     }
 
+    pub fn resolve_user_endpoint(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<Option<String>, ApplicationError> {
+        resolve_custom_openai_user_endpoint(path, body).map_err(ApplicationError::from)
+    }
+
     pub async fn cancel_request(&self, request_id: &str) -> bool {
         self.active_requests.cancel(request_id).await
     }
+}
+
+fn resolve_custom_openai_user_endpoint(
+    path: &str,
+    body: &Value,
+) -> Result<Option<String>, tt_domain::errors::DomainError> {
+    let path = path.trim().trim_matches('/').to_ascii_lowercase();
+    if !matches!(
+        path.as_str(),
+        "custom-openai/models" | "custom-openai/generate"
+    ) {
+        return Ok(None);
+    }
+
+    let Some(url) = body.get("url") else {
+        return Ok(None);
+    };
+    let url = url.as_str().ok_or_else(|| {
+        tt_domain::errors::DomainError::InvalidData(
+            "Custom OpenAI-compatible URL must be a string".to_string(),
+        )
+    })?;
+    if url.trim().is_empty() || tt_domain::models::endpoint_url::is_codex_endpoint(url) {
+        return Ok(None);
+    }
+
+    Ok(Some(parse_user_http_endpoint(url)?.to_string()))
 }
 
 fn text_response(status: u16, message: impl Into<String>) -> SdRouteResponseDto {
@@ -125,6 +161,40 @@ fn text_response(status: u16, message: impl Into<String>) -> SdRouteResponseDto 
         status,
         kind: SdRouteResponseKindDto::Text,
         body: Value::String(message.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::resolve_custom_openai_user_endpoint;
+
+    #[test]
+    fn custom_image_routes_require_a_canonical_user_endpoint_grant() {
+        assert_eq!(
+            resolve_custom_openai_user_endpoint(
+                "custom-openai/generate",
+                &json!({ "url": " HTTPS://EXAMPLE.COM:443/v1/ " }),
+            )
+            .expect("valid endpoint"),
+            Some("https://example.com/v1".to_string())
+        );
+        assert_eq!(
+            resolve_custom_openai_user_endpoint(
+                "custom-openai/models",
+                &json!({ "url": "http://codex.local/v1" }),
+            )
+            .expect("Codex is built in"),
+            None
+        );
+        assert!(
+            resolve_custom_openai_user_endpoint(
+                "custom-openai/generate",
+                &json!({ "url": "file:///etc/passwd" }),
+            )
+            .is_err()
+        );
     }
 }
 

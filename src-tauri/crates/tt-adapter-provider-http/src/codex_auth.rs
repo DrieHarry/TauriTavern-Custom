@@ -1,10 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tt_domain::errors::DomainError;
 
@@ -24,6 +28,8 @@ pub struct CodexAuthTokens {
     pub id_token: Option<String>,
     #[serde(default)]
     pub account_id: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -40,6 +46,8 @@ pub struct CodexAuth {
     pub account_id: Option<String>,
     #[serde(default)]
     pub last_refresh: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 impl CodexAuth {
@@ -83,6 +91,12 @@ pub struct CodexAuthManager {
     refresh_lock: Mutex<()>,
 }
 
+static AUTH_MANAGER: LazyLock<CodexAuthManager> = LazyLock::new(CodexAuthManager::default);
+
+pub(crate) fn codex_auth_manager() -> &'static CodexAuthManager {
+    &AUTH_MANAGER
+}
+
 impl Default for CodexAuthManager {
     fn default() -> Self {
         Self {
@@ -92,16 +106,21 @@ impl Default for CodexAuthManager {
 }
 
 impl CodexAuthManager {
-    pub async fn load_auth(&self, client: &reqwest::Client) -> Result<CodexResolvedAuth, DomainError> {
+    pub async fn load_auth(
+        &self,
+        client: &reqwest::Client,
+    ) -> Result<CodexResolvedAuth, DomainError> {
         let auth_path = get_auth_file_path()?;
         let _guard = self.refresh_lock.lock().await;
 
-        let content = tokio::fs::read_to_string(&auth_path).await.map_err(|error| {
-            DomainError::InvalidData(format!(
-                "Could not read Codex login at {}: {error}. Run \"codex login\" first.",
-                auth_path.display()
-            ))
-        })?;
+        let content = tokio::fs::read_to_string(&auth_path)
+            .await
+            .map_err(|error| {
+                DomainError::InvalidData(format!(
+                    "Could not read Codex login at {}: {error}. Run \"codex login\" first.",
+                    auth_path.display()
+                ))
+            })?;
 
         let mut auth: CodexAuth = serde_json::from_str(&content).map_err(|error| {
             DomainError::InvalidData(format!(
@@ -111,7 +130,7 @@ impl CodexAuthManager {
         })?;
 
         if should_refresh(&auth) {
-            refresh_auth(client, &mut auth, &auth_path).await?;
+            refresh_auth(client, &mut auth, &auth_path, &content).await?;
         }
 
         let access_token = auth.get_access_token().map(str::to_string).ok_or_else(|| {
@@ -196,7 +215,9 @@ pub fn decode_jwt_claims(token: &str) -> Option<Value> {
         _ => normalized,
     };
 
-    let bytes = base64::engine::general_purpose::STANDARD.decode(padded.as_bytes()).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(padded.as_bytes())
+        .ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -207,7 +228,10 @@ fn extract_claim_string(claims: &Value, field: &str) -> Option<String> {
         return Some(val.to_string());
     }
 
-    claims.get(field).and_then(Value::as_str).map(str::to_string)
+    claims
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn extract_claim_bool(claims: &Value, field: &str) -> bool {
@@ -266,6 +290,7 @@ async fn refresh_auth(
     client: &reqwest::Client,
     auth: &mut CodexAuth,
     auth_file: &Path,
+    expected_content: &str,
 ) -> Result<(), DomainError> {
     let refresh_token = auth.get_refresh_token().ok_or_else(|| {
         DomainError::InvalidData(
@@ -293,11 +318,7 @@ async fn refresh_auth(
     if !response.status().is_success() {
         let status = response.status();
         let error_body = response.text().await.unwrap_or_default();
-        let snippet = if error_body.len() > 500 {
-            &error_body[..500]
-        } else {
-            &error_body
-        };
+        let snippet = error_body.chars().take(500).collect::<String>();
         return Err(DomainError::InternalError(format!(
             "Codex token refresh failed: {status} {snippet}"
         )));
@@ -327,26 +348,101 @@ async fn refresh_auth(
         DomainError::InternalError(format!("Failed to serialize Codex auth JSON: {error}"))
     })?;
 
-    if let Some(parent) = auth_file.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
+    persist_auth_file(
+        auth_file,
+        format!("{serialized}\n").as_bytes(),
+        expected_content,
+    )
+    .await
+}
 
-    tokio::fs::write(auth_file, format!("{serialized}\n"))
-        .await
-        .map_err(|error| {
+async fn persist_auth_file(
+    auth_file: &Path,
+    serialized: &[u8],
+    expected_content: &str,
+) -> Result<(), DomainError> {
+    let parent = auth_file.parent().ok_or_else(|| {
+        DomainError::InvalidData(format!(
+            "Codex auth path has no parent directory: {}",
+            auth_file.display()
+        ))
+    })?;
+    tokio::fs::create_dir_all(parent).await.map_err(|error| {
+        DomainError::InternalError(format!(
+            "Failed to create Codex auth directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+
+    let temp_path = crate::file_replace::unique_temp_path(auth_file);
+    let write_result = async {
+        let mut temp = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await
+            .map_err(|error| {
+                DomainError::InternalError(format!(
+                    "Failed to create temporary Codex auth file {}: {error}",
+                    temp_path.display()
+                ))
+            })?;
+        temp.write_all(serialized).await.map_err(|error| {
             DomainError::InternalError(format!(
-                "Failed to write updated Codex auth file to {}: {error}",
-                auth_file.display()
+                "Failed to write temporary Codex auth file {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+        temp.sync_all().await.map_err(|error| {
+            DomainError::InternalError(format!(
+                "Failed to sync temporary Codex auth file {}: {error}",
+                temp_path.display()
             ))
         })?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(auth_file, std::fs::Permissions::from_mode(0o600));
-    }
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&temp_path, {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::Permissions::from_mode(0o600)
+        })
+        .await
+        .map_err(|error| {
+            DomainError::InternalError(format!(
+                "Failed to secure temporary Codex auth file {}: {error}",
+                temp_path.display()
+            ))
+        })?;
 
-    Ok(())
+        let current = tokio::fs::read_to_string(auth_file)
+            .await
+            .map_err(|error| {
+                DomainError::InternalError(format!(
+                    "Failed to re-read Codex auth file {} before refresh commit: {error}",
+                    auth_file.display()
+                ))
+            })?;
+        if current != expected_content {
+            return Err(DomainError::Conflict(format!(
+                "Codex auth file changed while tokens were refreshing: {}",
+                auth_file.display()
+            )));
+        }
+
+        tokio::fs::rename(&temp_path, auth_file)
+            .await
+            .map_err(|error| {
+                DomainError::InternalError(format!(
+                    "Failed to atomically replace Codex auth file {}: {error}",
+                    auth_file.display()
+                ))
+            })
+    }
+    .await;
+
+    if write_result.is_err() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+    write_result
 }
 
 pub fn build_codex_headers(
@@ -367,9 +463,8 @@ pub fn build_codex_headers(
 
     headers.insert(
         HeaderName::from_static("version"),
-        HeaderValue::from_str(version).map_err(|_| {
-            DomainError::InvalidData("Invalid version header value".to_string())
-        })?,
+        HeaderValue::from_str(version)
+            .map_err(|_| DomainError::InvalidData("Invalid version header value".to_string()))?,
     );
 
     headers.insert(
@@ -380,9 +475,8 @@ pub fn build_codex_headers(
     let user_agent = format!("SillyTavern-Codex-RP/{version}");
     headers.insert(
         USER_AGENT,
-        HeaderValue::from_str(&user_agent).map_err(|_| {
-            DomainError::InvalidData("Invalid user-agent header value".to_string())
-        })?,
+        HeaderValue::from_str(&user_agent)
+            .map_err(|_| DomainError::InvalidData("Invalid user-agent header value".to_string()))?,
     );
 
     if include_content_type {
@@ -410,6 +504,8 @@ pub fn build_codex_headers(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -442,10 +538,7 @@ mod tests {
             headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
             "Bearer test-token-123"
         );
-        assert_eq!(
-            headers.get("version").unwrap().to_str().unwrap(),
-            "0.145.0"
-        );
+        assert_eq!(headers.get("version").unwrap().to_str().unwrap(), "0.145.0");
         assert_eq!(
             headers.get("originator").unwrap().to_str().unwrap(),
             "SillyTavern"
@@ -466,5 +559,75 @@ mod tests {
             headers.get(CONTENT_TYPE).unwrap().to_str().unwrap(),
             "application/json"
         );
+    }
+
+    #[test]
+    fn auth_round_trip_preserves_unknown_cli_fields() {
+        let source = json!({
+            "tokens": {
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "future_token_field": "preserved"
+            },
+            "last_refresh": "2026-08-23T00:00:00Z",
+            "OPENAI_API_KEY": null,
+            "future_top_level": { "enabled": true }
+        });
+
+        let auth: CodexAuth = serde_json::from_value(source.clone()).expect("parse auth");
+        let encoded = serde_json::to_value(auth).expect("encode auth");
+
+        assert_eq!(encoded["tokens"]["future_token_field"], "preserved");
+        assert_eq!(encoded["future_top_level"], source["future_top_level"]);
+        assert!(encoded.get("OPENAI_API_KEY").is_some());
+    }
+
+    #[tokio::test]
+    async fn auth_persistence_rejects_concurrent_cli_changes_without_overwriting() {
+        let root = std::env::temp_dir().join(format!(
+            "tauritavern-codex-auth-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&root).await.expect("temp root");
+        let auth_file = root.join("auth.json");
+        tokio::fs::write(&auth_file, "cli-new\n")
+            .await
+            .expect("write current auth");
+
+        let result = persist_auth_file(&auth_file, b"app-refresh\n", "stale-old\n").await;
+
+        assert!(matches!(result, Err(DomainError::Conflict(_))));
+        assert_eq!(
+            tokio::fs::read_to_string(&auth_file)
+                .await
+                .expect("read retained auth"),
+            "cli-new\n"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn auth_persistence_replaces_the_complete_file() {
+        let root = std::env::temp_dir().join(format!(
+            "tauritavern-codex-auth-replace-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&root).await.expect("temp root");
+        let auth_file = root.join("auth.json");
+        tokio::fs::write(&auth_file, "old\n")
+            .await
+            .expect("write old auth");
+
+        persist_auth_file(&auth_file, b"new-complete-json\n", "old\n")
+            .await
+            .expect("atomic auth replacement");
+
+        assert_eq!(
+            tokio::fs::read_to_string(&auth_file)
+                .await
+                .expect("read replaced auth"),
+            "new-complete-json\n"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

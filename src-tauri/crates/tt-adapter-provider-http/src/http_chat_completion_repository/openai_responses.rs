@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
 use reqwest::{Client, StatusCode};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
@@ -81,6 +81,31 @@ impl ResponsesWsSessionPool {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ResponsesStreamOptions {
+    pub emit_reasoning: bool,
+    pub include_reasoning_alias: bool,
+    pub prefer_reasoning_text: bool,
+}
+
+impl Default for ResponsesStreamOptions {
+    fn default() -> Self {
+        Self {
+            emit_reasoning: true,
+            include_reasoning_alias: false,
+            prefer_reasoning_text: false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResponsesToolCallState {
+    index: usize,
+    name: String,
+    announced: bool,
+    arguments_streamed: bool,
+}
+
 struct ResponsesStreamState {
     created: u64,
     model: String,
@@ -88,10 +113,19 @@ struct ResponsesStreamState {
     sent_role: bool,
     saw_tool_call: bool,
     done_sent: bool,
+    saw_reasoning_text: bool,
+    options: ResponsesStreamOptions,
+    tool_calls: HashMap<String, ResponsesToolCallState>,
+    tool_item_to_call_id: HashMap<String, String>,
 }
 
 impl ResponsesStreamState {
+    #[cfg(test)]
     fn new(model: String) -> Self {
+        Self::with_options(model, ResponsesStreamOptions::default())
+    }
+
+    fn with_options(model: String, options: ResponsesStreamOptions) -> Self {
         Self {
             created: current_unix_timestamp(),
             model,
@@ -99,6 +133,10 @@ impl ResponsesStreamState {
             sent_role: false,
             saw_tool_call: false,
             done_sent: false,
+            saw_reasoning_text: false,
+            options,
+            tool_calls: HashMap::new(),
+            tool_item_to_call_id: HashMap::new(),
         }
     }
 
@@ -143,71 +181,232 @@ impl ResponsesStreamState {
                         self.send_delta(sender, json!({ "content": delta }), None);
                     }
                 }
-                "response.reasoning_text.delta"
-                | "response.reasoning_summary_text.delta"
-                | "response.reasoning.delta" => {
+                "response.reasoning_text.delta" | "response.reasoning.delta" => {
                     if let Some(delta) = event.get("delta").and_then(Value::as_str)
                         && !delta.is_empty()
+                        && self.options.emit_reasoning
                     {
-                        self.send_delta(sender, json!({ "reasoning_content": delta }), None);
+                        self.saw_reasoning_text = true;
+                        self.send_reasoning_delta(sender, delta);
                     }
                 }
-                "response.output_item.done" => {
-                    let Some(item) = event.get("item").and_then(Value::as_object) else {
-                        return Ok(());
-                    };
-
-                    if item.get("type").and_then(Value::as_str) != Some("function_call") {
-                        return Ok(());
+                "response.reasoning_summary_text.delta" => {
+                    if let Some(delta) = event.get("delta").and_then(Value::as_str)
+                        && !delta.is_empty()
+                        && self.options.emit_reasoning
+                        && (!self.options.prefer_reasoning_text || !self.saw_reasoning_text)
+                    {
+                        self.send_reasoning_delta(sender, delta);
                     }
-
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty());
-                    let name = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty());
-                    let arguments = item
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-
-                    let (Some(call_id), Some(name)) = (call_id, name) else {
-                        return Ok(());
-                    };
-
-                    self.saw_tool_call = true;
-
-                    let output_index = event
-                        .get("output_index")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as usize;
-
-                    self.send_delta(
-                        sender,
-                        json!({
-                            "tool_calls": [{
-                                "index": output_index,
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": arguments
-                                }
-                            }]
-                        }),
-                        None,
-                    );
+                }
+                "response.output_item.added" => {
+                    if let Some(item) = event.get("item") {
+                        self.handle_tool_call_added(sender, event, item);
+                    }
+                }
+                "response.function_call_arguments.delta" => {
+                    self.handle_tool_call_arguments(sender, event);
+                }
+                "response.output_item.done" => {
+                    if let Some(item) = event.get("item") {
+                        self.handle_tool_call_done(sender, event, item);
+                    }
                 }
                 _ => {}
             }
         }
 
         Ok(())
+    }
+
+    fn send_reasoning_delta(&mut self, sender: &ChatCompletionStreamSender, delta: &str) {
+        let mut reasoning_delta = json!({ "reasoning_content": delta });
+        if self.options.include_reasoning_alias {
+            reasoning_delta["reasoning"] = Value::String(delta.to_string());
+        }
+        self.send_delta(sender, reasoning_delta, None);
+    }
+
+    fn handle_tool_call_added(
+        &mut self,
+        sender: &ChatCompletionStreamSender,
+        event: &Value,
+        item: &Value,
+    ) {
+        let Some((call_id, index, name, announce)) = self.register_tool_call(event, item) else {
+            return;
+        };
+        if announce {
+            self.send_tool_call_delta(sender, index, Some(&call_id), Some(&name), Some(""));
+        }
+    }
+
+    fn handle_tool_call_arguments(&mut self, sender: &ChatCompletionStreamSender, event: &Value) {
+        let item_id = event
+            .get("item_id")
+            .or_else(|| event.get("call_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(item_id) = item_id else {
+            return;
+        };
+        let call_id = self
+            .tool_item_to_call_id
+            .get(item_id)
+            .cloned()
+            .unwrap_or_else(|| item_id.to_string());
+        let name = event
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let arguments = event
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if arguments.is_empty() {
+            return;
+        }
+
+        let next_index = self.tool_calls.len();
+        let state =
+            self.tool_calls
+                .entry(call_id.clone())
+                .or_insert_with(|| ResponsesToolCallState {
+                    index: next_index,
+                    name: name.clone(),
+                    ..Default::default()
+                });
+        if state.name.is_empty() && !name.is_empty() {
+            state.name = name;
+        }
+        let index = state.index;
+        let announce = !state.announced;
+        state.announced = true;
+        state.arguments_streamed = true;
+        let name = state.name.clone();
+        self.saw_tool_call = true;
+
+        if announce {
+            self.send_tool_call_delta(sender, index, Some(&call_id), Some(&name), Some(arguments));
+        } else {
+            self.send_tool_call_delta(sender, index, None, None, Some(arguments));
+        }
+    }
+
+    fn handle_tool_call_done(
+        &mut self,
+        sender: &ChatCompletionStreamSender,
+        event: &Value,
+        item: &Value,
+    ) {
+        let Some((call_id, index, name, announce)) = self.register_tool_call(event, item) else {
+            return;
+        };
+        let arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let arguments_streamed = self
+            .tool_calls
+            .get(&call_id)
+            .is_some_and(|state| state.arguments_streamed);
+
+        if announce {
+            self.send_tool_call_delta(sender, index, Some(&call_id), Some(&name), Some(arguments));
+        } else if !arguments_streamed && !arguments.is_empty() {
+            self.send_tool_call_delta(sender, index, None, None, Some(arguments));
+        }
+    }
+
+    fn register_tool_call(
+        &mut self,
+        event: &Value,
+        item: &Value,
+    ) -> Option<(String, usize, String, bool)> {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return None;
+        }
+
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .or_else(|| event.get("item_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?
+            .to_string();
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        if let Some(item_id) = item
+            .get("id")
+            .or_else(|| event.get("item_id"))
+            .and_then(Value::as_str)
+        {
+            self.tool_item_to_call_id
+                .insert(item_id.to_string(), call_id.clone());
+        }
+
+        let next_index = event
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(self.tool_calls.len());
+        let state =
+            self.tool_calls
+                .entry(call_id.clone())
+                .or_insert_with(|| ResponsesToolCallState {
+                    index: next_index,
+                    name: name.clone(),
+                    ..Default::default()
+                });
+        if state.name.is_empty() && !name.is_empty() {
+            state.name = name;
+        }
+        let announce = !state.announced;
+        state.announced = true;
+        self.saw_tool_call = true;
+
+        Some((call_id, state.index, state.name.clone(), announce))
+    }
+
+    fn send_tool_call_delta(
+        &mut self,
+        sender: &ChatCompletionStreamSender,
+        index: usize,
+        call_id: Option<&str>,
+        name: Option<&str>,
+        arguments: Option<&str>,
+    ) {
+        let mut tool_call = Map::new();
+        tool_call.insert("index".to_string(), json!(index));
+        if let Some(call_id) = call_id {
+            tool_call.insert("id".to_string(), Value::String(call_id.to_string()));
+            tool_call.insert("type".to_string(), Value::String("function".to_string()));
+        }
+        let mut function = Map::new();
+        if let Some(name) = name {
+            function.insert("name".to_string(), Value::String(name.to_string()));
+        }
+        if let Some(arguments) = arguments {
+            function.insert(
+                "arguments".to_string(),
+                Value::String(arguments.to_string()),
+            );
+        }
+        if !function.is_empty() {
+            tool_call.insert("function".to_string(), Value::Object(function));
+        }
+        self.send_delta(
+            sender,
+            json!({ "tool_calls": [Value::Object(tool_call)] }),
+            None,
+        );
     }
 
     fn ensure_completed(&self, cancelled: bool) -> Result<(), DomainError> {
@@ -317,9 +516,14 @@ async fn generate_http(
     }
 
     let body = read_upstream_json_body(provider_name, "generate", response).await?;
-    validate_terminal_response(&body)?;
+    normalize_completed_response(body)
+}
 
-    Ok(normalizers::normalize_openai_responses_response(body))
+pub(crate) fn normalize_completed_response(
+    response: Value,
+) -> Result<ChatCompletionRepositoryGenerateResponse, DomainError> {
+    validate_terminal_response(&response)?;
+    Ok(normalizers::normalize_openai_responses_response(response))
 }
 
 pub(super) async fn generate_stream(
@@ -384,7 +588,26 @@ async fn generate_stream_http(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let mut state = ResponsesStreamState::new(model);
+    stream_http_response(
+        provider_name,
+        response,
+        model,
+        sender,
+        cancel,
+        ResponsesStreamOptions::default(),
+    )
+    .await
+}
+
+pub(crate) async fn stream_http_response(
+    provider_name: &str,
+    response: reqwest::Response,
+    model: String,
+    sender: ChatCompletionStreamSender,
+    cancel: ChatCompletionCancelReceiver,
+    options: ResponsesStreamOptions,
+) -> Result<(), DomainError> {
+    let mut state = ResponsesStreamState::with_options(model, options);
     let cancelled = cancel.clone();
 
     let (dummy_sender, dummy_receiver) = mpsc::unbounded_channel::<String>();
@@ -684,7 +907,7 @@ fn websocket_response_payload(
     Ok(response)
 }
 
-fn upstream_payload(payload: &Value) -> Result<Value, DomainError> {
+pub(crate) fn upstream_payload(payload: &Value) -> Result<Value, DomainError> {
     let mut object = payload.as_object().cloned().ok_or_else(|| {
         DomainError::InvalidData("OpenAI Responses payload must be an object".to_string())
     })?;
@@ -723,7 +946,7 @@ fn response_from_ws_payload(payload: &[u8], operation: &str) -> Result<Option<Va
     terminal_response_from_event(&event).map(|response| response.cloned())
 }
 
-fn terminal_response_from_event(event: &Value) -> Result<Option<&Value>, DomainError> {
+pub(crate) fn terminal_response_from_event(event: &Value) -> Result<Option<&Value>, DomainError> {
     let event_type = event
         .get("type")
         .and_then(Value::as_str)
@@ -796,7 +1019,7 @@ fn parse_ws_event(payload: &[u8], operation: &str) -> Result<Value, DomainError>
     })
 }
 
-fn parse_sse_event(payload: &[u8], operation: &str) -> Result<Value, DomainError> {
+pub(crate) fn parse_sse_event(payload: &[u8], operation: &str) -> Result<Value, DomainError> {
     serde_json::from_slice(payload).map_err(|error| {
         log_upstream_body_parse_failure(
             "OpenAI Responses",

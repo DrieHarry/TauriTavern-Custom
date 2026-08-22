@@ -2215,12 +2215,15 @@ async function loadCustomOpenAiModels() {
         });
 
         if (!result.ok) {
-            return [];
+            throw new Error(await getModelLoadErrorText(result, 'Custom OpenAI-compatible endpoint returned an error.'));
         }
 
         const json = await result.json();
+        if (!Array.isArray(json.data)) {
+            throw new Error('Custom OpenAI-compatible model response is missing a data array.');
+        }
 
-        return (json.data || []);
+        return json.data;
     } catch (error) {
         reportModelLoadError('Custom (OpenAI-compatible)', error);
         return [];

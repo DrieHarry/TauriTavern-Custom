@@ -22,7 +22,7 @@ mod gemini_interactions;
 mod makersuite;
 mod normalizers;
 mod openai;
-mod openai_responses;
+pub(crate) mod openai_responses;
 mod response_body;
 mod vertexai;
 pub(crate) mod vertexai_auth;
@@ -74,8 +74,8 @@ impl SseEventAccumulator {
             }
 
             if !self.data.is_empty()
-                && (self.data.first().is_some_and(|b| *b == b'{' || *b == b'[')
-                    || value.first().is_some_and(|b| *b == b'{' || *b == b'['))
+                && value.first().is_some_and(|b| *b == b'{' || *b == b'[')
+                && serde_json::from_slice::<Value>(&self.data).is_ok()
             {
                 self.dispatch(sender, hook)?;
             }
@@ -361,7 +361,7 @@ impl HttpChatCompletionRepository {
             .await
     }
 
-    async fn stream_sse_response_internal<F>(
+    pub(crate) async fn stream_sse_response_internal<F>(
         provider_name: &str,
         mut response: reqwest::Response,
         sender: ChatCompletionStreamSender,
@@ -864,6 +864,7 @@ mod tests {
 
     use reqwest::Client;
     use reqwest::header::AUTHORIZATION;
+    use serde_json::{Value, json};
     use tokio::sync::mpsc;
 
     use tt_domain::errors::DomainError;
@@ -1051,6 +1052,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(receiver.try_recv().ok(), Some("first\nsecond".to_string()));
+        assert!(receiver.try_recv().is_err());
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn forward_sse_events_keeps_multiline_json_in_one_event() {
+        let (sender, mut receiver) = mpsc::unbounded_channel::<String>();
+        let mut buffer = b"data: {\"chunk\":\ndata: {\"nested\":true}}\n\n".to_vec();
+
+        fn noop(_: &[u8]) -> Result<(), DomainError> {
+            Ok(())
+        }
+        let mut hook = noop;
+        let mut accumulator = super::SseEventAccumulator::default();
+        HttpChatCompletionRepository::forward_sse_events(
+            &mut buffer,
+            &mut accumulator,
+            &sender,
+            &mut hook,
+        )
+        .unwrap();
+
+        let event = receiver.try_recv().expect("multiline event");
+        assert_eq!(
+            serde_json::from_str::<Value>(&event).expect("valid multiline JSON"),
+            json!({ "chunk": { "nested": true } })
+        );
         assert!(receiver.try_recv().is_err());
         assert!(buffer.is_empty());
     }

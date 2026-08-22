@@ -1,4 +1,5 @@
 import { createAbortError } from '../kernel/abort-error.js';
+import { getSillyTavernLocale } from '../adapters/st/sillytavern-i18n.js';
 
 function createRequestId() {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -63,6 +64,7 @@ export function registerSdRoutes(router, context, { jsonResponse, textResponse }
                 requestId,
                 path,
                 body,
+                locale: getSillyTavernLocale(),
             });
 
             if (abortRequested) {

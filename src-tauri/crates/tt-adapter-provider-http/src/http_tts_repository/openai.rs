@@ -36,18 +36,15 @@ pub(super) async fn handle_openai(
             instructions,
         } => {
             let is_mistral = is_mistral_tts_request(&endpoint, &model);
-            let mut payload = json!({
-                "input": input,
-                "response_format": response_format,
-                "voice": voice,
-                "model": model,
-            });
-            if !is_mistral {
-                payload["speed"] = json!(speed);
-            }
-            if let Some(instructions) = instructions {
-                payload["instructions"] = Value::String(instructions);
-            }
+            let payload = compatible_tts_payload(
+                input,
+                voice,
+                model,
+                &response_format,
+                speed,
+                instructions,
+                is_mistral,
+            );
             let response = send_with_retry("OpenAI-compatible TTS request", || {
                 client
                     .post(endpoint.clone())
@@ -81,7 +78,8 @@ pub(super) async fn handle_openai(
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
                         DomainError::InvalidData(
-                            "OpenAI-compatible TTS JSON response contains no audio_data".to_string(),
+                            "OpenAI-compatible TTS JSON response contains no audio_data"
+                                .to_string(),
                         )
                     })?;
                 let bytes = base64::Engine::decode(
@@ -89,9 +87,7 @@ pub(super) async fn handle_openai(
                     audio_b64.as_bytes(),
                 )
                 .map_err(|error| {
-                    DomainError::InvalidData(format!(
-                        "Failed to decode base64 audio_data: {error}"
-                    ))
+                    DomainError::InvalidData(format!("Failed to decode base64 audio_data: {error}"))
                 })?;
                 Ok(TtsRouteResponse::bytes(
                     200,
@@ -113,6 +109,31 @@ pub(super) async fn handle_openai(
             }
         }
     }
+}
+
+fn compatible_tts_payload(
+    input: String,
+    voice: String,
+    model: String,
+    response_format: &str,
+    speed: f64,
+    instructions: Option<String>,
+    is_mistral: bool,
+) -> Value {
+    let mut payload = json!({
+        "input": input,
+        "response_format": response_format,
+        "model": model,
+    });
+    let voice_field = if is_mistral { "voice_id" } else { "voice" };
+    payload[voice_field] = Value::String(voice);
+    if !is_mistral {
+        payload["speed"] = json!(speed);
+    }
+    if let Some(instructions) = instructions {
+        payload["instructions"] = Value::String(instructions);
+    }
+    payload
 }
 
 pub(crate) fn is_mistral_tts_request(endpoint: &url::Url, model: &str) -> bool {
@@ -293,9 +314,44 @@ mod tests {
         let mistral_url: url::Url = "https://api.mistral.ai/v1/audio/speech".parse().unwrap();
         assert!(super::is_mistral_tts_request(&mistral_url, "tts-1"));
 
-        let gateway_url: url::Url = "https://custom-gateway.local/v1/audio/speech".parse().unwrap();
-        assert!(super::is_mistral_tts_request(&gateway_url, "voxtral-mini-tts-v1"));
+        let gateway_url: url::Url = "https://custom-gateway.local/v1/audio/speech"
+            .parse()
+            .unwrap();
+        assert!(super::is_mistral_tts_request(
+            &gateway_url,
+            "voxtral-mini-tts-v1"
+        ));
         assert!(!super::is_mistral_tts_request(&gateway_url, "tts-1"));
+    }
+
+    #[test]
+    fn compatible_tts_payload_uses_mistral_voice_id_without_changing_other_providers() {
+        let mistral = super::compatible_tts_payload(
+            "hello".to_string(),
+            "voice-123".to_string(),
+            "voxtral-mini-tts-v1".to_string(),
+            "mp3",
+            1.25,
+            None,
+            true,
+        );
+        assert_eq!(mistral["voice_id"], "voice-123");
+        assert!(mistral.get("voice").is_none());
+        assert!(mistral.get("speed").is_none());
+
+        let compatible = super::compatible_tts_payload(
+            "hello".to_string(),
+            "alloy".to_string(),
+            "tts-1".to_string(),
+            "mp3",
+            1.25,
+            Some("Warmly".to_string()),
+            false,
+        );
+        assert_eq!(compatible["voice"], "alloy");
+        assert!(compatible.get("voice_id").is_none());
+        assert_eq!(compatible["speed"], 1.25);
+        assert_eq!(compatible["instructions"], "Warmly");
     }
 
     #[test]
@@ -305,6 +361,9 @@ mod tests {
         assert_eq!(super::get_audio_content_type("wav"), "audio/wav");
         assert_eq!(super::get_audio_content_type("opus"), "audio/ogg");
         assert_eq!(super::get_audio_content_type("aac"), "audio/aac");
-        assert_eq!(super::get_audio_content_type("raw"), "application/octet-stream");
+        assert_eq!(
+            super::get_audio_content_type("raw"),
+            "application/octet-stream"
+        );
     }
 }

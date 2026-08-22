@@ -16,6 +16,14 @@ pub(super) fn build(payload: Map<String, Value>) -> Result<(String, Value), Appl
             .unwrap_or_default(),
     )?;
 
+    if payload
+        .get("custom_url")
+        .and_then(Value::as_str)
+        .is_some_and(tt_domain::models::endpoint_url::is_codex_endpoint)
+    {
+        return openai_responses::build_codex(payload);
+    }
+
     match format {
         CustomApiFormat::OpenAiResponses => return openai_responses::build(payload),
         CustomApiFormat::GeminiInteractions => return gemini_interactions::build(payload),
@@ -138,5 +146,79 @@ mod tests {
             .expect("upstream body should be object");
         assert!(body.get("max_tokens").is_some());
         assert_eq!(body.get("temperature").and_then(Value::as_f64), Some(0.1));
+    }
+
+    #[test]
+    fn codex_payload_uses_responses_transcript_and_preserves_codex_options() {
+        let payload = json!({
+            "chat_completion_source": "custom",
+            "custom_url": "http://codex.local/v1",
+            "model": "gpt-5.1",
+            "messages": [
+                { "role": "system", "content": "Be concise." },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "Draw a fox from this reference." },
+                        { "type": "input_file", "file_id": "file_reference" }
+                    ]
+                }
+            ],
+            "reasoning_effort": "max",
+            "include_reasoning": true,
+            "request_images": true,
+            "request_image_resolution": "1024x1024",
+            "request_image_aspect_ratio": "1:1",
+            "enable_web_search": true,
+            "tools": [{ "type": "web_search_preview" }],
+            "response_format": { "type": "json_object" },
+            "stream": true
+        })
+        .as_object()
+        .cloned()
+        .expect("payload must be object");
+
+        let (endpoint, upstream) = build(payload).expect("Codex payload should build");
+
+        assert_eq!(endpoint, "/responses");
+        assert_eq!(upstream["input"][0]["role"], "developer");
+        assert_eq!(upstream["reasoning"]["effort"], "xhigh");
+        assert_eq!(upstream["reasoning"]["summary"], "detailed");
+        assert_eq!(upstream["text"]["format"]["type"], "json_object");
+        assert_eq!(upstream["input"][1]["content"][1]["type"], "input_file");
+        assert_eq!(
+            upstream["input"][1]["content"][1]["file_id"],
+            "file_reference"
+        );
+
+        let tools = upstream["tools"]
+            .as_array()
+            .expect("tools must be an array");
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool["type"] == "web_search_preview")
+                .count(),
+            1
+        );
+        let image_tool = tools
+            .iter()
+            .find(|tool| tool["type"] == "image_generation")
+            .expect("image generation tool should be preserved");
+        assert_eq!(image_tool["size"], "1024x1024");
+
+        let include = upstream["include"]
+            .as_array()
+            .expect("include must be an array");
+        assert!(
+            include
+                .iter()
+                .any(|item| item == "reasoning.encrypted_content")
+        );
+        assert!(
+            include
+                .iter()
+                .any(|item| item == "web_search_call.action.sources")
+        );
     }
 }

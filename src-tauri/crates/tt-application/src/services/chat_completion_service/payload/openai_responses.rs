@@ -12,8 +12,30 @@ use super::tool_calls::message_tool_call_id;
 
 const REASONING_ENCRYPTED_CONTENT: &str = "reasoning.encrypted_content";
 
+// Codex uses the Responses wire contract while retaining its existing provider identity.
+
+#[derive(Clone, Copy, Default)]
+enum ResponsesBuildProfile {
+    #[default]
+    Standard,
+    Codex,
+}
+
 pub(super) fn build(payload: Map<String, Value>) -> Result<(String, Value), ApplicationError> {
-    let request = build_openai_responses_payload(&payload)?;
+    build_with_profile(payload, ResponsesBuildProfile::Standard)
+}
+
+pub(super) fn build_codex(
+    payload: Map<String, Value>,
+) -> Result<(String, Value), ApplicationError> {
+    build_with_profile(payload, ResponsesBuildProfile::Codex)
+}
+
+fn build_with_profile(
+    payload: Map<String, Value>,
+    profile: ResponsesBuildProfile,
+) -> Result<(String, Value), ApplicationError> {
+    let request = build_openai_responses_payload(&payload, profile)?;
 
     let mut upstream_payload = Value::Object(request);
     copy_internal_provider_state(&payload, &mut upstream_payload)?;
@@ -24,6 +46,7 @@ pub(super) fn build(payload: Map<String, Value>) -> Result<(String, Value), Appl
 
 fn build_openai_responses_payload(
     payload: &Map<String, Value>,
+    profile: ResponsesBuildProfile,
 ) -> Result<Map<String, Value>, ApplicationError> {
     let model = payload
         .get("model")
@@ -37,7 +60,11 @@ fn build_openai_responses_payload(
         })?;
 
     let previous_response_id = non_empty_string(payload.get("previous_response_id"));
-    let input = build_input_items(payload.get("messages"), previous_response_id.is_some())?;
+    let input = build_input_items(
+        payload.get("messages"),
+        previous_response_id.is_some(),
+        matches!(profile, ResponsesBuildProfile::Codex),
+    )?;
 
     let mut request = Map::new();
     request.insert("model".to_string(), Value::String(model.to_string()));
@@ -86,7 +113,7 @@ fn build_openai_responses_payload(
     if let Some(reasoning_effort) = payload
         .get("reasoning_effort")
         .and_then(Value::as_str)
-        .and_then(|value| normalize_openai_reasoning_effort(value, model))
+        .and_then(|value| normalize_reasoning_effort(value, model, profile))
     {
         request.insert(
             "reasoning".to_string(),
@@ -103,6 +130,10 @@ fn build_openai_responses_payload(
         request.insert("text".to_string(), json!({ "verbosity": verbosity }));
     }
 
+    if matches!(profile, ResponsesBuildProfile::Codex) {
+        apply_codex_response_options(payload, &mut request)?;
+    }
+
     let mut tools = payload
         .get("tools")
         .and_then(Value::as_array)
@@ -111,10 +142,42 @@ fn build_openai_responses_payload(
     if payload.get("enable_web_search").and_then(Value::as_bool) == Some(true)
         && !tools
             .iter()
-            .any(|tool| tool.get("type").and_then(Value::as_str) == Some("web_search"))
+            .any(|tool| match tool.get("type").and_then(Value::as_str) {
+                Some("web_search") => true,
+                Some("web_search_preview") => {
+                    matches!(profile, ResponsesBuildProfile::Codex)
+                }
+                _ => false,
+            })
     {
         tools.insert(0, json!({ "type": "web_search" }));
     }
+    if matches!(profile, ResponsesBuildProfile::Codex)
+        && payload.get("request_images").and_then(Value::as_bool) == Some(true)
+        && !tools
+            .iter()
+            .any(|tool| tool.get("type").and_then(Value::as_str) == Some("image_generation"))
+    {
+        let mut image_tool = Map::new();
+        image_tool.insert(
+            "type".to_string(),
+            Value::String("image_generation".to_string()),
+        );
+        if let Some(size) = non_empty_string(payload.get("request_image_resolution")) {
+            image_tool.insert("size".to_string(), Value::String(size));
+        }
+        if let Some(aspect_ratio) = non_empty_string(payload.get("request_image_aspect_ratio")) {
+            image_tool.insert("aspect_ratio".to_string(), Value::String(aspect_ratio));
+        }
+        tools.push(Value::Object(image_tool));
+    }
+    let include_web_search_sources = matches!(profile, ResponsesBuildProfile::Codex)
+        && tools.iter().any(|tool| {
+            matches!(
+                tool.get("type").and_then(Value::as_str),
+                Some("web_search" | "web_search_preview")
+            )
+        });
     if !tools.is_empty() {
         request.insert("tools".to_string(), Value::Array(tools));
 
@@ -126,14 +189,105 @@ fn build_openai_responses_payload(
         }
     }
 
+    if include_web_search_sources {
+        ensure_include_item(&mut request, "web_search_call.action.sources")?;
+    }
     ensure_reasoning_encrypted_include(&mut request)?;
 
     Ok(request)
 }
 
+fn normalize_reasoning_effort<'a>(
+    value: &'a str,
+    model: &str,
+    profile: ResponsesBuildProfile,
+) -> Option<&'a str> {
+    if !matches!(profile, ResponsesBuildProfile::Codex) {
+        return normalize_openai_reasoning_effort(value, model);
+    }
+
+    let value = value.trim();
+    match value.to_ascii_lowercase().as_str() {
+        "" | "auto" => None,
+        "min" | "minimum" | "minimal" => Some("none"),
+        "maximum" | "max" if model.trim().to_ascii_lowercase().starts_with("gpt-5.6") => {
+            Some("max")
+        }
+        "maximum" | "max" | "extra-high" => Some("xhigh"),
+        _ => Some(value),
+    }
+}
+
+fn apply_codex_response_options(
+    payload: &Map<String, Value>,
+    request: &mut Map<String, Value>,
+) -> Result<(), ApplicationError> {
+    if payload.get("include_reasoning").and_then(Value::as_bool) == Some(true) {
+        let reasoning = request
+            .entry("reasoning".to_string())
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                ApplicationError::ValidationError(
+                    "Codex Responses reasoning configuration must be an object".to_string(),
+                )
+            })?;
+        reasoning.insert("summary".to_string(), Value::String("detailed".to_string()));
+    }
+
+    let format = if let Some(schema) = payload
+        .get("json_schema")
+        .and_then(Value::as_object)
+        .and_then(|schema| schema.get("value").map(|value| (schema, value)))
+    {
+        let (schema_object, value) = schema;
+        Some(json!({
+            "type": "json_schema",
+            "name": non_empty_string(schema_object.get("name")).unwrap_or_else(|| "response".to_string()),
+            "schema": value,
+            "strict": schema_object.get("strict").and_then(Value::as_bool).unwrap_or(true),
+        }))
+    } else if let Some(response_format) = payload.get("response_format").and_then(Value::as_object)
+    {
+        match response_format.get("type").and_then(Value::as_str) {
+            Some("json_object") => Some(json!({ "type": "json_object" })),
+            Some("json_schema") => response_format
+                .get("json_schema")
+                .and_then(Value::as_object)
+                .map(|schema| {
+                    json!({
+                        "type": "json_schema",
+                        "name": non_empty_string(schema.get("name")).unwrap_or_else(|| "response".to_string()),
+                        "schema": schema.get("schema").or_else(|| schema.get("value")).cloned().unwrap_or(Value::Null),
+                        "strict": schema.get("strict").and_then(Value::as_bool).unwrap_or(true),
+                    })
+                }),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(format) = format {
+        let text = request
+            .entry("text".to_string())
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                ApplicationError::ValidationError(
+                    "Codex Responses text configuration must be an object".to_string(),
+                )
+            })?;
+        text.insert("format".to_string(), format);
+    }
+
+    Ok(())
+}
+
 fn build_input_items(
     messages: Option<&Value>,
     allow_orphan_tool_outputs: bool,
+    allow_user_files: bool,
 ) -> Result<Vec<Value>, ApplicationError> {
     let Some(messages) = messages else {
         return Ok(Vec::new());
@@ -154,6 +308,7 @@ fn build_input_items(
 
     ResponsesTranscriptCompiler {
         allow_orphan_tool_outputs,
+        allow_user_files,
         ..Default::default()
     }
     .compile(entries)
@@ -164,6 +319,7 @@ struct ResponsesTranscriptCompiler {
     input: Vec<Value>,
     function_call_ids: HashSet<String>,
     allow_orphan_tool_outputs: bool,
+    allow_user_files: bool,
 }
 
 impl ResponsesTranscriptCompiler {
@@ -195,7 +351,7 @@ impl ResponsesTranscriptCompiler {
             "system" => {
                 self.input.push(json!({
                     "role": "developer",
-                    "content": responses_input_message_content(message.get("content"), false)?,
+                    "content": responses_input_message_content(message.get("content"), false, false)?,
                 }));
                 Ok(())
             }
@@ -205,6 +361,7 @@ impl ResponsesTranscriptCompiler {
                     "content": responses_input_message_content(
                         message.get("content"),
                         role == "user",
+                        role == "user" && self.allow_user_files,
                     )?,
                 }));
                 Ok(())
@@ -300,6 +457,7 @@ enum ResponsesInputContentPart {
 fn responses_input_message_content(
     content: Option<&Value>,
     allow_images: bool,
+    allow_files: bool,
 ) -> Result<Value, ApplicationError> {
     let parts = parse_openai_chat_content(content)?;
 
@@ -308,7 +466,7 @@ fn responses_input_message_content(
     let mut has_blocks = false;
 
     for part in &parts {
-        match responses_input_content_part(part, allow_images)? {
+        match responses_input_content_part(part, allow_images, allow_files)? {
             ResponsesInputContentPart::Text(fragment) => {
                 text.push_str(&fragment);
                 if !fragment.is_empty() {
@@ -335,6 +493,7 @@ fn responses_input_message_content(
 fn responses_input_content_part(
     part: &InputPart,
     allow_images: bool,
+    allow_files: bool,
 ) -> Result<ResponsesInputContentPart, ApplicationError> {
     match part {
         InputPart::Text(fragment) => Ok(ResponsesInputContentPart::Text(fragment.clone())),
@@ -345,7 +504,9 @@ fn responses_input_content_part(
         InputPart::Audio(_) | InputPart::Video(_) => Err(ApplicationError::ValidationError(
             "OpenAI Responses translator does not support audio or video content parts".to_string(),
         )),
-        InputPart::Unknown { ty, value } => responses_unknown_input_content_part(ty, value),
+        InputPart::Unknown { ty, value } => {
+            responses_unknown_input_content_part(ty, value, allow_files)
+        }
     }
 }
 
@@ -378,11 +539,15 @@ fn responses_input_image(media: &MediaPart, allow_images: bool) -> Result<Value,
 fn responses_unknown_input_content_part(
     ty: &Option<String>,
     value: &Value,
+    allow_files: bool,
 ) -> Result<ResponsesInputContentPart, ApplicationError> {
     if matches!(ty.as_deref(), Some("input_file" | "file")) {
-        return Err(ApplicationError::ValidationError(
-            "OpenAI Responses translator does not support file content parts yet".to_string(),
-        ));
+        if !allow_files {
+            return Err(ApplicationError::ValidationError(
+                "Codex Responses file content is only supported on user messages".to_string(),
+            ));
+        }
+        return responses_input_file(value).map(ResponsesInputContentPart::Block);
     }
 
     unknown_text(value)
@@ -393,6 +558,46 @@ fn responses_unknown_input_content_part(
                 None => "OpenAI Responses content part is unsupported".to_string(),
             })
         })
+}
+
+fn responses_input_file(value: &Value) -> Result<Value, ApplicationError> {
+    let object = value.as_object().ok_or_else(|| {
+        ApplicationError::ValidationError(
+            "Codex Responses file content must be an object".to_string(),
+        )
+    })?;
+    let mut block = Map::new();
+    block.insert("type".to_string(), Value::String("input_file".to_string()));
+
+    for (target, aliases) in [
+        ("file_data", ["file_data", "data"]),
+        ("file_id", ["file_id", "id"]),
+        ("file_url", ["file_url", "url"]),
+    ] {
+        if let Some(value) = aliases
+            .iter()
+            .find_map(|alias| non_empty_string(object.get(*alias)))
+        {
+            block.insert(target.to_string(), Value::String(value));
+        }
+    }
+    if let Some(filename) = ["filename", "name"]
+        .iter()
+        .find_map(|alias| non_empty_string(object.get(*alias)))
+    {
+        block.insert("filename".to_string(), Value::String(filename));
+    }
+
+    if !["file_data", "file_id", "file_url"]
+        .iter()
+        .any(|key| block.contains_key(*key))
+    {
+        return Err(ApplicationError::ValidationError(
+            "Codex Responses file content requires file_data, file_id, or file_url".to_string(),
+        ));
+    }
+
+    Ok(Value::Object(block))
 }
 
 fn ensure_user_image_content_allowed(allow_images: bool) -> Result<(), ApplicationError> {
@@ -573,15 +778,22 @@ fn validate_openai_responses_payload(object: &Map<String, Value>) -> Result<(), 
 fn ensure_reasoning_encrypted_include(
     object: &mut Map<String, Value>,
 ) -> Result<(), ApplicationError> {
+    ensure_include_item(object, REASONING_ENCRYPTED_CONTENT)
+}
+
+fn ensure_include_item(
+    object: &mut Map<String, Value>,
+    include: &str,
+) -> Result<(), ApplicationError> {
     let entry = object
         .entry("include".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
     let items = entry.as_array_mut().ok_or_else(|| {
         ApplicationError::ValidationError("OpenAI Responses include must be an array".to_string())
     })?;
-    let encrypted = Value::String(REASONING_ENCRYPTED_CONTENT.to_string());
-    if !items.iter().any(|item| item == &encrypted) {
-        items.push(encrypted);
+    let include = Value::String(include.to_string());
+    if !items.iter().any(|item| item == &include) {
+        items.push(include);
     }
 
     Ok(())
