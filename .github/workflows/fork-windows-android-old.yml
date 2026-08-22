@@ -8,7 +8,7 @@
 #
 # When upstream canary-release.yml changes, compare and port relevant changes from:
 # prepare, shared/Windows desktop setup, shared/Android mobile setup,
-# notes-context, notes-ai, notes, and Publish Canary.
+# notes-context, notes-ai, notes, and permanent canary publishing.
 
 name: Fork Windows + Android
 
@@ -43,19 +43,49 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve Canary metadata
+      - name: Resolve permanent canary metadata
         id: metadata
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          git fetch --force origin refs/tags/Canary:refs/tags/Canary
-          previous_sha=$(git rev-parse Canary^{commit})
-          test "$previous_sha" != "$GITHUB_SHA" || {
-            echo "Canary already points to $GITHUB_SHA"
+          [[ "$GITHUB_RUN_NUMBER" =~ ^[0-9]+$ ]] || {
+            echo "Current GitHub run number is invalid: $GITHUB_RUN_NUMBER" >&2
             exit 1
           }
+
+          candidates=$(mktemp)
+          while IFS=$'\t' read -r _sha ref; do
+            tag=${ref#refs/tags/}
+            if [[ "$tag" =~ ^canary-([0-9]+)-g[0-9a-fA-F]{12}$ ]]; then
+              run_number=${BASH_REMATCH[1]}
+              if (( 10#$run_number < 10#$GITHUB_RUN_NUMBER )); then
+                printf '%s\t%s\n' "$run_number" "$tag" >> "$candidates"
+              fi
+            fi
+          done < <(git ls-remote --tags --refs origin 'canary-*-g*')
+
+          if [[ ! -s "$candidates" ]]; then
+            echo "No permanent canary tag with a run number lower than $GITHUB_RUN_NUMBER was found." >&2
+            exit 1
+          fi
+
+          previous_run=$(sort -t $'\t' -k1,1n "$candidates" | tail -n 1 | cut -f 1)
+          mapfile -t previous_tags < <(
+            awk -F $'\t' -v run="$previous_run" '$1 == run { print $2 }' "$candidates" | sort -u
+          )
+          if [[ "${#previous_tags[@]}" -ne 1 ]]; then
+            echo "Expected one permanent canary tag for run $previous_run, found ${#previous_tags[@]}." >&2
+            printf '  %s\n' "${previous_tags[@]}" >&2
+            exit 1
+          fi
+
+          previous_tag=${previous_tags[0]}
+          git fetch --no-tags origin "refs/tags/$previous_tag:refs/tags/$previous_tag"
+          previous_sha=$(git rev-parse "$previous_tag^{commit}")
+          echo "Using previous canary $previous_tag at $previous_sha"
+
           stable_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
           [[ "$stable_tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || {
             echo "Latest stable release has an invalid tag: $stable_tag" >&2
@@ -445,36 +475,18 @@ jobs:
           printf 'Release assets:\n'
           printf '  %s\n' "${release_files[@]}"
 
-      - name: Publish Canary
+      - name: Publish permanent canary prerelease
         shell: bash
         run: |
           set -euo pipefail
-          gh release view Canary --repo "$GITHUB_REPOSITORY" >/dev/null
-          find release-assets -type f -name "${ASSET_PREFIX}*" -print0 \
-            | xargs -0 gh release upload Canary --repo "$GITHUB_REPOSITORY" --clobber
-          gh release edit Canary \
+          release_tag="canary-${GITHUB_RUN_NUMBER}-g${GITHUB_SHA:0:12}"
+          mapfile -t release_files < <(find release-assets -mindepth 1 -maxdepth 1 -type f -name "${ASSET_PREFIX}*" -print | sort)
+          test "${#release_files[@]}" -eq 4
+
+          gh release create "$release_tag" \
             --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
             --title "Canary Release $DISPLAY_TIME" \
             --notes-file notes/release-notes.md \
-            --prerelease
-          gh api --method PATCH \
-            "repos/$GITHUB_REPOSITORY/git/refs/tags/Canary" \
-            -f sha="$GITHUB_SHA" \
-            -F force=true
-
-      - name: Remove superseded assets
-        continue-on-error: true
-        shell: bash
-        run: |
-          declare -A current_assets=()
-          while IFS= read -r name; do
-            current_assets["$name"]=1
-          done < <(find release-assets -type f -printf '%f\n')
-
-          while IFS=$'\t' read -r id name; do
-            [[ -n "${current_assets[$name]+present}" ]] || \
-              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$id"
-          done < <(
-            gh api "repos/$GITHUB_REPOSITORY/releases/tags/Canary" \
-              --jq '.assets[] | [.id, .name] | @tsv'
-          )
+            --prerelease \
+            "${release_files[@]}"
