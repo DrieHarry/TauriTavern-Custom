@@ -28,6 +28,7 @@ export function resolveTauriTavernSettingsCapabilities() {
     return {
         requestProxyAllowed: iosCaps?.network?.request_proxy !== false,
         lanSyncAllowed: iosCaps?.sync?.lan !== false,
+        supportsCodexAuthImport: !isIosRuntime(),
         supportsCloseToTrayOnClose: isWindowsPlatform() && !isMobile(),
         supportsDataRootSelection,
     };

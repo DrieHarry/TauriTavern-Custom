@@ -47,6 +47,10 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
     registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
       handleImportArchivePickerResult(uri)
     }
+  private val codexAuthPickerLauncher =
+    registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+      handleCodexAuthPickerResult(uri)
+    }
   private val exportArchivePickerLauncher =
     registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
       handleExportArchivePickerResult(uri)
@@ -59,6 +63,7 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
     AndroidImportArchiveJsBridge(
       contentResolver = contentResolver,
       launchImportArchivePicker = { launchImportArchivePicker() },
+      launchCodexAuthPicker = { launchCodexAuthPicker() },
       launchExportArchivePicker = { suggestedName -> launchExportArchivePicker(suggestedName) },
     )
   }
@@ -258,6 +263,23 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
     }
   }
 
+  private fun launchCodexAuthPicker() {
+    mainHandler.post {
+      if (isActivityDestroyed) {
+        return@post
+      }
+
+      codexAuthPickerLauncher.launch(
+        arrayOf(
+          "application/json",
+          "text/json",
+          "text/plain",
+          "application/octet-stream",
+        ),
+      )
+    }
+  }
+
   private fun launchPublicDownloadDocumentPicker(
     suggestedName: String,
     mimeType: String,
@@ -311,6 +333,14 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
     )
   }
 
+  private fun handleCodexAuthPickerResult(uri: Uri?) {
+    dispatchPickerResult(
+      receiverName = CODEX_AUTH_PICKER_RECEIVER,
+      contentUri = uri?.toString().orEmpty(),
+      error = "",
+    )
+  }
+
   private fun handlePublicDownloadPickerResult(
     resultCode: Int,
     uri: Uri?,
@@ -359,6 +389,7 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
   companion object {
     private const val IMPORT_ARCHIVE_PICKER_RECEIVER = "__TAURITAVERN_IMPORT_ARCHIVE_PICKER__"
     private const val EXPORT_ARCHIVE_PICKER_RECEIVER = "__TAURITAVERN_EXPORT_ARCHIVE_PICKER__"
+    private const val CODEX_AUTH_PICKER_RECEIVER = "__TAURITAVERN_CODEX_AUTH_PICKER__"
     private const val PUBLIC_DOWNLOAD_PICKER_RECEIVER = "__TAURITAVERN_PUBLIC_DOWNLOAD_PICKER__"
   }
 }

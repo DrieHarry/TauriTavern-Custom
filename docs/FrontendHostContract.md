@@ -66,14 +66,15 @@
 - 失败时的返回值语义保持一致（例如 `null` vs 抛错 vs fallback string）；
 - 不得引入同步阻塞（第三方会在渲染路径高频调用）。
 
-### 3.2 Android 导入/导出 Picker（Public）
+### 3.2 Android 原生文件 Picker（Public）
 
-由 `createTauriMainContext()` 安装（用于 Android Content URI 的回调接收）：
+用于接收 Android Content URI 回调。归档 receiver 由 `createTauriMainContext()` 安装；Codex receiver 在打开 TauriTavern Settings 的导入流程时按需安装：
 
 - `window.__TAURITAVERN_IMPORT_ARCHIVE_PICKER__`（对象：用于接收 Android 侧回调并 resolve/reject pending promise）
 - `window.__TAURITAVERN_EXPORT_ARCHIVE_PICKER__`（同上）
+- `window.__TAURITAVERN_CODEX_AUTH_PICKER__`（Codex `auth.json` 选择回调；只传递 Content URI，不把凭据内容注入前端）
 
-> 这两者属于“跨语言桥接回调点”，命名与行为应视为 Public Contract。
+> 这些对象属于“跨语言桥接回调点”，命名与行为应视为 Public Contract。
 
 ### 3.3 返回键处理（Public）
 

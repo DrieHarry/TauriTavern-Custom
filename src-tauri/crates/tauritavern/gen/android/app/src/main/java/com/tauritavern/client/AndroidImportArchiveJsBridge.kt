@@ -8,11 +8,17 @@ import java.io.File
 class AndroidImportArchiveJsBridge(
   private val contentResolver: ContentResolver,
   private val launchImportArchivePicker: () -> Unit,
+  private val launchCodexAuthPicker: () -> Unit,
   private val launchExportArchivePicker: (String) -> Unit,
 ) {
   @JavascriptInterface
   fun requestImportArchivePicker() {
     launchImportArchivePicker()
+  }
+
+  @JavascriptInterface
+  fun requestCodexAuthPicker() {
+    launchCodexAuthPicker()
   }
 
   @JavascriptInterface

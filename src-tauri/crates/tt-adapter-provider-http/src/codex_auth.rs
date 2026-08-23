@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -8,15 +8,20 @@ use reqwest::header::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tt_domain::errors::DomainError;
+use tt_ports::repositories::codex_auth_repository::{CodexAuthImportOutcome, CodexAuthRepository};
+use uuid::Uuid;
 
 pub const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const CODEX_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const DEFAULT_CLIENT_VERSION: &str = "0.145.0";
 const REFRESH_AFTER_SECS: i64 = 8 * 24 * 60 * 60; // 8 days
+const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
+const IMPORT_STAGING_FILE_PREFIX: &str = "codex-auth-import-";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CodexAuthTokens {
@@ -89,35 +94,72 @@ pub struct CodexResolvedAuth {
 
 pub struct CodexAuthManager {
     refresh_lock: Mutex<()>,
+    managed_paths: RwLock<Option<ManagedCodexAuthPaths>>,
 }
 
-static AUTH_MANAGER: LazyLock<CodexAuthManager> = LazyLock::new(CodexAuthManager::default);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedCodexAuthPaths {
+    auth_file: PathBuf,
+    import_staging_root: PathBuf,
+}
+
+static AUTH_MANAGER: LazyLock<Arc<CodexAuthManager>> =
+    LazyLock::new(|| Arc::new(CodexAuthManager::default()));
 
 pub(crate) fn codex_auth_manager() -> &'static CodexAuthManager {
-    &AUTH_MANAGER
+    AUTH_MANAGER.as_ref()
+}
+
+pub async fn configure_codex_auth_repository(
+    auth_file: PathBuf,
+    import_staging_root: PathBuf,
+) -> Arc<dyn CodexAuthRepository> {
+    AUTH_MANAGER
+        .configure_managed_storage(auth_file, import_staging_root)
+        .await;
+    AUTH_MANAGER.clone()
 }
 
 impl Default for CodexAuthManager {
     fn default() -> Self {
         Self {
             refresh_lock: Mutex::new(()),
+            managed_paths: RwLock::new(None),
         }
     }
 }
 
 impl CodexAuthManager {
+    async fn configure_managed_storage(&self, auth_file: PathBuf, import_staging_root: PathBuf) {
+        *self.managed_paths.write().await = Some(ManagedCodexAuthPaths {
+            auth_file,
+            import_staging_root,
+        });
+    }
+
+    #[cfg(test)]
+    fn with_managed_storage(auth_file: PathBuf, import_staging_root: PathBuf) -> Self {
+        Self {
+            refresh_lock: Mutex::new(()),
+            managed_paths: RwLock::new(Some(ManagedCodexAuthPaths {
+                auth_file,
+                import_staging_root,
+            })),
+        }
+    }
+
     pub async fn load_auth(
         &self,
         client: &reqwest::Client,
     ) -> Result<CodexResolvedAuth, DomainError> {
-        let auth_path = get_auth_file_path()?;
         let _guard = self.refresh_lock.lock().await;
+        let auth_path = self.resolve_auth_file_path().await?;
 
         let content = tokio::fs::read_to_string(&auth_path)
             .await
             .map_err(|error| {
                 DomainError::InvalidData(format!(
-                    "Could not read Codex login at {}: {error}. Run \"codex login\" first.",
+                    "Could not read Codex authentication at {}: {error}. Import auth.json in TauriTavern Settings or run \"codex login\" on desktop.",
                     auth_path.display()
                 ))
             })?;
@@ -135,7 +177,7 @@ impl CodexAuthManager {
 
         let access_token = auth.get_access_token().map(str::to_string).ok_or_else(|| {
             DomainError::InvalidData(format!(
-                "No ChatGPT OAuth token found in {}. Run \"codex login\".",
+                "No ChatGPT OAuth token found in {}. Import a valid Codex auth.json in TauriTavern Settings or run \"codex login\" on desktop.",
                 auth_path.display()
             ))
         })?;
@@ -162,6 +204,238 @@ impl CodexAuthManager {
             is_fedramp,
         })
     }
+
+    async fn resolve_auth_file_path(&self) -> Result<PathBuf, DomainError> {
+        let managed = self.managed_paths.read().await.clone();
+
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            return managed.map(|paths| paths.auth_file).ok_or_else(|| {
+                DomainError::InternalError(
+                    "TauriTavern managed Codex authentication storage is not configured"
+                        .to_string(),
+                )
+            });
+        }
+
+        if let Some(paths) = managed.as_ref() {
+            match tokio::fs::try_exists(&paths.auth_file).await {
+                Ok(true) => return Ok(paths.auth_file.clone()),
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(DomainError::InternalError(format!(
+                        "Failed to inspect managed Codex authentication at {}: {error}",
+                        paths.auth_file.display()
+                    )));
+                }
+            }
+        }
+
+        resolve_cli_auth_file_path()
+            .or_else(|error| managed.map(|paths| paths.auth_file).ok_or(error))
+    }
+}
+
+#[async_trait::async_trait]
+impl CodexAuthRepository for CodexAuthManager {
+    async fn prepare_import_staging_path(&self) -> Result<PathBuf, DomainError> {
+        let paths = self.require_managed_paths().await?;
+        tokio::fs::create_dir_all(&paths.import_staging_root)
+            .await
+            .map_err(|error| {
+                DomainError::InternalError(format!(
+                    "Failed to create Codex auth import staging directory {}: {error}",
+                    paths.import_staging_root.display()
+                ))
+            })?;
+
+        Ok(paths.import_staging_root.join(format!(
+            "{IMPORT_STAGING_FILE_PREFIX}{}.json",
+            Uuid::new_v4()
+        )))
+    }
+
+    async fn import_auth_file(
+        &self,
+        source_path: &Path,
+        expected_existing: Option<&str>,
+    ) -> Result<CodexAuthImportOutcome, DomainError> {
+        let paths = self.require_managed_paths().await?;
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            require_import_staging_path(source_path, &paths.import_staging_root)?;
+        }
+
+        let incoming = read_auth_file_bounded(source_path, "selected Codex auth file").await?;
+        validate_imported_auth(&incoming, source_path)?;
+
+        let _guard = self.refresh_lock.lock().await;
+        let existing = match read_optional_auth_file(&paths.auth_file).await? {
+            Some(existing) if existing == incoming => {
+                return Ok(CodexAuthImportOutcome::AlreadyCurrent);
+            }
+            existing => existing,
+        };
+
+        match (existing.as_deref(), expected_existing) {
+            (Some(current), Some(expected)) => {
+                let actual = auth_fingerprint(current);
+                if actual != expected {
+                    return Err(DomainError::Conflict(
+                        "Imported Codex authentication changed after confirmation; review it again before replacing"
+                            .to_string(),
+                    ));
+                }
+                persist_auth_file(&paths.auth_file, &incoming, Some(current)).await?;
+                Ok(CodexAuthImportOutcome::Imported {
+                    replaced_existing: true,
+                })
+            }
+            (None, Some(_)) => Err(DomainError::Conflict(
+                "Imported Codex authentication changed after confirmation; review it again before replacing"
+                    .to_string(),
+            )),
+            (Some(current), None) if contains_usable_authentication(current) => {
+                Ok(CodexAuthImportOutcome::RequiresConfirmation {
+                    confirmation: auth_fingerprint(current),
+                })
+            }
+            (Some(current), None) => {
+                persist_auth_file(&paths.auth_file, &incoming, Some(current)).await?;
+                Ok(CodexAuthImportOutcome::Imported {
+                    replaced_existing: true,
+                })
+            }
+            (None, None) => {
+                persist_auth_file(&paths.auth_file, &incoming, None).await?;
+                Ok(CodexAuthImportOutcome::Imported {
+                    replaced_existing: false,
+                })
+            }
+        }
+    }
+
+    async fn discard_import_staging_path(&self, path: &Path) -> Result<(), DomainError> {
+        let paths = self.require_managed_paths().await?;
+        require_import_staging_path(path, &paths.import_staging_root)?;
+
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(DomainError::InternalError(format!(
+                "Failed to discard staged Codex auth import {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+}
+
+impl CodexAuthManager {
+    async fn require_managed_paths(&self) -> Result<ManagedCodexAuthPaths, DomainError> {
+        self.managed_paths.read().await.clone().ok_or_else(|| {
+            DomainError::InternalError(
+                "TauriTavern managed Codex authentication storage is not configured".to_string(),
+            )
+        })
+    }
+}
+
+fn require_import_staging_path(path: &Path, staging_root: &Path) -> Result<(), DomainError> {
+    let has_expected_parent = path.parent() == Some(staging_root);
+    let has_expected_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(IMPORT_STAGING_FILE_PREFIX) && name.ends_with(".json")
+        });
+    if !has_expected_parent || !has_expected_name {
+        return Err(DomainError::InvalidData(format!(
+            "Codex auth import path is outside the managed staging directory: {}",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+async fn read_optional_auth_file(path: &Path) -> Result<Option<Vec<u8>>, DomainError> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if !metadata.is_file() => Err(DomainError::InvalidData(format!(
+            "Codex auth path is not a file: {}",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.len() > MAX_AUTH_FILE_BYTES => {
+            Err(DomainError::InvalidData(format!(
+                "Codex auth file is too large (maximum {MAX_AUTH_FILE_BYTES} bytes): {}",
+                path.display()
+            )))
+        }
+        Ok(_) => tokio::fs::read(path).await.map(Some).map_err(|error| {
+            DomainError::InternalError(format!(
+                "Failed to read Codex auth file {}: {error}",
+                path.display()
+            ))
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(DomainError::InternalError(format!(
+            "Failed to inspect Codex auth file {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+async fn read_auth_file_bounded(path: &Path, label: &str) -> Result<Vec<u8>, DomainError> {
+    let Some(bytes) = read_optional_auth_file(path).await? else {
+        return Err(DomainError::NotFound(format!(
+            "{label} does not exist: {}",
+            path.display()
+        )));
+    };
+    if bytes.len() as u64 > MAX_AUTH_FILE_BYTES {
+        return Err(DomainError::InvalidData(format!(
+            "{label} is too large (maximum {MAX_AUTH_FILE_BYTES} bytes): {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn validate_imported_auth(bytes: &[u8], path: &Path) -> Result<CodexAuth, DomainError> {
+    let auth: CodexAuth = serde_json::from_slice(bytes).map_err(|error| {
+        DomainError::InvalidData(format!(
+            "Selected Codex auth file is not valid JSON at {}: {error}",
+            path.display()
+        ))
+    })?;
+
+    let has_access_token = auth
+        .get_access_token()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_refresh_token = auth
+        .get_refresh_token()
+        .is_some_and(|value| !value.trim().is_empty());
+    if !has_access_token || !has_refresh_token {
+        return Err(DomainError::InvalidData(format!(
+            "Selected Codex auth file at {} must contain non-empty ChatGPT OAuth access_token and refresh_token values",
+            path.display()
+        )));
+    }
+
+    Ok(auth)
+}
+
+fn contains_usable_authentication(bytes: &[u8]) -> bool {
+    let Ok(auth) = serde_json::from_slice::<CodexAuth>(bytes) else {
+        return false;
+    };
+
+    auth.get_access_token()
+        .is_some_and(|value| !value.trim().is_empty())
+        || auth
+            .get_refresh_token()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn auth_fingerprint(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
 }
 
 pub fn client_version() -> String {
@@ -174,7 +448,7 @@ pub fn client_version() -> String {
     DEFAULT_CLIENT_VERSION.to_string()
 }
 
-pub fn get_auth_file_path() -> Result<PathBuf, DomainError> {
+fn resolve_cli_auth_file_path() -> Result<PathBuf, DomainError> {
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         let trimmed = codex_home.trim();
         if !trimmed.is_empty() {
@@ -351,7 +625,7 @@ async fn refresh_auth(
     persist_auth_file(
         auth_file,
         format!("{serialized}\n").as_bytes(),
-        expected_content,
+        Some(expected_content.as_bytes()),
     )
     .await
 }
@@ -359,7 +633,7 @@ async fn refresh_auth(
 async fn persist_auth_file(
     auth_file: &Path,
     serialized: &[u8],
-    expected_content: &str,
+    expected_content: Option<&[u8]>,
 ) -> Result<(), DomainError> {
     let parent = auth_file.parent().ok_or_else(|| {
         DomainError::InvalidData(format!(
@@ -413,19 +687,36 @@ async fn persist_auth_file(
             ))
         })?;
 
-        let current = tokio::fs::read_to_string(auth_file)
-            .await
-            .map_err(|error| {
-                DomainError::InternalError(format!(
-                    "Failed to re-read Codex auth file {} before refresh commit: {error}",
-                    auth_file.display()
-                ))
-            })?;
-        if current != expected_content {
-            return Err(DomainError::Conflict(format!(
-                "Codex auth file changed while tokens were refreshing: {}",
-                auth_file.display()
-            )));
+        match expected_content {
+            Some(expected) => {
+                let current = tokio::fs::read(auth_file).await.map_err(|error| {
+                    DomainError::InternalError(format!(
+                        "Failed to re-read Codex auth file {} before commit: {error}",
+                        auth_file.display()
+                    ))
+                })?;
+                if current != expected {
+                    return Err(DomainError::Conflict(format!(
+                        "Codex auth file changed before commit: {}",
+                        auth_file.display()
+                    )));
+                }
+            }
+            None => match tokio::fs::metadata(auth_file).await {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(DomainError::Conflict(format!(
+                        "Codex auth file was created before commit: {}",
+                        auth_file.display()
+                    )));
+                }
+                Err(error) => {
+                    return Err(DomainError::InternalError(format!(
+                        "Failed to inspect Codex auth file {} before commit: {error}",
+                        auth_file.display()
+                    )));
+                }
+            },
         }
 
         tokio::fs::rename(&temp_path, auth_file)
@@ -507,6 +798,18 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn valid_auth_json(access_token: &str, refresh_token: &str) -> Vec<u8> {
+        serde_json::to_vec_pretty(&json!({
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "future_token_field": "preserved"
+            },
+            "future_top_level": { "enabled": true }
+        }))
+        .expect("serialize test auth")
+    }
 
     #[test]
     fn test_jwt_claims_decoding() {
@@ -594,7 +897,7 @@ mod tests {
             .await
             .expect("write current auth");
 
-        let result = persist_auth_file(&auth_file, b"app-refresh\n", "stale-old\n").await;
+        let result = persist_auth_file(&auth_file, b"app-refresh\n", Some(b"stale-old\n")).await;
 
         assert!(matches!(result, Err(DomainError::Conflict(_))));
         assert_eq!(
@@ -618,7 +921,7 @@ mod tests {
             .await
             .expect("write old auth");
 
-        persist_auth_file(&auth_file, b"new-complete-json\n", "old\n")
+        persist_auth_file(&auth_file, b"new-complete-json\n", Some(b"old\n"))
             .await
             .expect("atomic auth replacement");
 
@@ -628,6 +931,106 @@ mod tests {
                 .expect("read replaced auth"),
             "new-complete-json\n"
         );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn imported_auth_requires_matching_confirmation_before_replacing_valid_credentials() {
+        let root = std::env::temp_dir().join(format!(
+            "tauritavern-codex-auth-import-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let auth_file = root.join("security").join("codex").join("auth.json");
+        let staging_root = root.join("imports");
+        let first_source = root.join("first-auth.json");
+        let second_source = root.join("second-auth.json");
+        tokio::fs::create_dir_all(&root).await.expect("temp root");
+        let first = valid_auth_json("first-access", "first-refresh");
+        let second = valid_auth_json("second-access", "second-refresh");
+        tokio::fs::write(&first_source, &first)
+            .await
+            .expect("write first auth");
+        tokio::fs::write(&second_source, &second)
+            .await
+            .expect("write second auth");
+
+        let manager = CodexAuthManager::with_managed_storage(auth_file.clone(), staging_root);
+        assert_eq!(
+            manager
+                .import_auth_file(&first_source, None)
+                .await
+                .expect("initial import"),
+            CodexAuthImportOutcome::Imported {
+                replaced_existing: false
+            }
+        );
+        assert_eq!(
+            manager
+                .import_auth_file(&first_source, None)
+                .await
+                .expect("same import"),
+            CodexAuthImportOutcome::AlreadyCurrent
+        );
+
+        let confirmation = match manager
+            .import_auth_file(&second_source, None)
+            .await
+            .expect("replacement preview")
+        {
+            CodexAuthImportOutcome::RequiresConfirmation { confirmation } => confirmation,
+            other => panic!("unexpected replacement preview: {other:?}"),
+        };
+        assert_eq!(
+            tokio::fs::read(&auth_file)
+                .await
+                .expect("retained first auth"),
+            first
+        );
+
+        let stale = manager
+            .import_auth_file(&second_source, Some("stale-confirmation"))
+            .await;
+        assert!(matches!(stale, Err(DomainError::Conflict(_))));
+        assert_eq!(
+            manager
+                .import_auth_file(&second_source, Some(&confirmation))
+                .await
+                .expect("confirmed replacement"),
+            CodexAuthImportOutcome::Imported {
+                replaced_existing: true
+            }
+        );
+        assert_eq!(
+            tokio::fs::read(&auth_file)
+                .await
+                .expect("read replaced auth"),
+            second
+        );
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn imported_auth_rejects_json_without_complete_oauth_tokens() {
+        let root = std::env::temp_dir().join(format!(
+            "tauritavern-codex-auth-invalid-import-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let auth_file = root.join("security").join("codex").join("auth.json");
+        let source = root.join("auth.json");
+        tokio::fs::create_dir_all(&root).await.expect("temp root");
+        tokio::fs::write(&source, br#"{"tokens":{"access_token":"access"}}"#)
+            .await
+            .expect("write incomplete auth");
+        let manager =
+            CodexAuthManager::with_managed_storage(auth_file.clone(), root.join("imports"));
+
+        let result = manager.import_auth_file(&source, None).await;
+
+        assert!(
+            matches!(result, Err(DomainError::InvalidData(message)) if message.contains("refresh_token"))
+        );
+        assert!(!auth_file.exists(), "invalid auth must not be imported");
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

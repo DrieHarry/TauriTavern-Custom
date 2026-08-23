@@ -21,6 +21,7 @@ use tt_application::services::chat_completion_service::ChatCompletionService;
 use tt_application::services::chat_history_coordinator::ChatHistoryCoordinator;
 use tt_application::services::chat_payload_commit_service::ChatPayloadCommitService;
 use tt_application::services::chat_service::ChatService;
+use tt_application::services::codex_auth_service::CodexAuthService;
 use tt_application::services::content_service::ContentService;
 use tt_application::services::extension_service::ExtensionService;
 use tt_application::services::extension_store_service::ExtensionStoreService;
@@ -74,6 +75,9 @@ pub(super) async fn build(
     let external_import_downloader: Arc<dyn ExternalImportDownloader> =
         Arc::new(HttpExternalImportDownloader::new(http_client_pool.clone()));
     let request_proxy_runtime: Arc<dyn RequestProxyRuntime> = http_client_pool.clone();
+    let codex_auth_service = Arc::new(CodexAuthService::new(
+        repositories.codex_auth_repository.clone(),
+    ));
 
     let content_service = Arc::new(ContentService::new(
         repositories.content_repository.clone(),
@@ -257,6 +261,7 @@ pub(super) async fn build(
         settings_service,
         user_directory_service,
         secret_service,
+        codex_auth_service,
         skill_service,
         sprite_service,
         content_service,

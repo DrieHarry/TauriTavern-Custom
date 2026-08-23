@@ -17,7 +17,7 @@ use tt_adapter_media::{
 use tt_adapter_provider_http::{
     HttpChatCompletionRepository, HttpEmbeddingRepository, HttpProviderMetadataRepository,
     HttpSearxngSearchRepository, HttpStableDiffusionRepository, HttpTranslateRepository,
-    HttpTtsRepository,
+    HttpTtsRepository, codex_auth::configure_codex_auth_repository,
 };
 use tt_adapter_storage_core::{
     DataDirectory, FileAssetRepository, FileChatRepository, FileExtensionStoreRepository,
@@ -48,6 +48,7 @@ use tt_ports::repositories::character_repository::CharacterRepository;
 use tt_ports::repositories::chat_completion_repository::ChatCompletionRepository;
 use tt_ports::repositories::chat_payload_commit_repository::ChatPayloadCommitRepository;
 use tt_ports::repositories::chat_repository::ChatRepository;
+use tt_ports::repositories::codex_auth_repository::CodexAuthRepository;
 use tt_ports::repositories::content_repository::ContentRepository;
 use tt_ports::repositories::extension_repository::ExtensionRepository;
 use tt_ports::repositories::extension_store_repository::ExtensionStoreRepository;
@@ -93,6 +94,7 @@ pub(in crate::app::composition) struct AppRepositories {
     pub(in crate::app::composition) prompt_cache_repository: Arc<dyn PromptCacheRepository>,
     pub(in crate::app::composition) user_directory_repository: Arc<dyn UserDirectoryRepository>,
     pub(in crate::app::composition) secret_repository: Arc<dyn SecretRepository>,
+    pub(in crate::app::composition) codex_auth_repository: Arc<dyn CodexAuthRepository>,
     pub(in crate::app::composition) skill_repository: Arc<dyn SkillRepository>,
     pub(in crate::app::composition) sprite_repository: Arc<dyn SpriteRepository>,
     pub(in crate::app::composition) content_repository: Arc<dyn ContentRepository>,
@@ -143,6 +145,12 @@ pub(super) async fn build(
     let data_root = data_directory.root().to_path_buf();
     let default_user_dir = data_directory.default_user().to_path_buf();
     let chat_aliases = new_shared_chat_alias_store_for_user_dir(data_directory.default_user());
+    let codex_auth_root = runtime_paths.app_root.join("security").join("codex");
+    let codex_auth_repository = configure_codex_auth_repository(
+        codex_auth_root.join("auth.json"),
+        codex_auth_root.join("imports"),
+    )
+    .await;
 
     let file_chat_repository = Arc::new(FileChatRepository::with_chat_aliases_and_backup_settings(
         data_directory.characters().to_path_buf(),
@@ -342,6 +350,7 @@ pub(super) async fn build(
         prompt_cache_repository,
         user_directory_repository,
         secret_repository,
+        codex_auth_repository,
         skill_repository,
         sprite_repository,
         content_repository,

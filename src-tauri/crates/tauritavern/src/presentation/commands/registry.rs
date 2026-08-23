@@ -125,6 +125,10 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::settings_commands::get_settings_snapshots,
         super::settings_commands::load_settings_snapshot,
         super::settings_commands::restore_settings_snapshot,
+        // Codex auth commands
+        super::codex_auth_commands::prepare_codex_auth_import,
+        super::codex_auth_commands::import_codex_auth,
+        super::codex_auth_commands::discard_codex_auth_import,
         // Dev logging commands
         super::dev_logging_commands::devlog_append_frontend_logs,
         super::dev_logging_commands::devlog_set_backend_log_stream_enabled,

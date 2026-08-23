@@ -153,6 +153,7 @@ export function createTauriTavernSettingsApp(options) {
                 },
                 busy: {
                     dataRoot: false,
+                    codexAuth: false,
                 },
             };
         },
@@ -310,6 +311,14 @@ export function createTauriTavernSettingsApp(options) {
                     };
                 } finally {
                     this.busy.dataRoot = false;
+                }
+            },
+            async addCodexAuth() {
+                this.busy.codexAuth = true;
+                try {
+                    await requireAction(actions, 'addCodexAuth')();
+                } finally {
+                    this.busy.codexAuth = false;
                 }
             },
             setRequestProxyEnabled(enabled) {
@@ -600,6 +609,19 @@ export function createTauriTavernSettingsApp(options) {
                 </SettingsSection>
 
                 <SettingsSection :title="tr('Models')" icon="fa-brain">
+                    <SettingRow
+                        v-if="capabilities.supportsCodexAuthImport"
+                        :label="tr('Codex Authentication')"
+                        :hint="tr('Import a Codex auth.json without exposing its tokens to the web interface.')"
+                    >
+                        <ActionButton
+                            :label="tr('Add Codex Auth')"
+                            icon="fa-file-arrow-up"
+                            :disabled="busy.codexAuth"
+                            @click="addCodexAuth"
+                        />
+                    </SettingRow>
+
                     <SettingRow
                         :label="tr('Claude Prompt Cache')"
                         help-topic="claudePromptCache"

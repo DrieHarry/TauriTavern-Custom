@@ -202,6 +202,32 @@ export async function updateTauriTavernSettings(dto) {
     return invokeWithHostNormalization('update_tauritavern_settings', { dto });
 }
 
+export async function prepareCodexAuthImport() {
+    return invokeWithHostNormalization('prepare_codex_auth_import');
+}
+
+export async function importCodexAuth(filePath, expectedExisting = null) {
+    if (typeof filePath !== 'string' || filePath.trim() === '') {
+        throw new Error('Invalid Codex auth import path');
+    }
+    if (expectedExisting !== null && (typeof expectedExisting !== 'string' || expectedExisting.trim() === '')) {
+        throw new Error('Invalid Codex auth replacement confirmation');
+    }
+
+    return invokeWithHostNormalization('import_codex_auth', {
+        file_path: filePath,
+        expected_existing: expectedExisting,
+    });
+}
+
+export async function discardCodexAuthImport(filePath) {
+    if (typeof filePath !== 'string' || filePath.trim() === '') {
+        throw new Error('Invalid Codex auth import path');
+    }
+
+    return invokeWithHostNormalization('discard_codex_auth_import', { file_path: filePath });
+}
+
 export async function getRuntimePaths() {
     const invokeFn = getInvokeFn();
     if (!invokeFn) {

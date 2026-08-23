@@ -17,8 +17,13 @@ object AndroidContentFileTransfer {
   ): String {
     targetFile.parentFile?.mkdirs()
 
-    requireNotNull(contentResolver.openInputStream(contentUri)).use { input ->
-      targetFile.outputStream().use { output -> input.copyTo(output, COPY_BUFFER_BYTES) }
+    try {
+      requireNotNull(contentResolver.openInputStream(contentUri)).use { input ->
+        targetFile.outputStream().use { output -> input.copyTo(output, COPY_BUFFER_BYTES) }
+      }
+    } catch (error: Throwable) {
+      targetFile.delete()
+      throw error
     }
 
     return targetFile.absolutePath

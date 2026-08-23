@@ -5,6 +5,7 @@ import {
     setDataRoot,
     updateTauriTavernSettings,
 } from '../../../../tauri-bridge.js';
+import { addCodexAuth } from './codex-auth-import.js';
 import { runTaskOrPopup, showErrorPopup } from './popup-utils.js';
 import {
     loadChatBackupStorageStats,
@@ -349,6 +350,7 @@ async function chooseDataRoot() {
 
 function createSettingsActions(backgroundOptions) {
     return {
+        addCodexAuth: () => runTaskOrPopup(addCodexAuth),
         chooseDataRoot: () => runTaskOrPopup(chooseDataRoot),
         chooseWallpaper: (request) => runTaskOrPopup(() => chooseWallpaper(backgroundOptions, request)),
         showHelp: (topicId) => runTaskOrPopup(() => showHelpTopic(topicId)),

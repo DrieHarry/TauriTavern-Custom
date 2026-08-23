@@ -17,6 +17,7 @@ use tt_application::services::chat_completion_service::ChatCompletionService;
 use tt_application::services::chat_history_coordinator::ChatHistoryCoordinator;
 use tt_application::services::chat_payload_commit_service::ChatPayloadCommitService;
 use tt_application::services::chat_service::ChatService;
+use tt_application::services::codex_auth_service::CodexAuthService;
 use tt_application::services::content_service::ContentService;
 use tt_application::services::data_archive_service::DataArchiveService;
 use tt_application::services::extension_service::ExtensionService;
@@ -87,6 +88,7 @@ pub(crate) struct AppServices {
     pub(crate) settings_service: Arc<SettingsService>,
     pub(crate) user_directory_service: Arc<UserDirectoryService>,
     pub(crate) secret_service: Arc<SecretService>,
+    pub(crate) codex_auth_service: Arc<CodexAuthService>,
     pub(crate) skill_service: Arc<SkillService>,
     pub(crate) sprite_service: Arc<SpriteService>,
     pub(crate) content_service: Arc<ContentService>,

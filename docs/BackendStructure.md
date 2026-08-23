@@ -305,6 +305,8 @@ adapter 是外层细节，但不是可以任意堆放的 common bucket。一个 
 
 TauriTavern 用户数据中的私有状态放在 `_tauritavern` 下，例如 agent workspace、agent profiles、skills、prompt cache、legacy extension source metadata、LLM connections。能够授予宿主权限的安全状态不属于用户数据：自定义端点 grant 存在 `app_root/security`，不会随可切换的 `data_root`、备份或导入迁移。
 
+导入的 Codex OAuth 凭据同样属于宿主安全状态，保存到 `app_root/security/codex/auth.json`。桌面端仅在该文件存在时优先使用它，否则继续兼容 `CODEX_HOME/auth.json` 与 Codex CLI 的 `~/.codex/auth.json`；Android 始终使用应用管理的凭据，不依赖 home 目录或 Codex CLI。
+
 权威代码入口：
 
 - `src-tauri/crates/tt-adapter-storage-core/src/file_system.rs`

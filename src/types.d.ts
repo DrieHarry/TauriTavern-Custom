@@ -25,6 +25,9 @@ interface Window {
     __TAURITAVERN_EXPORT_ARCHIVE_PICKER__?: {
         onNativeResult: (payload: any) => void;
     };
+    __TAURITAVERN_CODEX_AUTH_PICKER__?: {
+        onNativeResult: (payload: any) => void;
+    };
 
     __TAURITAVERN_HANDLE_BACK__?: () => boolean;
     __TAURITAVERN_NATIVE_SHARE__?: {
