@@ -13,7 +13,6 @@ use tt_ports::repositories::chat_completion_repository::{
 
 use super::HttpChatCompletionRepository;
 use super::openai_responses::{self, ResponsesStreamOptions};
-use super::response_body::read_upstream_json_body;
 use crate::codex_auth::{CODEX_BASE_URL, build_codex_headers, client_version, codex_auth_manager};
 
 const MODEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -143,16 +142,16 @@ pub(super) async fn generate(
     payload: &Value,
     provider_name: &str,
 ) -> Result<ChatCompletionRepositoryGenerateResponse, DomainError> {
-    let client = repository.client(config)?;
+    let client = repository.stream_client(config)?;
     let auth = codex_auth_manager().load_auth(&client).await?;
     let version = client_version();
     let headers = build_codex_headers(&auth, Some(&version), true)?;
-    let request_body = codex_request_payload(payload, false)?;
+    let request_body = codex_request_payload(payload)?;
 
     let response = client
         .post(format!("{CODEX_BASE_URL}/responses"))
         .headers(headers)
-        .header(ACCEPT, "application/json")
+        .header(ACCEPT, "text/event-stream")
         .json(&request_body)
         .send()
         .await
@@ -172,7 +171,8 @@ pub(super) async fn generate(
         .await);
     }
 
-    let response = read_upstream_json_body(provider_name, "generate", response).await?;
+    let response =
+        openai_responses::collect_http_completed_response(provider_name, response).await?;
     normalize_codex_response(response, should_emit_reasoning(payload))
 }
 
@@ -189,7 +189,7 @@ pub(super) async fn generate_stream(
     let auth = codex_auth_manager().load_auth(&client).await?;
     let version = client_version();
     let headers = build_codex_headers(&auth, Some(&version), true)?;
-    let request_body = codex_request_payload(payload, true)?;
+    let request_body = codex_request_payload(payload)?;
     let model = request_body
         .get("model")
         .and_then(Value::as_str)
@@ -240,12 +240,26 @@ pub(super) async fn generate_stream(
     .await
 }
 
-fn codex_request_payload(payload: &Value, stream: bool) -> Result<Value, DomainError> {
+fn codex_request_payload(payload: &Value) -> Result<Value, DomainError> {
     let mut request = openai_responses::upstream_payload(payload)?;
     let object = request.as_object_mut().ok_or_else(|| {
         DomainError::InvalidData("Codex Responses payload must be an object".to_string())
     })?;
-    object.insert("stream".to_string(), Value::Bool(stream));
+    // Enforce Codex wire invariants after application-level body overrides.
+    for key in ["max_output_tokens", "temperature", "top_p"] {
+        object.remove(key);
+    }
+    if let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input {
+            if item.get("role").and_then(Value::as_str) == Some("developer")
+                && let Some(item) = item.as_object_mut()
+            {
+                item.insert("role".to_string(), Value::String("system".to_string()));
+            }
+        }
+    }
+
+    object.insert("stream".to_string(), Value::Bool(true));
     object.insert("store".to_string(), Value::Bool(false));
     Ok(request)
 }
@@ -310,18 +324,30 @@ mod tests {
     }
 
     #[test]
-    fn codex_request_payload_forces_transport_stream_mode() {
+    fn codex_request_payload_enforces_wire_contract() {
         let payload = json!({
             "model": "gpt-5.6",
-            "input": [{ "role": "user", "content": "Hello" }],
+            "input": [
+                { "role": "system", "content": "System" },
+                { "role": "developer", "content": "Developer" },
+                { "role": "user", "content": "Hello" }
+            ],
+            "max_output_tokens": 2048,
+            "temperature": 0.7,
+            "top_p": 0.9,
             "stream": false,
             "_tauritavern_provider_state": { "transport": "internal" }
         });
 
-        let request = codex_request_payload(&payload, true).expect("Codex payload");
+        let request = codex_request_payload(&payload).expect("Codex payload");
         assert_eq!(request["stream"], true);
         assert_eq!(request["store"], false);
         assert!(request.get("_tauritavern_provider_state").is_none());
+        assert!(request.get("max_output_tokens").is_none());
+        assert!(request.get("temperature").is_none());
+        assert!(request.get("top_p").is_none());
+        assert_eq!(request["input"][0]["role"], "system");
+        assert_eq!(request["input"][1]["role"], "system");
     }
 
     #[test]

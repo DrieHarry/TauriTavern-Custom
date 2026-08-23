@@ -26,6 +26,7 @@ use super::response_body::{log_upstream_body_parse_failure, read_upstream_json_b
 type ResponsesWsStream = tokio_tungstenite::WebSocketStream<reqwest::Upgraded>;
 
 const OPERATION_GENERATE_STREAM_HTTP: &str = "generate_stream_http";
+const OPERATION_GENERATE_COLLECT_HTTP: &str = "generate_collect_http";
 const OPERATION_GENERATE_PERSISTENT_WS: &str = "generate_persistent_ws";
 
 #[derive(Default)]
@@ -597,6 +598,55 @@ async fn generate_stream_http(
         ResponsesStreamOptions::default(),
     )
     .await
+}
+
+#[derive(Default)]
+struct ResponsesCompletionCollector {
+    completed_response: Option<Value>,
+}
+
+impl ResponsesCompletionCollector {
+    fn handle_event(&mut self, event: &Value) -> Result<(), DomainError> {
+        if let Some(response) = terminal_response_from_event(event)? {
+            self.completed_response = Some(response.clone());
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Value, DomainError> {
+        self.completed_response.ok_or_else(|| {
+            DomainError::transient(
+                "OpenAI Responses stream closed before response.completed".to_string(),
+            )
+        })
+    }
+}
+
+pub(crate) async fn collect_http_completed_response(
+    provider_name: &str,
+    response: reqwest::Response,
+) -> Result<Value, DomainError> {
+    let mut collector = ResponsesCompletionCollector::default();
+    let (dummy_sender, dummy_receiver) = mpsc::unbounded_channel::<String>();
+    drop(dummy_receiver);
+    let (_cancel_sender, cancel) = tokio::sync::watch::channel(false);
+
+    HttpChatCompletionRepository::stream_sse_response_internal(
+        provider_name,
+        response,
+        dummy_sender,
+        cancel,
+        |payload| {
+            if payload == b"[DONE]" {
+                return Ok(());
+            }
+            let event = parse_sse_event(payload, OPERATION_GENERATE_COLLECT_HTTP)?;
+            collector.handle_event(&event)
+        },
+    )
+    .await?;
+
+    collector.finish()
 }
 
 pub(crate) async fn stream_http_response(
@@ -1263,5 +1313,36 @@ mod tests {
 
         assert!(state.ensure_completed(false).is_err());
         state.ensure_completed(true).unwrap();
+    }
+
+    #[test]
+    fn responses_completion_collector_returns_the_completed_response() {
+        let response = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": []
+        });
+        let mut collector = ResponsesCompletionCollector::default();
+
+        collector
+            .handle_event(&json!({
+                "type": "response.completed",
+                "response": response.clone()
+            }))
+            .unwrap();
+
+        assert_eq!(collector.finish().unwrap(), response);
+    }
+
+    #[test]
+    fn responses_completion_collector_rejects_a_truncated_stream() {
+        let collector = ResponsesCompletionCollector::default();
+
+        let error = collector.finish().expect_err("completion is required");
+        assert!(
+            error
+                .to_string()
+                .contains("closed before response.completed")
+        );
     }
 }

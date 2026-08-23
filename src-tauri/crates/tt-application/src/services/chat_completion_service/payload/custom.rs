@@ -181,7 +181,7 @@ mod tests {
         let (endpoint, upstream) = build(payload).expect("Codex payload should build");
 
         assert_eq!(endpoint, "/responses");
-        assert_eq!(upstream["input"][0]["role"], "developer");
+        assert_eq!(upstream["input"][0]["role"], "system");
         assert_eq!(upstream["reasoning"]["effort"], "xhigh");
         assert_eq!(upstream["reasoning"]["summary"], "detailed");
         assert_eq!(upstream["text"]["format"]["type"], "json_object");

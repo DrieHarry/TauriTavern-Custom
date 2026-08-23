@@ -63,7 +63,7 @@ fn build_openai_responses_payload(
     let input = build_input_items(
         payload.get("messages"),
         previous_response_id.is_some(),
-        matches!(profile, ResponsesBuildProfile::Codex),
+        profile,
     )?;
 
     let mut request = Map::new();
@@ -287,7 +287,7 @@ fn apply_codex_response_options(
 fn build_input_items(
     messages: Option<&Value>,
     allow_orphan_tool_outputs: bool,
-    allow_user_files: bool,
+    profile: ResponsesBuildProfile,
 ) -> Result<Vec<Value>, ApplicationError> {
     let Some(messages) = messages else {
         return Ok(Vec::new());
@@ -308,7 +308,8 @@ fn build_input_items(
 
     ResponsesTranscriptCompiler {
         allow_orphan_tool_outputs,
-        allow_user_files,
+        allow_user_files: matches!(profile, ResponsesBuildProfile::Codex),
+        profile,
         ..Default::default()
     }
     .compile(entries)
@@ -320,6 +321,7 @@ struct ResponsesTranscriptCompiler {
     function_call_ids: HashSet<String>,
     allow_orphan_tool_outputs: bool,
     allow_user_files: bool,
+    profile: ResponsesBuildProfile,
 }
 
 impl ResponsesTranscriptCompiler {
@@ -348,20 +350,25 @@ impl ResponsesTranscriptCompiler {
         match role.as_str() {
             "assistant" => self.compile_assistant_message(message),
             "tool" | "function" => self.compile_tool_message(message),
-            "system" => {
+            "system" | "developer" => {
+                let role = if matches!(self.profile, ResponsesBuildProfile::Codex) {
+                    "system"
+                } else {
+                    "developer"
+                };
                 self.input.push(json!({
-                    "role": "developer",
+                    "role": role,
                     "content": responses_input_message_content(message.get("content"), false, false)?,
                 }));
                 Ok(())
             }
-            "developer" | "user" => {
+            "user" => {
                 self.input.push(json!({
                     "role": role,
                     "content": responses_input_message_content(
                         message.get("content"),
-                        role == "user",
-                        role == "user" && self.allow_user_files,
+                        true,
+                        self.allow_user_files,
                     )?,
                 }));
                 Ok(())
@@ -938,7 +945,31 @@ fn map_openai_tool_choice_to_responses(tool_choice: Value) -> Value {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::build;
+    use super::{build, build_codex};
+
+    #[test]
+    fn codex_payload_preserves_system_role_and_normalizes_developer_role() {
+        let payload = json!({
+            "model": "gpt-5-codex",
+            "messages": [
+                { "role": "system", "content": "system instructions" },
+                { "role": "developer", "content": "developer instructions" },
+                { "role": "user", "content": "hello" }
+            ]
+        })
+        .as_object()
+        .cloned()
+        .expect("payload must be object");
+
+        let (_, upstream) = build_codex(payload).expect("build should succeed");
+        let input = upstream["input"]
+            .as_array()
+            .expect("input must be an array");
+
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[1]["role"], "system");
+        assert_eq!(input[2]["role"], "user");
+    }
 
     #[test]
     fn openai_responses_payload_maps_system_and_tool_turns_to_typed_items() {

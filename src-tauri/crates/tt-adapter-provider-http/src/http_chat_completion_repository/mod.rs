@@ -40,12 +40,27 @@ pub struct HttpChatCompletionRepository {
     openai_responses_ws_sessions: openai_responses::ResponsesWsSessionPool,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) enum SseDataFraming {
+    #[default]
+    EventDelimited,
+    DataLineDelimited,
+}
+
 #[derive(Default)]
 struct SseEventAccumulator {
     data: Vec<u8>,
+    framing: SseDataFraming,
 }
 
 impl SseEventAccumulator {
+    fn with_framing(framing: SseDataFraming) -> Self {
+        Self {
+            framing,
+            ..Default::default()
+        }
+    }
+
     fn on_line<F: FnMut(&[u8]) -> Result<(), DomainError>>(
         &mut self,
         line: &[u8],
@@ -69,6 +84,11 @@ impl SseEventAccumulator {
 
             if value == b"[DONE]" {
                 self.dispatch(sender, hook)?;
+                self.data.extend_from_slice(value);
+                return self.dispatch(sender, hook);
+            }
+
+            if matches!(self.framing, SseDataFraming::DataLineDelimited) {
                 self.data.extend_from_slice(value);
                 return self.dispatch(sender, hook);
             }
@@ -357,22 +377,68 @@ impl HttpChatCompletionRepository {
         sender: ChatCompletionStreamSender,
         cancel: ChatCompletionCancelReceiver,
     ) -> Result<(), DomainError> {
-        Self::stream_sse_response_internal(provider_name, response, sender, cancel, |_| Ok(()))
-            .await
+        Self::stream_sse_response_with_framing(
+            provider_name,
+            response,
+            sender,
+            cancel,
+            SseDataFraming::EventDelimited,
+        )
+        .await
+    }
+
+    pub(crate) async fn stream_sse_response_with_framing(
+        provider_name: &str,
+        response: reqwest::Response,
+        sender: ChatCompletionStreamSender,
+        cancel: ChatCompletionCancelReceiver,
+        framing: SseDataFraming,
+    ) -> Result<(), DomainError> {
+        Self::stream_sse_response_internal_with_framing(
+            provider_name,
+            response,
+            sender,
+            cancel,
+            framing,
+            |_| Ok(()),
+        )
+        .await
     }
 
     pub(crate) async fn stream_sse_response_internal<F>(
         provider_name: &str,
+        response: reqwest::Response,
+        sender: ChatCompletionStreamSender,
+        cancel: ChatCompletionCancelReceiver,
+        hook: F,
+    ) -> Result<(), DomainError>
+    where
+        F: FnMut(&[u8]) -> Result<(), DomainError>,
+    {
+        Self::stream_sse_response_internal_with_framing(
+            provider_name,
+            response,
+            sender,
+            cancel,
+            SseDataFraming::EventDelimited,
+            hook,
+        )
+        .await
+    }
+
+    pub(crate) async fn stream_sse_response_internal_with_framing<F>(
+        provider_name: &str,
         mut response: reqwest::Response,
         sender: ChatCompletionStreamSender,
         mut cancel: ChatCompletionCancelReceiver,
+        framing: SseDataFraming,
         mut hook: F,
     ) -> Result<(), DomainError>
     where
         F: FnMut(&[u8]) -> Result<(), DomainError>,
     {
         let mut buffer = Vec::<u8>::new();
-        let mut accumulator = SseEventAccumulator::default();
+        let mut accumulator = SseEventAccumulator::with_framing(framing);
         let endpoint = response.url().clone();
 
         loop {
@@ -739,7 +805,7 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
                     config,
                     endpoint_path,
                     payload,
-                    source_name,
+                    source,
                     sender,
                     cancel,
                 )
@@ -785,7 +851,7 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
                         config,
                         endpoint_path,
                         payload,
-                        source_name,
+                        source,
                         sender,
                         cancel,
                     )
@@ -1079,6 +1145,30 @@ mod tests {
             serde_json::from_str::<Value>(&event).expect("valid multiline JSON"),
             json!({ "chunk": { "nested": true } })
         );
+        assert!(receiver.try_recv().is_err());
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn forward_sse_events_dispatches_data_lines_without_an_event_boundary() {
+        let (sender, mut receiver) = mpsc::unbounded_channel::<String>();
+        let mut buffer = b"data: {\"chunk\":1}\n".to_vec();
+
+        fn noop(_: &[u8]) -> Result<(), DomainError> {
+            Ok(())
+        }
+        let mut hook = noop;
+        let mut accumulator =
+            super::SseEventAccumulator::with_framing(super::SseDataFraming::DataLineDelimited);
+        HttpChatCompletionRepository::forward_sse_events(
+            &mut buffer,
+            &mut accumulator,
+            &sender,
+            &mut hook,
+        )
+        .unwrap();
+
+        assert_eq!(receiver.try_recv().ok(), Some("{\"chunk\":1}".to_string()));
         assert!(receiver.try_recv().is_err());
         assert!(buffer.is_empty());
     }

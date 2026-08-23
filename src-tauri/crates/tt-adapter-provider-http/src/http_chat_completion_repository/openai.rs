@@ -3,11 +3,12 @@ use serde_json::Value;
 
 use tt_domain::errors::DomainError;
 use tt_ports::repositories::chat_completion_repository::{
-    ChatCompletionApiConfig, ChatCompletionCancelReceiver, ChatCompletionStreamSender,
+    ChatCompletionApiConfig, ChatCompletionCancelReceiver, ChatCompletionSource,
+    ChatCompletionStreamSender,
 };
 
-use super::HttpChatCompletionRepository;
 use super::response_body::read_upstream_json_body;
+use super::{HttpChatCompletionRepository, SseDataFraming};
 
 pub(super) async fn list_models(
     repository: &HttpChatCompletionRepository,
@@ -95,10 +96,15 @@ pub(super) async fn generate_stream(
     config: &ChatCompletionApiConfig,
     endpoint_path: &str,
     payload: &Value,
-    provider_name: &str,
+    source: ChatCompletionSource,
     sender: ChatCompletionStreamSender,
     cancel: ChatCompletionCancelReceiver,
 ) -> Result<(), DomainError> {
+    let provider_name = source.display_name();
+    let framing = match source {
+        ChatCompletionSource::NanoGpt => SseDataFraming::DataLineDelimited,
+        _ => SseDataFraming::EventDelimited,
+    };
     let url = HttpChatCompletionRepository::build_url(&config.base_url, endpoint_path)?;
 
     let client = repository.stream_client(config)?;
@@ -133,11 +139,12 @@ pub(super) async fn generate_stream(
             .to_string();
         let mut logged = false;
 
-        HttpChatCompletionRepository::stream_sse_response_internal(
+        HttpChatCompletionRepository::stream_sse_response_internal_with_framing(
             provider_name,
             response,
             sender,
             cancel,
+            framing,
             move |payload| {
                 if logged {
                     return Ok(());
@@ -167,7 +174,13 @@ pub(super) async fn generate_stream(
         )
         .await
     } else {
-        HttpChatCompletionRepository::stream_sse_response(provider_name, response, sender, cancel)
-            .await
+        HttpChatCompletionRepository::stream_sse_response_with_framing(
+            provider_name,
+            response,
+            sender,
+            cancel,
+            framing,
+        )
+        .await
     }
 }
