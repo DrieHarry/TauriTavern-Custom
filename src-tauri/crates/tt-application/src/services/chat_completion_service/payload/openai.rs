@@ -160,6 +160,12 @@ fn build_chat_completion_payload(
         insert_if_present(&mut request, payload, key);
     }
 
+    if source == "custom"
+        && let Some(reasoning_effort) = payload.get("reasoning_effort")
+    {
+        request.insert("reasoning_effort".to_string(), reasoning_effort.clone());
+    }
+
     if let Some(model) = payload.get("model").and_then(Value::as_str) {
         if should_forward_openai_reasoning_effort(source, model)
             && let Some(reasoning_effort) = payload
@@ -388,10 +394,10 @@ mod tests {
     }
 
     #[test]
-    fn custom_payload_does_not_forward_reasoning_effort_for_non_openai_models() {
+    fn custom_payload_forwards_reasoning_effort_for_unknown_models() {
         let payload = json!({
             "chat_completion_source": "custom",
-            "model": "claude-opus-4-5",
+            "model": "custom-reasoning-model",
             "messages": [{"role": "user", "content": "hello"}],
             "reasoning_effort": "high",
             "verbosity": "high"
@@ -404,30 +410,31 @@ mod tests {
         assert_eq!(endpoint, "/chat/completions");
 
         let body = upstream.as_object().expect("payload must be object");
-        assert!(body.get("reasoning_effort").is_none());
+
+        assert_eq!(
+            body.get("reasoning_effort").and_then(Value::as_str),
+            Some("high")
+        );
+
         assert!(body.get("verbosity").is_none());
     }
 
     #[test]
-    fn custom_payload_forwards_reasoning_effort_for_supported_openai_models() {
-        let payload = json!({
-            "chat_completion_source": "custom",
-            "model": "gpt-5-2025-08-07",
-            "messages": [{"role": "user", "content": "hello"}],
-            "reasoning_effort": "min"
-        })
-        .as_object()
-        .cloned()
-        .expect("payload must be object");
+    fn custom_payload_preserves_reasoning_effort_for_openai_model_names() {
+        for reasoning_effort in ["min", "max", "xhigh", "auto"] {
+            let payload = json!({
+                "chat_completion_source": "custom",
+                "model": "gpt-5.1",
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": reasoning_effort
+            })
+            .as_object()
+            .cloned()
+            .expect("payload must be object");
 
-        let (_endpoint, upstream) = build(payload).expect("build should succeed");
-        let body = upstream.as_object().expect("payload must be object");
-        assert_eq!(
-            body.get("reasoning_effort")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            "none"
-        );
+            let (_endpoint, upstream) = build(payload).expect("build should succeed");
+            assert_eq!(upstream["reasoning_effort"], reasoning_effort);
+        }
     }
 
     #[test]
