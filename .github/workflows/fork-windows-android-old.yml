@@ -10,7 +10,7 @@
 # prepare, shared/Windows desktop setup, shared/Android mobile setup,
 # notes-context, notes-ai, notes, and permanent canary publishing.
 
-name: Fork Windows + Android
+name: (API) Fork Windows + Android
 
 on:
   workflow_dispatch:
