@@ -353,11 +353,9 @@ impl ResponsesStreamState {
                 .insert(item_id.to_string(), call_id.clone());
         }
 
-        let next_index = event
-            .get("output_index")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(self.tool_calls.len());
+        // Responses output indices include non-tool items such as reasoning and messages.
+        // Chat Completions tool-call indices instead address the dense tool_calls array.
+        let next_index = self.tool_calls.len();
         let state =
             self.tool_calls
                 .entry(call_id.clone())
@@ -603,22 +601,72 @@ async fn generate_stream_http(
 #[derive(Default)]
 struct ResponsesCompletionCollector {
     completed_response: Option<Value>,
+    output_items: Vec<CollectedResponseOutputItem>,
+}
+
+struct CollectedResponseOutputItem {
+    output_index: Option<usize>,
+    item: Value,
 }
 
 impl ResponsesCompletionCollector {
     fn handle_event(&mut self, event: &Value) -> Result<(), DomainError> {
+        if event.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
+            let item = event.get("item").cloned().ok_or_else(|| {
+                DomainError::InternalError(
+                    "OpenAI Responses output_item.done event is missing item".to_string(),
+                )
+            })?;
+            self.output_items.push(CollectedResponseOutputItem {
+                output_index: event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok()),
+                item,
+            });
+        }
         if let Some(response) = terminal_response_from_event(event)? {
             self.completed_response = Some(response.clone());
         }
         Ok(())
     }
 
-    fn finish(self) -> Result<Value, DomainError> {
-        self.completed_response.ok_or_else(|| {
+    fn finish(mut self) -> Result<Value, DomainError> {
+        let mut response = self.completed_response.ok_or_else(|| {
             DomainError::transient(
                 "OpenAI Responses stream closed before response.completed".to_string(),
             )
-        })
+        })?;
+
+        let terminal_has_output = response
+            .get("output")
+            .and_then(Value::as_array)
+            .is_some_and(|output| !output.is_empty());
+        if !terminal_has_output && !self.output_items.is_empty() {
+            if self
+                .output_items
+                .iter()
+                .all(|output_item| output_item.output_index.is_some())
+            {
+                self.output_items
+                    .sort_by_key(|output_item| output_item.output_index);
+            }
+            let output = self
+                .output_items
+                .into_iter()
+                .map(|output_item| output_item.item)
+                .collect();
+            response
+                .as_object_mut()
+                .ok_or_else(|| {
+                    DomainError::InternalError(
+                        "OpenAI Responses completion response must be an object".to_string(),
+                    )
+                })?
+                .insert("output".to_string(), Value::Array(output));
+        }
+
+        Ok(response)
     }
 }
 
@@ -1240,6 +1288,19 @@ mod tests {
                     "type": "response.output_item.done",
                     "output_index": 0,
                     "item": {
+                        "type": "reasoning",
+                        "summary": []
+                    }
+                }),
+            )
+            .unwrap();
+        state
+            .handle_event(
+                &sender,
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
                         "type": "function_call",
                         "call_id": "call_weather",
                         "name": "weather",
@@ -1272,6 +1333,7 @@ mod tests {
         }
 
         assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["index"], json!(0));
         assert_eq!(tool_calls[0]["id"], json!("call_weather"));
         assert_eq!(tool_calls[0]["function"]["name"], json!("weather"));
         assert_eq!(
@@ -1316,22 +1378,72 @@ mod tests {
     }
 
     #[test]
-    fn responses_completion_collector_returns_the_completed_response() {
-        let response = json!({
-            "id": "resp_1",
-            "status": "completed",
-            "output": []
-        });
+    fn responses_completion_collector_reconstructs_output_items() {
         let mut collector = ResponsesCompletionCollector::default();
 
         collector
             .handle_event(&json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "summary": []
+                }
+            }))
+            .unwrap();
+        collector
+            .handle_event(&json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "A moonlit forest"
+                    }]
+                }
+            }))
+            .unwrap();
+        collector
+            .handle_event(&json!({
+                "type": "response.output_item.done",
+                "output_index": 2,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_image",
+                    "name": "generate_image",
+                    "arguments": "{\"prompt\":\"A moonlit forest\"}"
+                }
+            }))
+            .unwrap();
+        collector
+            .handle_event(&json!({
                 "type": "response.completed",
-                "response": response.clone()
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 4,
+                        "total_tokens": 14
+                    }
+                }
             }))
             .unwrap();
 
-        assert_eq!(collector.finish().unwrap(), response);
+        let normalized = normalize_completed_response(collector.finish().unwrap())
+            .expect("collected response should normalize")
+            .body;
+        let message = &normalized["choices"][0]["message"];
+
+        assert_eq!(message["content"], json!("A moonlit forest"));
+        assert_eq!(message["tool_calls"][0]["id"], json!("call_image"));
+        assert_eq!(
+            message["tool_calls"][0]["function"]["name"],
+            json!("generate_image")
+        );
+        assert_eq!(normalized["usage"]["prompt_tokens"], json!(10));
     }
 
     #[test]

@@ -30,6 +30,13 @@ impl ChatCompletionProviderFormat {
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
             )?;
+            if payload
+                .get("custom_url")
+                .and_then(Value::as_str)
+                .is_some_and(tt_domain::models::endpoint_url::is_codex_endpoint)
+            {
+                return Ok(Self::OpenAiResponses);
+            }
             return Ok(match format {
                 CustomApiFormat::OpenAiCompat => Self::OpenAiCompatible,
                 CustomApiFormat::OpenAiResponses => Self::OpenAiResponses,
@@ -80,6 +87,47 @@ fn is_vertexai_claude_payload(payload: &Map<String, Value>) -> bool {
         .get("model")
         .and_then(Value::as_str)
         .is_some_and(is_vertex_ai_claude_model_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn codex_custom_endpoint_uses_responses_provider_format() {
+        let payload = json!({
+            "custom_api_format": "openai_compat",
+            "custom_url": "http://codex.local/v1"
+        });
+
+        assert_eq!(
+            ChatCompletionProviderFormat::from_payload(
+                ChatCompletionSource::Custom,
+                payload.as_object().unwrap(),
+            )
+            .unwrap(),
+            ChatCompletionProviderFormat::OpenAiResponses
+        );
+    }
+
+    #[test]
+    fn ordinary_custom_endpoint_keeps_configured_provider_format() {
+        let payload = json!({
+            "custom_api_format": "openai_compat",
+            "custom_url": "https://example.com/v1"
+        });
+
+        assert_eq!(
+            ChatCompletionProviderFormat::from_payload(
+                ChatCompletionSource::Custom,
+                payload.as_object().unwrap(),
+            )
+            .unwrap(),
+            ChatCompletionProviderFormat::OpenAiCompatible
+        );
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -276,17 +276,13 @@ fn normalize_codex_response(
     emit_reasoning: bool,
 ) -> Result<ChatCompletionRepositoryGenerateResponse, DomainError> {
     let mut normalized = openai_responses::normalize_completed_response(response)?;
-    if let Some(message) = normalized
-        .body
-        .pointer_mut("/choices/0/message")
-        .and_then(Value::as_object_mut)
+    if !emit_reasoning
+        && let Some(message) = normalized
+            .body
+            .pointer_mut("/choices/0/message")
+            .and_then(Value::as_object_mut)
     {
-        // Codex remains an OpenAI-compatible custom provider; Responses replay metadata is not
-        // exposed as its canonical provider representation.
-        message.remove("native");
-        if !emit_reasoning {
-            message.remove("reasoning_content");
-        }
+        message.remove("reasoning_content");
     }
     Ok(normalized)
 }
@@ -320,7 +316,10 @@ mod tests {
         assert_eq!(normalized["choices"][0]["message"]["content"], "Hello");
         assert_eq!(normalized["usage"]["prompt_tokens"], 10);
         assert_eq!(normalized["usage"]["completion_tokens"], 4);
-        assert!(normalized["choices"][0]["message"].get("native").is_none());
+        assert_eq!(
+            normalized.pointer("/choices/0/message/native/openai_responses/output/0/type"),
+            Some(&json!("message"))
+        );
     }
 
     #[test]
