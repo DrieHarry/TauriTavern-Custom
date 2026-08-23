@@ -6,7 +6,6 @@ use crate::errors::ApplicationError;
 use tt_ports::repositories::chat_completion_repository::CHAT_COMPLETION_PROVIDER_STATE_FIELD;
 
 use super::content_parts::{InputPart, MediaPart, MediaSource, parse_openai_chat_content};
-use super::openai_reasoning::normalize_openai_reasoning_effort;
 use super::shared::message_content_to_text;
 use super::tool_calls::message_tool_call_id;
 
@@ -110,11 +109,15 @@ fn build_openai_responses_payload(
         );
     }
 
-    if let Some(reasoning_effort) = payload
-        .get("reasoning_effort")
-        .and_then(Value::as_str)
-        .and_then(|value| normalize_reasoning_effort(value, model, profile))
-    {
+    let reasoning_effort = match profile {
+        ResponsesBuildProfile::Standard => payload.get("reasoning_effort").cloned(),
+        ResponsesBuildProfile::Codex => payload
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .and_then(|value| normalize_codex_reasoning_effort(value, model))
+            .map(|value| Value::String(value.to_string())),
+    };
+    if let Some(reasoning_effort) = reasoning_effort {
         request.insert(
             "reasoning".to_string(),
             json!({ "effort": reasoning_effort }),
@@ -197,15 +200,7 @@ fn build_openai_responses_payload(
     Ok(request)
 }
 
-fn normalize_reasoning_effort<'a>(
-    value: &'a str,
-    model: &str,
-    profile: ResponsesBuildProfile,
-) -> Option<&'a str> {
-    if !matches!(profile, ResponsesBuildProfile::Codex) {
-        return normalize_openai_reasoning_effort(value, model);
-    }
-
+fn normalize_codex_reasoning_effort<'a>(value: &'a str, model: &str) -> Option<&'a str> {
     let value = value.trim();
     match value.to_ascii_lowercase().as_str() {
         "" | "auto" => None,
