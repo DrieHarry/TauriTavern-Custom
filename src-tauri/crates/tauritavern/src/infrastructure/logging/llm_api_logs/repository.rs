@@ -273,7 +273,7 @@ impl StableDiffusionRepository for LoggingStableDiffusionRepository {
 
         let id = self.store.allocate_id();
 
-        let log_payload = wire_log_payload(&request.body);
+        let log_payload = image_request_log_payload(&request.body);
         let model = log_payload
             .get("model")
             .and_then(Value::as_str)
@@ -306,8 +306,9 @@ impl StableDiffusionRepository for LoggingStableDiffusionRepository {
                         ("ERROR".to_string(), Some(err_str.to_string()))
                     };
 
-                    let response_log_payload = wire_log_payload(&response.body);
-                    let readable = format_image_response_readable(response.status, &response_log_payload);
+                    let response_log_payload = image_response_log_payload(&response.body);
+                    let readable =
+                        format_image_response_readable(response.status, &response_log_payload);
                     let raw = pretty_json(&response_log_payload);
                     (
                         is_success,
@@ -360,6 +361,128 @@ impl StableDiffusionRepository for LoggingStableDiffusionRepository {
     }
 }
 
+fn image_request_log_payload(payload: &Value) -> Value {
+    let mut sanitized = wire_log_payload(payload).into_owned();
+    let format = sanitized
+        .get("format")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    redact_image_request_content(&mut sanitized, None, format.as_deref());
+    sanitized
+}
+
+fn redact_image_request_content(value: &mut Value, field: Option<&str>, format: Option<&str>) {
+    match value {
+        Value::String(_) if field.is_some_and(is_image_request_content_field) => {
+            replace_image_content(value, format);
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_image_request_content(value, field, format);
+            }
+        }
+        Value::Object(object) => {
+            for (key, value) in object {
+                redact_image_request_content(value, Some(key), format);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_image_request_content_field(field: &str) -> bool {
+    matches!(
+        field,
+        "init_images"
+            | "mask"
+            | "image"
+            | "image_base64"
+            | "input_image"
+            | "source_image"
+            | "control_image"
+            | "reference_image"
+            | "b64_json"
+    )
+}
+
+fn image_response_log_payload(payload: &Value) -> Value {
+    let mut sanitized = wire_log_payload(payload).into_owned();
+    let format = sanitized
+        .get("format")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    if let Some(object) = sanitized.as_object_mut() {
+        for field in ["data", "image"] {
+            if let Some(value) = object.get_mut(field)
+                && value.is_string()
+            {
+                replace_image_content(value, format.as_deref());
+            }
+        }
+
+        if let Some(images) = object.get_mut("images").and_then(Value::as_array_mut) {
+            for image in images.iter_mut().filter(|image| image.is_string()) {
+                replace_image_content(image, format.as_deref());
+            }
+        }
+    }
+
+    redact_named_base64_fields(&mut sanitized, format.as_deref());
+    sanitized
+}
+
+fn redact_named_base64_fields(value: &mut Value, format: Option<&str>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                redact_named_base64_fields(value, format);
+            }
+        }
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(key.as_str(), "b64_json" | "base64" | "image_base64")
+                    && value.is_string()
+                {
+                    replace_image_content(value, format);
+                } else {
+                    redact_named_base64_fields(value, format);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_image_content(value: &mut Value, format: Option<&str>) {
+    let Some(encoded) = value.as_str() else {
+        return;
+    };
+    if encoded.starts_with("<inline media omitted;")
+        || encoded.starts_with("<generated image omitted;")
+    {
+        return;
+    }
+
+    let (mime_type, base64_chars) = data_url_image(encoded)
+        .map(|(mime_type, data)| (Some(mime_type), data.len()))
+        .unwrap_or((None, encoded.len()));
+    let media = mime_type
+        .map(|mime_type| format!("mime={mime_type}"))
+        .or_else(|| format.map(|format| format!("format={format}")))
+        .unwrap_or_else(|| "format=unknown".to_string());
+    *value = Value::String(format!(
+        "<generated image omitted; {media}; base64_chars={base64_chars}>"
+    ));
+}
+
+fn data_url_image(value: &str) -> Option<(&str, &str)> {
+    let body = value.strip_prefix("data:")?;
+    let (metadata, data) = body.split_once(',')?;
+    let mime_type = metadata.strip_suffix(";base64")?.trim();
+    (mime_type.starts_with("image/") && !data.is_empty()).then_some((mime_type, data))
+}
+
 fn format_image_request_readable(path: &str, body: &Value) -> String {
     let mut out = String::new();
     out.push_str(&format!("[Image Generation: {path}]\n\n"));
@@ -386,13 +509,21 @@ fn format_image_request_readable(path: &str, body: &Value) -> String {
     ) {
         params.push(format!("size={w}x{h}"));
     }
-    if let Some(sampler) = body.get("sampler_name").or_else(|| body.get("sampler")).and_then(Value::as_str) {
+    if let Some(sampler) = body
+        .get("sampler_name")
+        .or_else(|| body.get("sampler"))
+        .and_then(Value::as_str)
+    {
         params.push(format!("sampler={sampler}"));
     }
     if let Some(steps) = body.get("steps").and_then(Value::as_u64) {
         params.push(format!("steps={steps}"));
     }
-    if let Some(cfg) = body.get("cfg_scale").or_else(|| body.get("scale")).and_then(Value::as_f64) {
+    if let Some(cfg) = body
+        .get("cfg_scale")
+        .or_else(|| body.get("scale"))
+        .and_then(Value::as_f64)
+    {
         params.push(format!("cfg_scale={cfg}"));
     }
     if let Some(seed) = body.get("seed").and_then(Value::as_i64) {
@@ -409,22 +540,191 @@ fn format_image_request_readable(path: &str, body: &Value) -> String {
 fn format_image_response_readable(status: u16, body: &Value) -> String {
     let mut out = String::new();
     if (200..300).contains(&status) {
-        let format = body.get("format").and_then(Value::as_str).unwrap_or("image");
+        let format = body
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("image");
         out.push_str(&format!("[Image generated: format={format}]\n"));
 
-        if let Some(data) = body.get("data").and_then(Value::as_str) {
-            out.push_str(&format!("Image data size: {} chars\n", data.len()));
+        if let Some(data) = generated_image_content(body) {
+            let encoded_chars = logged_image_content_chars(data);
+            out.push_str(&format!("Image data size: {encoded_chars} chars\n"));
         }
-        if let Some(revised) = body.get("revised_prompt").and_then(Value::as_str) {
+        if let Some(revised) = revised_image_prompt(body) {
             out.push_str(&format!("\nRevised Prompt:\n{revised}\n"));
         }
     } else {
         out.push_str(&format!("[Error status={status}]\n"));
-        if let Some(err) = body.get("error").and_then(|e| e.get("message").or(Some(e))).and_then(Value::as_str) {
+        if let Some(err) = body
+            .get("error")
+            .and_then(|e| e.get("message").or(Some(e)))
+            .and_then(Value::as_str)
+        {
             out.push_str(err);
         } else {
             out.push_str(&body.to_string());
         }
     }
     out.trim_end().to_string()
+}
+
+fn logged_image_content_chars(value: &str) -> usize {
+    value
+        .strip_prefix("<generated image omitted;")
+        .or_else(|| value.strip_prefix("<inline media omitted;"))
+        .and_then(|metadata| metadata.split("base64_chars=").nth(1))
+        .and_then(|length| length.trim_end_matches('>').parse::<usize>().ok())
+        .or_else(|| data_url_image(value).map(|(_, encoded)| encoded.len()))
+        .unwrap_or(value.len())
+}
+
+fn generated_image_content(body: &Value) -> Option<&str> {
+    body.get("data")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("image").and_then(Value::as_str))
+        .or_else(|| {
+            body.get("images")
+                .and_then(Value::as_array)
+                .and_then(|images| images.first())
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            body.get("data")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("b64_json"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            body.get("artifacts")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("base64"))
+                .and_then(Value::as_str)
+        })
+}
+
+fn revised_image_prompt(body: &Value) -> Option<&str> {
+    body.get("revised_prompt")
+        .or_else(|| body.get("revisedPrompt"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            body.get("data")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| {
+                    item.get("revised_prompt")
+                        .or_else(|| item.get("revisedPrompt"))
+                })
+                .and_then(Value::as_str)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        format_image_response_readable, image_request_log_payload, image_response_log_payload,
+    };
+
+    #[test]
+    fn image_request_log_copy_redacts_inputs_without_losing_generation_metadata() {
+        let request = json!({
+            "prompt": "a lighthouse in a storm",
+            "negative_prompt": "blurry",
+            "model": "flux-test",
+            "width": 1024,
+            "height": 768,
+            "steps": 28,
+            "init_images": ["REQUEST_IMAGE_BASE64"],
+            "mask": "data:image/png;base64,MASK_IMAGE_BASE64",
+        });
+
+        let logged = image_request_log_payload(&request);
+
+        assert_eq!(logged["prompt"], request["prompt"]);
+        assert_eq!(logged["negative_prompt"], request["negative_prompt"]);
+        assert_eq!(logged["model"], request["model"]);
+        assert_eq!(logged["width"], 1024);
+        assert_eq!(logged["height"], 768);
+        assert_eq!(logged["steps"], 28);
+        assert!(!logged.to_string().contains("REQUEST_IMAGE_BASE64"));
+        assert!(!logged.to_string().contains("MASK_IMAGE_BASE64"));
+        assert_eq!(request["init_images"][0], "REQUEST_IMAGE_BASE64");
+        assert_eq!(request["mask"], "data:image/png;base64,MASK_IMAGE_BASE64");
+    }
+
+    #[test]
+    fn image_response_log_copy_redacts_supported_provider_shapes_and_keeps_metadata() {
+        let responses = [
+            json!({
+                "format": "png",
+                "data": "NORMALIZED_DATA_BASE64",
+                "revised_prompt": "a brighter lighthouse",
+                "seed": 42,
+            }),
+            json!({
+                "format": "jpeg",
+                "image": "NORMALIZED_IMAGE_BASE64",
+                "provider": "workers-ai",
+            }),
+            json!({
+                "images": ["WEBUI_IMAGE_BASE64"],
+                "parameters": { "steps": 30, "cfg_scale": 7.5 },
+                "info": "{\"seed\":1234}",
+            }),
+            json!({
+                "data": [{
+                    "b64_json": "OPENAI_IMAGE_BASE64",
+                    "revised_prompt": "a revised provider prompt",
+                }],
+                "created": 123456,
+            }),
+            json!({
+                "artifacts": [{ "base64": "STABILITY_IMAGE_BASE64", "finishReason": "SUCCESS" }],
+            }),
+        ];
+
+        for response in &responses {
+            let logged = image_response_log_payload(response);
+            let logged_text = logged.to_string();
+            for raw_image in [
+                "NORMALIZED_DATA_BASE64",
+                "NORMALIZED_IMAGE_BASE64",
+                "WEBUI_IMAGE_BASE64",
+                "OPENAI_IMAGE_BASE64",
+                "STABILITY_IMAGE_BASE64",
+            ] {
+                assert!(!logged_text.contains(raw_image));
+            }
+            assert!(logged_text.contains("image omitted"));
+
+            // Sanitization operates on the log copy, never on the response returned to the app.
+            assert!(!response.to_string().contains("image omitted"));
+        }
+
+        let logged = image_response_log_payload(&responses[0]);
+        assert_eq!(logged["revised_prompt"], "a brighter lighthouse");
+        assert_eq!(logged["seed"], 42);
+        let webui_logged = image_response_log_payload(&responses[2]);
+        assert_eq!(webui_logged["parameters"]["steps"], 30);
+        assert_eq!(webui_logged["info"], "{\"seed\":1234}");
+    }
+
+    #[test]
+    fn image_response_readable_keeps_size_and_nested_revised_prompt() {
+        let response = json!({
+            "data": [{
+                "b64_json": "12345678",
+                "revised_prompt": "a calmer sea",
+            }],
+        });
+
+        let readable = format_image_response_readable(200, &response);
+
+        assert!(readable.contains("Image data size: 8 chars"));
+        assert!(readable.contains("Revised Prompt:\na calmer sea"));
+        assert!(!readable.contains("12345678"));
+    }
 }
