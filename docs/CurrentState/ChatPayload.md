@@ -10,6 +10,7 @@
 - `chat[i]` 始终是 0-based 绝对消息索引。
 - generation、扩展、编辑、swipe、删除和保存共享同一个 canonical `chat[]`。
 - 任一 JSONL 记录无法解析时，加载整体失败；不得提交部分历史。
+- 未显式切换聊天时，角色的 `chat` 文件 stem 在浅层、完整和重复读取之间保持稳定。
 
 这与 SillyTavern 1.18.0 的前端契约一致。TauriTavern 不再提供 `chat_history_mode`，也不存在前端 window state、生成时 backfill 或局部 patch 保存。
 
@@ -21,6 +22,8 @@
 - 群聊：`loadGroupChatPayload()`
 
 transport 解析完整 JSONL 后直接把同一对象数组交给核心调用方，不再经过本地 Fetch 的 `JSON.stringify()` / `Response.json()` 往返。角色和群聊调用方继续负责 `allowNotFound`、stale-selection guard、header 处理和既有事件时序。`POST /api/chats/get` 与 `POST /api/chats/group/get` 仍是扩展和脚本可主动调用的兼容路由，并复用同一 transport。
+
+角色聊天在完整水合后才绑定本次 payload 请求的 character/chat 快照。若角色当前 stem 不存在、但已有聊天列表非空，则沿用 `replaceCurrentChat()` 的最近聊天语义按需修复并写回；列表为空时才允许创建新聊天。恢复只在打开目标角色时发生，不做启动期全库扫描。
 
 所有平台通过共享的 Tauri FileHandle pull stream 有界读取 JSONL。每次加载始终复用同一个文件 handle，并在 EOF、取消或失败时关闭资源；桌面标准模式、portable 模式及自定义数据目录使用同一个已解析 `data_root` runtime scope。
 
@@ -72,6 +75,8 @@ Rust 仍保留 JSONL tail/before 读取，因为 Agent 和扩展可能只需要�
 
 分页是显式查询能力，不参与当前聊天的 `chat[]`、DOM、generation 或保存。`window.__TAURITAVERN__.api.chat` 的 `history.tail/before/beforePages` 是其公开前端入口。
 
+聊天摘要、最近记录和搜索属于可重建投影：单个文件失败只排除该文件并报告错误，持久化摘要索引写回失败只记录告警。真实目标 JSONL 的完整加载与保存仍保持整体失败语义。
+
 ## 6. `windowInfo()` ABI
 
 `api.chat.current.windowInfo()` 保留既有六字段 Promise ABI，但现在只描述完整历史：
@@ -113,6 +118,7 @@ Rust：
 - 长聊天加载后 `chat.length` 等于完整消息数，初始 `.mes` 数量受 `chat_truncation` 限制。
 - Show More 只补 DOM，绝对 `mesid` 不变。
 - character/group stale load 结果不会覆盖新选择。
+- 缺少本地 `chat` 字段的角色在浅层、完整读取和重启后解析为同一个 stem；已有失配聊天按需恢复。
 - 完整保存后重开，编辑、删除、swipe、隐藏范围和 metadata 均保持。
 - tail/before 对角色和群聊返回相同索引语义，stale cursor 明确失败。
 - 旧 settings 中的 `chat_history_mode` 被 serde 作为未知字段忽略，重新序列化时不会保留。
