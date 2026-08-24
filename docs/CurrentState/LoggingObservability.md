@@ -40,6 +40,8 @@ Dev Observability 通过 `app/dev_observability.rs::DevObservabilityHub` 暴露�
 
 LLM API logs 仍由 infrastructure decorator `LoggingChatCompletionRepository` 记录 raw/readable 请求响应。JSON 请求及非流式 JSON 响应写入前会移除内部 provider state，并把 data URL、Claude base64 source、Gemini inline data 中的媒体内容替换为只含 MIME 与编码长度的占位符；脱敏只作用于日志副本，不修改出站 payload。持久化失败是诊断日志，不触发 backend error toast。
 
+图片生成继续由 `LoggingStableDiffusionRepository` 装饰并写入同一个 `LlmApiLogStore`。日志保留 prompt、negative prompt、模型、生成参数、endpoint/status/error、provider metadata 与 revised prompt；请求内嵌图片和响应中的 `data` / `image` / `images[]` / provider base64 字段会在日志副本中替换为只含格式或 MIME 与编码长度的占位符，实际返回给前端的响应不变。
+
 ## 5. 持续开发守卫
 
 `pnpm run check` 会运行 `pnpm run check:logging-boundaries`，防止以下旧边界回潮：

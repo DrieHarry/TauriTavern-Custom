@@ -954,6 +954,7 @@ type TauriTavernLlmApiLogsApi = {
 type TauriTavernDevApi = {
     frontendLogs: TauriTavernFrontendLogsApi;
     backendLogs: TauriTavernBackendLogsApi;
+    exportBundle: () => Promise<string>;
     llmApiLogs: TauriTavernLlmApiLogsApi;
 };
 
@@ -1144,7 +1145,7 @@ type TauriTavernLlmApiRawKind = 'json' | 'sse';
 type TauriTavernLlmApiLogIndexEntry = {
     id: number;
     timestampMs: number;
-    level: 'INFO' | 'ERROR';
+    level: 'INFO' | 'WARN' | 'ERROR';
     ok: boolean;
     source: string;
     model: string | null;
@@ -1156,7 +1157,7 @@ type TauriTavernLlmApiLogIndexEntry = {
 type TauriTavernLlmApiLogPreview = {
     id: number;
     timestampMs: number;
-    level: 'INFO' | 'ERROR';
+    level: 'INFO' | 'WARN' | 'ERROR';
     ok: boolean;
     source: string;
     model: string | null;
