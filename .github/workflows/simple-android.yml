@@ -1,0 +1,100 @@
+name: Simple Android
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAURITAVERN_BUILD_BRANCH: ${{ github.ref_name }}
+  TAURITAVERN_BUILD_REVISION: ${{ github.sha }}
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+          cache-dependency-path: |
+            src-tauri/crates/tauritavern/gen/android/**/*.gradle*
+            src-tauri/crates/tauritavern/gen/android/**/gradle-wrapper.properties
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+          link-to-sdk: true
+
+      - name: Configure Android compiler
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          sysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          {
+            echo "AR_aarch64_linux_android=$toolchain/llvm-ar"
+            echo "CC_aarch64_linux_android=$toolchain/aarch64-linux-android24-clang"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--sysroot=$sysroot"
+          } >> "$GITHUB_ENV"
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - uses: pnpm/setup@v2
+        with:
+          runtime: node@22
+          cache: true
+          install: false
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Setup Android signing
+        shell: bash
+        run: |
+          cd src-tauri/crates/tauritavern/gen/android
+          echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" > keystore.properties
+          echo "password=${{ secrets.ANDROID_KEY_PASSWORD }}" >> keystore.properties
+          base64 -d <<< "${{ secrets.ANDROID_KEY_BASE64 }}" > "$RUNNER_TEMP/keystore.jks"
+          echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
+
+      - name: Enable HTTP access for standard mobile bundle
+        run: ./scripts/ci/configure-mobile-http.sh enable android
+
+      - name: Build and upload Android APK
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        with:
+          projectPath: src-tauri/crates/tauritavern
+          tauriScript: node ../../../scripts/tauri-app.mjs
+          mobile: android
+          args: --verbose --apk --split-per-abi --target aarch64
+          uploadWorkflowArtifacts: true
+          uploadPlainBinary: true
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+          workflowArtifactNamePattern: "TauriTavern-simple-[platform]-[arch]-[bundle]"
