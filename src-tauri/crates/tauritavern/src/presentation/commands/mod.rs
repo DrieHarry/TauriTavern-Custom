@@ -29,6 +29,7 @@ pub mod ios_file_bridge_commands;
 pub mod lan_sync_commands;
 pub mod llm_connection_commands;
 pub mod mcp_commands;
+pub mod native_plugin_commands;
 pub mod native_regex_commands;
 pub mod preset_commands;
 pub mod provider_metadata_commands;

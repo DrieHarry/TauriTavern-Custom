@@ -7,10 +7,14 @@ publish = false
 [dependencies]
 async-trait = "0.1"
 path-clean = "1.0"
-rquickjs = { version = "0.12.2", features = ["loader"] }
+rquickjs = { version = "0.12.2", features = ["futures", "loader", "parallel"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 # 只保留 spawn_blocking（rt）与 Semaphore（sync）所需的 feature。
-tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"] }
+tracing = "0.1"
+tt-contracts = { path = "../tt-contracts" }
+tt-domain = { path = "../tt-domain" }
 tt-ports = { path = "../tt-ports" }
 
 [dev-dependencies]

@@ -6,3 +6,6 @@ mod kit;
 mod runtime_module;
 
 pub use engine::QuickJsScriptEngine;
+pub use native_plugin::QuickJsNativePluginRuntime;
+
+mod native_plugin;

@@ -9,9 +9,9 @@ use tokio::sync::Semaphore;
 
 use crate::app::{AppServices, StartupProfile};
 use crate::infrastructure::apis::http_external_import_downloader::HttpExternalImportDownloader;
-use tt_adapter_http::HttpClientPool;
+use tt_adapter_http::{HttpClientPool, ReqwestNativePluginHttpGateway};
 use tt_adapter_mcp::RmcpMcpGateway;
-use tt_adapter_quickjs::QuickJsScriptEngine;
+use tt_adapter_quickjs::{QuickJsNativePluginRuntime, QuickJsScriptEngine};
 use tt_adapter_storage_core::file_system::DataDirectory;
 use tt_application::services::asset_service::AssetService;
 use tt_application::services::avatar_service::AvatarService;
@@ -31,6 +31,7 @@ use tt_application::services::group_service::GroupService;
 use tt_application::services::image_metadata_service::ImageMetadataService;
 use tt_application::services::llm_connection_service::LlmConnectionService;
 use tt_application::services::mcp_service::McpService;
+use tt_application::services::native_plugin_service::NativePluginService;
 use tt_application::services::native_regex_service::NativeRegexService;
 use tt_application::services::preset_service::PresetService;
 use tt_application::services::provider_metadata_service::ProviderMetadataService;
@@ -94,6 +95,17 @@ pub(super) async fn build(
     ));
     let extension_store_service = Arc::new(ExtensionStoreService::new(
         repositories.extension_store_repository.clone(),
+    ));
+    let native_plugin_http_gateway = Arc::new(ReqwestNativePluginHttpGateway::new(
+        http_client_pool.clone(),
+    ));
+    let native_plugin_runtime = Arc::new(QuickJsNativePluginRuntime::new(
+        native_plugin_http_gateway,
+        repositories.native_plugin_data_store.clone(),
+    ));
+    let native_plugin_service = Arc::new(NativePluginService::new(
+        repositories.native_plugin_package_repository.clone(),
+        native_plugin_runtime,
     ));
     let avatar_service = Arc::new(AvatarService::new(repositories.avatar_repository.clone()));
     let image_metadata_service = Arc::new(ImageMetadataService::new(
@@ -268,6 +280,7 @@ pub(super) async fn build(
         asset_service,
         extension_service,
         extension_store_service,
+        native_plugin_service,
         avatar_service,
         group_service,
         background_service,

@@ -5,10 +5,13 @@ edition = "2024"
 publish = false
 
 [dependencies]
-reqwest = { workspace = true, features = ["blocking", "http2", "rustls", "socks"] }
+async-trait = "0.1"
+base64 = "0.23"
+reqwest = { workspace = true, features = ["blocking", "http2", "rustls", "socks", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tt-contracts = { path = "../tt-contracts" }
 tt-domain = { path = "../tt-domain" }
 tt-ports = { path = "../tt-ports" }
 

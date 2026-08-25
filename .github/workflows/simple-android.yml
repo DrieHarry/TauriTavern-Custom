@@ -1,4 +1,4 @@
-name: Simple Android
+name: Simple Windows and Android
 
 on:
   workflow_dispatch:
@@ -12,6 +12,38 @@ env:
   TAURITAVERN_BUILD_REVISION: ${{ github.sha }}
 
 jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - uses: pnpm/setup@v2
+        with:
+          runtime: node@22
+          cache: true
+          install: false
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build and upload Windows NSIS installer
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: src-tauri/crates/tauritavern
+          tauriScript: node ../../../scripts/tauri-app.mjs
+          args: --bundles nsis
+          uploadWorkflowArtifacts: true
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+          workflowArtifactNamePattern: "TauriTavern-simple-[platform]-[arch]-[bundle]"
+
   build-android:
     runs-on: ubuntu-latest
     steps:

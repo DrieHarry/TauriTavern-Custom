@@ -33,6 +33,8 @@ pub const GIT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const GIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub const MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub const NATIVE_PLUGIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const NATIVE_PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HttpClientProfile {
@@ -49,6 +51,7 @@ pub enum HttpClientProfile {
     Translation,
     Tts,
     Mcp,
+    NativePlugin,
 }
 
 #[derive(Clone, Default)]
@@ -388,6 +391,10 @@ fn build_profile_client(
             .redirect(Policy::none())
             .pool_max_idle_per_host(0)
             .connect_timeout(MCP_CONNECT_TIMEOUT),
+        HttpClientProfile::NativePlugin => builder
+            .redirect(Policy::none())
+            .connect_timeout(NATIVE_PLUGIN_CONNECT_TIMEOUT)
+            .timeout(NATIVE_PLUGIN_REQUEST_TIMEOUT),
     };
 
     if user_endpoint_route.is_some() {

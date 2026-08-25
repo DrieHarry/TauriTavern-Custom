@@ -99,6 +99,10 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::extension_store_commands::set_extension_store_blob,
         super::extension_store_commands::delete_extension_store_blob,
         super::extension_store_commands::list_extension_store_blob_keys,
+        // TauriTavern native plugin commands
+        super::native_plugin_commands::list_native_plugins,
+        super::native_plugin_commands::call_native_plugin,
+        super::native_plugin_commands::deactivate_native_plugin,
         // User commands
         super::user_commands::get_all_users,
         super::user_commands::get_user,

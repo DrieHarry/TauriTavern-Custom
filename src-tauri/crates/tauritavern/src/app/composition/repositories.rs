@@ -22,9 +22,9 @@ use tt_adapter_provider_http::{
 use tt_adapter_storage_core::{
     DataDirectory, FileAssetRepository, FileChatRepository, FileExtensionStoreRepository,
     FileGroupRepository, FileLlmConnectionRepository, FileMcpServerRepository,
-    FilePromptCacheRepository, FileQuickReplyRepository, FileSecretRepository,
-    FileSettingsRepository, FileThemeRepository, FileUserDirectoryRepository,
-    FileUserEndpointGrantRepository, FileUserRepository,
+    FileNativePluginDataStore, FileNativePluginRepository, FilePromptCacheRepository,
+    FileQuickReplyRepository, FileSecretRepository, FileSettingsRepository, FileThemeRepository,
+    FileUserDirectoryRepository, FileUserEndpointGrantRepository, FileUserRepository,
     chat_directory_identity::new_shared_chat_alias_store_for_user_dir,
 };
 use tt_adapter_storage_userdata::FileAgentProfileRepository;
@@ -36,6 +36,7 @@ use tt_adapter_tokenization::MiktikTokenizerRepository;
 use tt_adapter_vector::{CandleLocalEmbeddingRepository, RedbVectorRepository};
 use tt_domain::errors::DomainError;
 use tt_domain::models::settings::ChatBackupSettings;
+use tt_ports::native_plugin::{NativePluginDataStore, NativePluginPackageRepository};
 use tt_ports::repositories::agent_invocation_repository::AgentInvocationRepository;
 use tt_ports::repositories::agent_profile_repository::AgentProfileRepository;
 use tt_ports::repositories::agent_profile_storage_health_repository::AgentProfileStorageHealthRepository;
@@ -101,6 +102,9 @@ pub(in crate::app::composition) struct AppRepositories {
     pub(in crate::app::composition) asset_repository: Arc<dyn AssetRepository>,
     pub(in crate::app::composition) extension_repository: Arc<dyn ExtensionRepository>,
     pub(in crate::app::composition) extension_store_repository: Arc<dyn ExtensionStoreRepository>,
+    pub(in crate::app::composition) native_plugin_package_repository:
+        Arc<dyn NativePluginPackageRepository>,
+    pub(in crate::app::composition) native_plugin_data_store: Arc<dyn NativePluginDataStore>,
     pub(in crate::app::composition) avatar_repository: Arc<dyn AvatarRepository>,
     pub(in crate::app::composition) group_repository: Arc<dyn GroupRepository>,
     pub(in crate::app::composition) background_repository: Arc<dyn BackgroundRepository>,
@@ -227,6 +231,14 @@ pub(super) async fn build(
 
     let extension_store_repository: Arc<dyn ExtensionStoreRepository> = Arc::new(
         FileExtensionStoreRepository::new(data_root.join("_tauritavern").join("extension-store")),
+    );
+    let native_plugin_package_repository: Arc<dyn NativePluginPackageRepository> =
+        Arc::new(FileNativePluginRepository::new(
+            default_user_dir.join("extensions"),
+            data_directory.global_extensions().to_path_buf(),
+        ));
+    let native_plugin_data_store: Arc<dyn NativePluginDataStore> = Arc::new(
+        FileNativePluginDataStore::new(data_root.join("_tauritavern").join("native-plugins")),
     );
 
     let avatar_repository: Arc<dyn AvatarRepository> = Arc::new(FileAvatarRepository::new(
@@ -357,6 +369,8 @@ pub(super) async fn build(
         asset_repository,
         extension_repository,
         extension_store_repository,
+        native_plugin_package_repository,
+        native_plugin_data_store,
         avatar_repository,
         group_repository,
         background_repository,

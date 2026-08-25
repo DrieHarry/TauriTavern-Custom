@@ -43,6 +43,9 @@ const api = host?.api;
 - `api.mcp`
   - 面向 MCP registration、persistent tool catalog 与第一方 Manager user test call 的独立平台能力。
   - 当前提供 Active/Paused、Off/Ask/Allow、显式 refresh、完整分页、diagnostics 与 typed one-shot call outcome，并支持 Agent/Legacy 模型工具调用。
+- `api.nativePlugins`
+  - 面向 TauriTavern-only backend helpers。
+  - 提供 native plugin discovery、typed operation call 与 lifecycle unload；不模拟 SillyTavern Node server plugin。
 
 ## 文档
 
@@ -57,6 +60,7 @@ const api = host?.api;
 | [LlmConnections.md](LlmConnections.md) | `api.llmConnections` 完整参考（Agent LLM 连接定义） |
 | [Skill.md](Skill.md) | `api.skill` 完整参考（Skill 管理、导入导出、读取） |
 | [MCP.md](MCP.md) | `api.mcp` 当前参考（registration、persistent catalog、user test call 与模型工具调用） |
+| [NativePlugins.md](NativePlugins.md) | `api.nativePlugins` 完整参考（package、runtime、HTTP/storage host） |
 | [Migration.md](Migration.md) | 从 SillyTavern 扩展迁移到 TauriTavern 的适配指南 |
 
 ## 契约说明

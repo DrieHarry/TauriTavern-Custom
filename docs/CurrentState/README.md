@@ -106,3 +106,7 @@
 23. `docs/CurrentState/FirstPartyUI.md`
    - 自有 UI 的 React/strict TSX 工程基线与 Vue 退役约束
    - 包含所有权、构建/watch 链路、债务棘轮、冻结 handle、bundle 基线与有意不做的范围
+
+24. `docs/CurrentState/NativePlugins.md`
+   - TauriTavern-only native plugin runtime 当前实现快照
+   - 包含 package discovery、QuickJS 生命周期、HTTP/storage capability 与明确不兼容的 Node server plugin 边界

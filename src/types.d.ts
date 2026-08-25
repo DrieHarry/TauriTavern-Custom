@@ -993,6 +993,25 @@ type TauriTavernExtensionApi = {
     store: TauriTavernExtensionStoreApi;
 };
 
+type TauriTavernNativePluginDescriptor = {
+    id: string;
+    name: string;
+    version: string;
+    extensionName: string;
+    scope: 'local' | 'global';
+    permissions: {
+        http: {
+            origins: string[];
+        };
+    };
+};
+
+type TauriTavernNativePluginsApi = {
+    list: () => Promise<TauriTavernNativePluginDescriptor[]>;
+    call: (pluginId: string, operation: string, input?: unknown) => Promise<any>;
+    deactivate: (pluginId: string) => Promise<void>;
+};
+
 type TauriTavernLayoutInsets = {
     top: number;
     right: number;
@@ -1111,6 +1130,7 @@ type TauriTavernHostApi = {
     dev?: TauriTavernDevApi;
     worldInfo?: TauriTavernWorldInfoApi;
     extension?: TauriTavernExtensionApi;
+    nativePlugins?: TauriTavernNativePluginsApi;
 };
 
 type TauriTavernHostAbi = {

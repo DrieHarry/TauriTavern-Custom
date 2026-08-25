@@ -37,6 +37,7 @@ pub mod image_metadata_service;
 pub mod lan_sync_service;
 pub mod llm_connection_service;
 pub mod mcp_service;
+pub mod native_plugin_service;
 pub mod native_regex_service;
 pub mod preset_service;
 pub mod prompt_assembly_service;

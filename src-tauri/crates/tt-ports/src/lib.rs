@@ -5,6 +5,7 @@ pub mod generation_background;
 pub mod host_resource;
 pub mod lan_sync;
 pub mod mcp;
+pub mod native_plugin;
 pub mod repositories;
 pub mod runtime_paths;
 pub mod settings;

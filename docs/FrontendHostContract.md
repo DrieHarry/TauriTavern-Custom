@@ -122,6 +122,9 @@
     - 取消选择返回 `null`；picker/staging/read 失败必须抛错，不得静默回退到 WebView file input。
   - `api.extension.store`：扩展级**全局持久化**（不绑定 chat），提供 KV JSON + Blob，支持多 table。
     - 详细签名与示例见：`docs/API/Extension.md`。
+  - `api.nativePlugins`：TauriTavern-only native plugin discovery、operation call 与 lifecycle unload。
+    - 当前 Host ABI：`list()`、`call(pluginId, operation, input?)`、`deactivate(pluginId)`。
+    - 不模拟 SillyTavern Node server plugin；package、sandbox 与 host capability 见 `docs/API/NativePlugins.md`。
   - `api.dev`：TauriTavern 规范化的开发调试 API。内置 Settings 开发面板与第三方扩展都应消费这一层，而不是直接依赖 Tauri 事件名或 Rust 命令名。
     - `api.dev.frontendLogs`
       - `list(options?: { limit?: number }) -> Promise<FrontendLogEntry[]>`

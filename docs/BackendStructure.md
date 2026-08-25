@@ -81,11 +81,11 @@ src-tauri/
 | `tt-adapter-provider-http` | LLM、SearXNG、SD、Translate、TTS、embedding、provider metadata 的 HTTP repository |
 | `tt-adapter-vector` | Vector 的 ACID 本地索引与本地 embedding runtime；不承载 provider HTTP |
 | `tt-adapter-tokenization` | tokenizer concrete repository |
-| `tt-adapter-storage-core` | `DataDirectory`、基础文件系统 helper、chat/settings/user/theme/secret/quick reply/prompt cache/asset/llm connection/extension-store |
+| `tt-adapter-storage-core` | `DataDirectory`、基础文件系统 helper、chat/settings/user/theme/secret/quick reply/prompt cache/asset/llm connection/extension-store/native-plugin package+store |
 | `tt-adapter-storage-userdata` | character、world info、agent workspace、agent profile、skill local package store、PNG card metadata |
 | `tt-adapter-media` | avatar/background/user media/image metadata、browser-visible host resource file store |
 | `tt-adapter-extension` | third-party extension 发现、安装、版本检查、更新、分支查询/切换、删除与移动；Gitoxide smart HTTP 与 embedded worktree |
-| `tt-adapter-quickjs` | QuickJS Runtime/Context、内存 ESM 与 JavaScript binding；只接触逻辑模块、JSON、内存 workspace snapshot/delta |
+| `tt-adapter-quickjs` | QuickJS Runtime/Context、内存 ESM 与 JavaScript binding；承载隔离 Skill 执行与有界 persistent native-plugin runtime，只接触逻辑模块、JSON 与 typed host capability |
 | `tt-adapter-sync` | LAN Sync、TT-Sync v2 runtime、stores、client/server、sync jobs |
 | `tt-adapter-archive` | data archive import/export executor、archive path safety |
 
