@@ -19,7 +19,7 @@ use tt_ports::native_plugin::{
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STACK_BYTES: usize = 256 * 1024;
-const MAX_RESULT_BYTES: usize = 1024 * 1024;
+const MAX_RESULT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_LOADED_PLUGINS: usize = 8;
 
 const HOST_BOOTSTRAP: &str = r#"

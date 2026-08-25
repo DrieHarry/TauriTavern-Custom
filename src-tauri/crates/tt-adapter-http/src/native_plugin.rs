@@ -13,7 +13,7 @@ use tt_ports::native_plugin::NativePluginHttpGateway;
 
 use crate::{HttpClientPool, HttpClientProfile};
 
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 pub struct ReqwestNativePluginHttpGateway {
     clients: Arc<HttpClientPool>,
