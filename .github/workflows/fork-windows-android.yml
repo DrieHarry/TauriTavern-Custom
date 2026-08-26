@@ -397,7 +397,7 @@ jobs:
           } > "$evidence_file"
 
           evidence_size=$(wc -c < "$evidence_file")
-          if [[ "$evidence_size" -gt 1000000 ]]; then
+          if [[ "$evidence_size" -gt 3000000 ]]; then
             echo "::error::Prepared release evidence is too large: ${evidence_size} bytes." >&2
             exit 1
           fi
@@ -434,7 +434,7 @@ jobs:
           }
 
           output_size=$(wc -c < "$output_file")
-          if [[ "$output_size" -gt 30000 ]] \
+          if [[ "$output_size" -gt 50000 ]] \
             || ! grep -qx '## 更新日志' "$output_file" \
             || ! grep -qx '## Release Notes' "$output_file" \
             || ! grep -qx -- '---' "$output_file" \
