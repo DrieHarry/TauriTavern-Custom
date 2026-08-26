@@ -23,7 +23,7 @@ use tt_domain::models::{
         McpEndpoint, McpProtocolVersionPreference, McpRegistrationId, McpRequestHeaders,
         McpServerRegistration, McpServerState, McpToolPermission,
     },
-    tool::{ToolDescriptor, ToolId},
+    tool::{ToolDescriptionOverride, ToolDescriptor, ToolId},
 };
 use tt_ports::{
     mcp::{McpCallIssue, McpCallOutcome, McpGateway, McpKnownResponse},
@@ -61,6 +61,8 @@ struct MemoryRepository {
     catalogs: StdMutex<BTreeMap<McpRegistrationId, (String, McpDiscoveryResult)>>,
     scan_issues: StdMutex<Vec<McpRegistrationStorageIssue>>,
     fail_scan: AtomicBool,
+    fail_load: AtomicBool,
+    catalog_load_failure: StdMutex<Option<McpRegistrationId>>,
     fail_catalog_save: AtomicBool,
     catalog_loads: AtomicUsize,
 }
@@ -89,6 +91,11 @@ impl McpServerRepository for MemoryRepository {
         &self,
         id: &McpRegistrationId,
     ) -> Result<Option<McpServerRegistration>, DomainError> {
+        if self.fail_load.load(Ordering::Relaxed) {
+            return Err(DomainError::InternalError(
+                "fixture registration load failed".to_string(),
+            ));
+        }
         Ok(self.registrations.lock().unwrap().get(id).cloned())
     }
 
@@ -106,6 +113,11 @@ impl McpServerRepository for MemoryRepository {
         endpoint: &McpEndpoint,
     ) -> Result<Option<McpDiscoveryResult>, DomainError> {
         self.catalog_loads.fetch_add(1, Ordering::Relaxed);
+        if self.catalog_load_failure.lock().unwrap().as_ref() == Some(id) {
+            return Err(DomainError::InternalError(
+                "fixture catalog load failed".to_string(),
+            ));
+        }
         let catalogs = self.catalogs.lock().unwrap();
         match catalogs.get(id) {
             Some((stored_endpoint, snapshot)) if stored_endpoint == endpoint.as_str() => {
@@ -526,7 +538,7 @@ async fn cancelled_prepared_call_is_not_sent_or_retained() {
 async fn model_catalog_is_cached_only_and_ask_executes_like_allow() {
     let repository = Arc::new(MemoryRepository::default());
     let gateway = Arc::new(FixedGateway::default());
-    let service = McpService::new(repository, gateway.clone());
+    let service = McpService::new(repository.clone(), gateway.clone());
     let created = service
         .create_server(
             "My Server".to_string(),
@@ -581,6 +593,79 @@ async fn model_catalog_is_cached_only_and_ask_executes_like_allow() {
             if code == "mcp.call_permission_off"
     ));
     assert_eq!(gateway.calls.lock().unwrap().len(), 1);
+
+    repository.fail_load.store(true, Ordering::Relaxed);
+    let outcome = service
+        .call_permitted_tool(&tool_id, json!({}), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        McpCallOutcome::NotSent(McpCallIssue { ref code, .. })
+            if code == "mcp.call_registration_unavailable"
+    ));
+}
+
+#[tokio::test]
+async fn registration_description_override_is_shared_without_mutating_the_catalog() {
+    let repository = Arc::new(MemoryRepository::default());
+    let gateway = Arc::new(FixedGateway::default());
+    let service = McpService::new(repository, gateway);
+    let created = service
+        .create_server(
+            "My Server".to_string(),
+            "http://127.0.0.1:3333/mcp".to_string(),
+            BTreeMap::new(),
+            McpProtocolVersionPreference::Auto,
+        )
+        .await
+        .unwrap();
+    service
+        .set_server_state(&created.id, McpServerState::Active)
+        .await
+        .unwrap();
+    service.discover_tools(&created.id).await.unwrap();
+    service
+        .set_tool_permission(&created.id, "search".to_string(), McpToolPermission::Allow)
+        .await
+        .unwrap();
+    service
+        .set_tool_description_override(
+            &created.id,
+            "search".to_string(),
+            Some(ToolDescriptionOverride {
+                description: Some("  Search only local files.  ".to_string()),
+                properties: BTreeMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let raw = service.discover_tools(&created.id).await.unwrap();
+    assert_eq!(raw.tools[0].description, None);
+    let legacy = service.list_legacy_tools_cached().await.unwrap();
+    assert_eq!(
+        legacy.tools[0].description.as_deref(),
+        Some("  Search only local files.  ")
+    );
+    let tool_id = ToolId::parse(format!("mcp/{}:search", created.id)).unwrap();
+    let resolved = service
+        .resolve_permitted_model_tools_cached(&[tool_id])
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.tools[0].descriptor.description.as_deref(),
+        Some("  Search only local files.  ")
+    );
+
+    service
+        .set_tool_description_override(&created.id, "search".to_string(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        service.list_legacy_tools_cached().await.unwrap().tools[0].description,
+        None
+    );
 }
 
 #[tokio::test]
@@ -682,10 +767,8 @@ async fn model_catalog_is_cached_only_and_localizes_registration_failures() {
         .set_server_state(&corrupt.id, McpServerState::Active)
         .await
         .unwrap();
-    repository.catalogs.lock().unwrap().insert(
-        McpRegistrationId::parse(&corrupt.id).unwrap(),
-        ("https://wrong.example/mcp".to_string(), snapshot.clone()),
-    );
+    *repository.catalog_load_failure.lock().unwrap() =
+        Some(McpRegistrationId::parse(&corrupt.id).unwrap());
 
     let missing = service
         .create_server(
