@@ -391,13 +391,18 @@ jobs:
               ':(exclude)**/tests.rs' \
               ':(exclude)**/tests/**' \
               ':(exclude)**/contract_tests/**' \
+              ':(exclude)**/*.test.*' \
+              ':(exclude)**/*.spec.*' \
+              ':(exclude)**/__tests__/**' \
+              ':(exclude)**/*.snap' \
               ':(exclude)packaging/flatpak/cargo-sources.json' \
+              ':(exclude)packaging/flatpak/pnpm-sources.json' \
               ':(exclude)pnpm-lock.yaml' \
               ':(exclude)src-tauri/Cargo.lock'
           } > "$evidence_file"
 
           evidence_size=$(wc -c < "$evidence_file")
-          if [[ "$evidence_size" -gt 3000000 ]]; then
+          if [[ "$evidence_size" -gt 1040000 ]]; then
             echo "::error::Prepared release evidence is too large: ${evidence_size} bytes." >&2
             exit 1
           fi
