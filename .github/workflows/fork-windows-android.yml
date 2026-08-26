@@ -374,35 +374,64 @@ jobs:
           set -euo pipefail
           output_file="$RUNNER_TEMP/codex-release-notes.md"
           evidence_file="$RUNNER_TEMP/codex-release-evidence.md"
+          raw_diff_file="$RUNNER_TEMP/raw-diff.patch"
 
           test -s .canary-notes/release-context.md
           git cat-file -e "${PREVIOUS_SHA}^{commit}"
           git cat-file -e "${GITHUB_SHA}^{commit}"
 
+          git diff --no-ext-diff --unified=1 --diff-filter=d "$PREVIOUS_SHA..$GITHUB_SHA" -- \
+            . \
+            ':(exclude).github/**' \
+            ':(exclude)docs/**' \
+            ':(exclude)tests/**' \
+            ':(exclude)**/tests.rs' \
+            ':(exclude)**/tests/**' \
+            ':(exclude)**/contract_tests/**' \
+            ':(exclude)**/*.test.*' \
+            ':(exclude)**/*.spec.*' \
+            ':(exclude)**/__tests__/**' \
+            ':(exclude)**/*.snap' \
+            ':(exclude)packaging/**' \
+            ':(exclude)distribution/**' \
+            ':(exclude)scripts/ci/**' \
+            ':(exclude)scripts/check-*.mjs' \
+            ':(exclude)scripts/guardrails/**' \
+            ':(exclude)pnpm-lock.yaml' \
+            ':(exclude)src-tauri/Cargo.lock' > "$raw_diff_file"
+
+          context_size=$(wc -c < .canary-notes/release-context.md)
+          max_evidence_bytes=980000
+          diff_budget=$(( max_evidence_bytes - context_size - 1000 ))
+          if (( diff_budget < 50000 )); then
+            diff_budget=50000
+          fi
+          raw_diff_size=$(wc -c < "$raw_diff_file")
+
           {
             cat .canary-notes/release-context.md
             echo
             echo "## Relevant source diff"
-            git diff --no-ext-diff --unified=1 "$PREVIOUS_SHA..$GITHUB_SHA" -- \
-              . \
-              ':(exclude).github/**' \
-              ':(exclude)docs/**' \
-              ':(exclude)tests/**' \
-              ':(exclude)**/tests.rs' \
-              ':(exclude)**/tests/**' \
-              ':(exclude)**/contract_tests/**' \
-              ':(exclude)**/*.test.*' \
-              ':(exclude)**/*.spec.*' \
-              ':(exclude)**/__tests__/**' \
-              ':(exclude)**/*.snap' \
-              ':(exclude)packaging/flatpak/cargo-sources.json' \
-              ':(exclude)packaging/flatpak/pnpm-sources.json' \
-              ':(exclude)pnpm-lock.yaml' \
-              ':(exclude)src-tauri/Cargo.lock'
+            if (( raw_diff_size <= diff_budget )); then
+              cat "$raw_diff_file"
+            else
+              python3 -c "import sys, textwrap; exec(textwrap.dedent('''
+                budget = int(sys.argv[1])
+                total = 0
+                with open(sys.argv[2], 'r', encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        total += len(line.encode('utf-8'))
+                        if total > budget:
+                            break
+                        sys.stdout.write(line)
+              '''))" "$diff_budget" "$raw_diff_file"
+              echo
+              echo "[Diff truncated to fit model context limit; refer to commits and changed paths above for complete summary.]"
+            fi
           } > "$evidence_file"
 
           evidence_size=$(wc -c < "$evidence_file")
-          if [[ "$evidence_size" -gt 1400000 ]]; then
+          if [[ "$evidence_size" -gt 1000000 ]]; then
             echo "::error::Prepared release evidence is too large: ${evidence_size} bytes." >&2
             exit 1
           fi
