@@ -402,7 +402,7 @@ jobs:
           } > "$evidence_file"
 
           evidence_size=$(wc -c < "$evidence_file")
-          if [[ "$evidence_size" -gt 1040000 ]]; then
+          if [[ "$evidence_size" -gt 1400000 ]]; then
             echo "::error::Prepared release evidence is too large: ${evidence_size} bytes." >&2
             exit 1
           fi
