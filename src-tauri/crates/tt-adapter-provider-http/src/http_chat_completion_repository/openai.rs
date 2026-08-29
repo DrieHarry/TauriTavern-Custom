@@ -33,18 +33,9 @@ pub(super) async fn list_models_with_path(
     let request = HttpChatCompletionRepository::apply_extra_headers(request, &config.extra_headers);
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
-    let response = request.send().await.map_err(|error| {
-        HttpChatCompletionRepository::map_transport_error("Status request failed", error)
-    })?;
-
-    if !response.status().is_success() {
-        return Err(HttpChatCompletionRepository::map_error_response(
-            provider_name,
-            response,
-            "Failed to list models",
-        )
-        .await);
-    }
+    let response =
+        HttpChatCompletionRepository::send_checked(request, provider_name, "Failed to list models")
+            .await?;
 
     read_upstream_json_body(provider_name, "list_models", response).await
 }
@@ -69,18 +60,12 @@ pub(super) async fn generate(
     let request = HttpChatCompletionRepository::apply_extra_headers(request, &config.extra_headers);
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
-    let response = request.send().await.map_err(|error| {
-        HttpChatCompletionRepository::map_transport_error("Generation request failed", error)
-    })?;
-
-    if !response.status().is_success() {
-        return Err(HttpChatCompletionRepository::map_error_response(
-            provider_name,
-            response,
-            "Generation request failed",
-        )
-        .await);
-    }
+    let response = HttpChatCompletionRepository::send_checked(
+        request,
+        provider_name,
+        "Generation request failed",
+    )
+    .await?;
 
     let body = read_upstream_json_body(provider_name, "generate", response).await?;
 
@@ -110,39 +95,12 @@ pub(super) async fn generate_stream(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let mut logged = false;
-
-        HttpChatCompletionRepository::stream_sse_response_internal(
+        HttpChatCompletionRepository::stream_sse_response_with_cache_logging(
             provider_name,
+            model,
             response,
             sender,
             cancel,
-            move |payload| {
-                if logged {
-                    return Ok(());
-                }
-
-                if !payload
-                    .windows(b"cache_read_input_tokens".len())
-                    .any(|window| window == b"cache_read_input_tokens")
-                    && !payload
-                        .windows(b"cache_creation_input_tokens".len())
-                        .any(|window| window == b"cache_creation_input_tokens")
-                {
-                    return Ok(());
-                }
-
-                let Ok(value) = serde_json::from_slice::<Value>(payload) else {
-                    return Ok(());
-                };
-
-                logged = super::log_prompt_cache_performance_if_present(
-                    provider_name,
-                    Some(model.as_str()),
-                    &value,
-                );
-                Ok(())
-            },
         )
         .await
     } else {
@@ -191,20 +149,8 @@ async fn send_stream_request(
     let request = HttpChatCompletionRepository::apply_extra_headers(request, &config.extra_headers);
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
-    let response = request.send().await.map_err(|error| {
-        HttpChatCompletionRepository::map_transport_error("Generation request failed", error)
-    })?;
-
-    if !response.status().is_success() {
-        return Err(HttpChatCompletionRepository::map_error_response(
-            provider_name,
-            response,
-            "Generation request failed",
-        )
-        .await);
-    }
-
-    Ok(response)
+    HttpChatCompletionRepository::send_checked(request, provider_name, "Generation request failed")
+        .await
 }
 
 #[derive(Default)]
@@ -212,6 +158,7 @@ struct OpenAiToolCallAccumulator {
     id: String,
     name: String,
     arguments: String,
+    extra_content: Option<Value>,
 }
 
 #[derive(Default)]
@@ -224,6 +171,9 @@ struct OpenAiChatAccumulator {
     usage: Option<Value>,
     content: String,
     refusal: String,
+    reasoning: String,
+    reasoning_content: String,
+    reasoning_details: Vec<Value>,
     finish_reason: Option<String>,
     tool_calls: Vec<OpenAiToolCallAccumulator>,
 }
@@ -303,6 +253,21 @@ impl OpenAiChatAccumulator {
         if let Some(value) = take_optional_string(delta, "refusal")? {
             append_string_fragment(&mut self.refusal, value);
         }
+        if let Some(value) = take_optional_string(delta, "reasoning")? {
+            append_string_fragment(&mut self.reasoning, value);
+        }
+        if let Some(value) = take_optional_string(delta, "reasoning_content")? {
+            append_string_fragment(&mut self.reasoning_content, value);
+        }
+        match delta.remove("reasoning_details") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(details)) => self.reasoning_details.extend(details),
+            Some(_) => {
+                return Err(invalid_openai_stream(
+                    "delta.reasoning_details must be an array",
+                ));
+            }
+        }
 
         if let Some(tool_calls) = delta.get_mut("tool_calls") {
             let tool_calls = tool_calls
@@ -324,11 +289,26 @@ impl OpenAiChatAccumulator {
         let delta = raw_delta
             .as_object_mut()
             .ok_or_else(|| invalid_openai_stream("tool call delta must be an object"))?;
-        let tool_call_index = delta
+        let explicit_index = delta
             .get("index")
             .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| invalid_openai_stream("tool call delta is missing index"))?;
+            .and_then(|value| usize::try_from(value).ok());
+        let tool_call_index = match explicit_index {
+            Some(index) => index,
+            None => {
+                let id = delta
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        invalid_openai_stream("tool call delta is missing index and id")
+                    })?;
+                self.tool_calls
+                    .iter()
+                    .position(|tool_call| tool_call.id == id)
+                    .unwrap_or(self.tool_calls.len())
+            }
+        };
 
         if tool_call_index == self.tool_calls.len() {
             self.tool_calls.push(OpenAiToolCallAccumulator::default());
@@ -339,11 +319,17 @@ impl OpenAiChatAccumulator {
             )));
         }
 
+        let extra_content = delta
+            .remove("extra_content")
+            .filter(|value| !value.is_null());
         let state = &mut self.tool_calls[tool_call_index];
         if state.id.is_empty()
             && let Some(id) = take_optional_string(delta, "id")?
         {
             state.id = id;
+        }
+        if let Some(extra_content) = extra_content {
+            state.extra_content = Some(extra_content);
         }
 
         let function = match delta.get_mut("function") {
@@ -393,6 +379,11 @@ impl OpenAiChatAccumulator {
         let finish_reason = self
             .finish_reason
             .ok_or_else(|| invalid_openai_stream("ended without a finish reason"))?;
+        if finish_reason == "tool_calls" && self.tool_calls.is_empty() {
+            return Err(invalid_openai_stream(
+                "ended with tool_calls finish reason but no tool calls",
+            ));
+        }
 
         let mut message = Map::new();
         message.insert("role".to_string(), Value::String("assistant".to_string()));
@@ -407,6 +398,21 @@ impl OpenAiChatAccumulator {
         if !self.refusal.is_empty() {
             message.insert("refusal".to_string(), Value::String(self.refusal));
         }
+        if !self.reasoning.is_empty() {
+            message.insert("reasoning".to_string(), Value::String(self.reasoning));
+        }
+        if !self.reasoning_content.is_empty() {
+            message.insert(
+                "reasoning_content".to_string(),
+                Value::String(self.reasoning_content),
+            );
+        }
+        if !self.reasoning_details.is_empty() {
+            message.insert(
+                "reasoning_details".to_string(),
+                Value::Array(self.reasoning_details),
+            );
+        }
         if !self.tool_calls.is_empty() {
             message.insert(
                 "tool_calls".to_string(),
@@ -419,6 +425,9 @@ impl OpenAiChatAccumulator {
                                 call.insert("id".to_string(), Value::String(tool_call.id));
                             }
                             call.insert("type".to_string(), Value::String("function".to_string()));
+                            if let Some(extra_content) = tool_call.extra_content {
+                                call.insert("extra_content".to_string(), extra_content);
+                            }
                             let mut function = Map::new();
                             function.insert("name".to_string(), Value::String(tool_call.name));
                             function.insert(
@@ -508,8 +517,8 @@ mod tests {
     #[test]
     fn openai_chat_stream_projects_tool_fragments_and_builds_agent_final() {
         let events = [
-            br#"{"id":"chat_1","object":"chat.completion.chunk","created":42,"model":"gpt-test","choices":[{"index":0,"delta":{"role":"assistant","content":"I will ","tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"arguments":"{\"path\":\"a.md\",\"content\":\"hel"}}]},"finish_reason":null}]}"#.as_slice(),
-            br#"{"id":"chat_1","created":42,"model":"gpt-test","error":null,"choices":[{"index":0,"delta":{"content":"write.","tool_calls":[{"index":0,"function":{"name":"workspace_write_file"}},{"index":1,"id":"call_1","type":"function","function":{"name":"workspace_apply_patch","arguments":"{\"path\":\"b.md\",\"old_string\":\"x\",\"new_string\":\"n"}}]},"finish_reason":null}]}"#.as_slice(),
+            br#"{"id":"chat_1","object":"chat.completion.chunk","created":42,"model":"gpt-test","choices":[{"index":0,"delta":{"role":"assistant","content":"I will ","reasoning":"Plan ","reasoning_content":"Need ","reasoning_details":[{"type":"reasoning.encrypted","id":"call_0","data":"opaque"}],"tool_calls":[{"id":"call_0","type":"function","extra_content":{"google":{"thought_signature":"signature"}},"function":{"arguments":"{\"path\":\"a.md\",\"content\":\"hel"}}]},"finish_reason":null}]}"#.as_slice(),
+            br#"{"id":"chat_1","created":42,"model":"gpt-test","error":null,"choices":[{"index":0,"delta":{"content":"write.","reasoning":"then act.","reasoning_content":"files.","tool_calls":[{"id":"call_0","function":{"name":"workspace_write_file"}},{"id":"call_1","type":"function","function":{"name":"workspace_apply_patch","arguments":"{\"path\":\"b.md\",\"old_string\":\"x\",\"new_string\":\"n"}}]},"finish_reason":null}]}"#.as_slice(),
             br#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"lo\"}"}}]},"finish_reason":null}]}"#.as_slice(),
             br#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"ew\"}"}}]},"finish_reason":null}]}"#.as_slice(),
             br#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.as_slice(),
@@ -556,7 +565,20 @@ mod tests {
         assert_eq!(body["id"], "chat_1");
         assert_eq!(body["model"], "gpt-test");
         assert_eq!(body["choices"][0]["message"]["content"], "I will write.");
+        assert_eq!(body["choices"][0]["message"]["reasoning"], "Plan then act.");
+        assert_eq!(
+            body["choices"][0]["message"]["reasoning_content"],
+            "Need files."
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["reasoning_details"],
+            json!([{"type":"reasoning.encrypted","id":"call_0","data":"opaque"}])
+        );
         assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["extra_content"],
+            json!({"google":{"thought_signature":"signature"}})
+        );
         assert_eq!(
             body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"a.md\",\"content\":\"hello\"}"
@@ -586,5 +608,14 @@ mod tests {
         let mut missing_finish = OpenAiChatAccumulator::default();
         missing_finish.apply_event(b"[DONE]", &mut |_| {}).unwrap();
         assert!(missing_finish.finish().is_err());
+
+        let mut missing_tool_calls = OpenAiChatAccumulator::default();
+        missing_tool_calls
+            .apply_event(
+                br#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(missing_tool_calls.finish().is_err());
     }
 }
