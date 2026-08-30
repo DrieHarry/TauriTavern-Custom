@@ -306,6 +306,7 @@ export class PromptCollection {
 class PromptManager {
     #isVisible = false;
     #dryRunPending = false;
+    #previewPending = false;
     #visibilityObserver = null;
 
     get promptSources() {
@@ -461,13 +462,27 @@ class PromptManager {
 
         // Enable and disable prompts
         this.handleToggle = (event) => {
-            const promptID = event.target.closest('.' + this.configuration.prefix + 'prompt_manager_prompt').dataset.pmIdentifier;
+            const { prefix } = this.configuration;
+            const promptRow = event.target.closest('.' + prefix + 'prompt_manager_prompt');
+            const promptID = promptRow.dataset.pmIdentifier;
             const promptOrderEntry = this.getPromptOrderEntry(this.activeCharacter, promptID);
             const counts = this.tokenHandler.getCounts();
+            const enabled = !promptOrderEntry.enabled;
 
             counts[promptID] = null;
-            promptOrderEntry.enabled = !promptOrderEntry.enabled;
-            this.render();
+            promptOrderEntry.enabled = enabled;
+
+            promptRow.classList.toggle(prefix + 'prompt_manager_prompt_disabled', !enabled);
+
+            const toggle = promptRow.querySelector('.prompt-manager-toggle-action');
+            toggle.classList.toggle('fa-toggle-on', enabled);
+            toggle.classList.toggle('fa-toggle-off', !enabled);
+
+            const tokenElement = promptRow.querySelector('.prompt_manager_prompt_tokens');
+            tokenElement.dataset.pmTokens = '-';
+            tokenElement.textContent = '-';
+
+            this.renderDebounced();
             this.saveServiceSettings();
         };
 
@@ -508,7 +523,7 @@ class PromptManager {
             this.detachPrompt(prompt, this.activeCharacter);
             this.hidePopup();
             this.clearEditForm();
-            this.render();
+            this.renderNowAndRefresh();
             this.saveServiceSettings();
         };
 
@@ -533,7 +548,7 @@ class PromptManager {
 
             this.hidePopup();
             this.clearEditForm();
-            this.render();
+            this.renderNowAndRefresh();
             this.saveServiceSettings();
         };
 
@@ -618,7 +633,7 @@ class PromptManager {
 
             if (prompt) {
                 this.appendPrompt(prompt, this.activeCharacter);
-                this.render();
+                this.renderNowAndRefresh();
                 this.saveServiceSettings();
             }
         };
@@ -639,7 +654,7 @@ class PromptManager {
 
                     this.hidePopup();
                     this.clearEditForm();
-                    this.render();
+                    this.renderNowAndRefresh();
                     this.saveServiceSettings();
                 }
             });
@@ -746,7 +761,7 @@ class PromptManager {
                     this.removePromptOrderForCharacter(this.activeCharacter);
                     this.addPromptOrderForCharacter(this.activeCharacter, promptManagerDefaultPromptOrder);
 
-                    this.render();
+                    this.renderNowAndRefresh();
                     this.saveServiceSettings();
                 });
         };
@@ -857,7 +872,7 @@ class PromptManager {
 
             this.hidePopup();
             this.clearEditForm();
-            this.renderDebounced();
+            this.renderNowAndRefresh();
         });
 
         // Re-render prompt manager on world settings update
@@ -870,7 +885,10 @@ class PromptManager {
         const visibilityTarget = this.containerElement.closest('.drawer-content') ?? this.containerElement;
         this.#visibilityObserver = new IntersectionObserver(([entry]) => {
             this.#isVisible = entry.isIntersecting;
-            if (!this.#isVisible || !this.#dryRunPending) return;
+            if (!this.#isVisible) return;
+
+            if (this.#previewPending) this.render(false);
+            if (!this.#dryRunPending) return;
 
             this.#dryRunPending = false;
             this.render();
@@ -925,6 +943,7 @@ class PromptManager {
         this.profileStart('filling context');
         try {
             await this.tryGenerate();
+            this.#previewPending = false;
         } catch (error) {
             this.error = error instanceof Error ? error.message : String(error || t`Unknown error`);
             throw error;
@@ -935,8 +954,14 @@ class PromptManager {
     }
 
     async #renderWithoutTryGenerate() {
-        if (!await this.#waitUntilGenerationIsIdle()) return;
         await this.#renderPromptManagerUi();
+    }
+
+    renderNowAndRefresh() {
+        if (main_api !== 'openai') return;
+        this.#previewPending = true;
+        if (this.#isVisible) this.render(false);
+        this.renderDebounced();
     }
 
     /**
@@ -1841,7 +1866,7 @@ class PromptManager {
                 </div>
         ` : '';
 
-        const totalActiveTokens = this.tokenUsage;
+        const totalActiveTokens = this.#previewPending ? '-' : this.tokenUsage;
 
         const headerHtml = await renderTemplateAsync('promptManagerHeader', { error: this.error, errorDiv, prefix: this.configuration.prefix, totalActiveTokens });
         promptManagerDiv.insertAdjacentHTML('beforeend', headerHtml);
@@ -1890,6 +1915,7 @@ class PromptManager {
         promptManagerList.innerHTML = '';
 
         const { prefix } = this.configuration;
+        const previewPending = this.#previewPending;
 
         let listItemHtml = await renderTemplateAsync('promptManagerListHeader', { prefix });
 
@@ -1900,14 +1926,14 @@ class PromptManager {
             const enabledClass = listEntry.enabled ? '' : `${prefix}prompt_manager_prompt_disabled`;
             const draggableClass = `${prefix}prompt_manager_prompt_draggable`;
             const markerClass = prompt.marker ? `${prefix}prompt_manager_marker` : '';
-            const tokens = this.tokenHandler?.getCounts()[prompt.identifier] ?? 0;
+            const tokens = previewPending ? 0 : (this.tokenHandler?.getCounts()[prompt.identifier] ?? 0);
 
             // Warn the user if the chat history goes below certain token thresholds.
             let warningClass = '';
             let warningTitle = '';
 
             const tokenBudget = this.serviceSettings.openai_max_context - this.serviceSettings.openai_max_tokens;
-            if (this.tokenUsage > tokenBudget * 0.8 &&
+            if (!previewPending && this.tokenUsage > tokenBudget * 0.8 &&
                 'chatHistory' === prompt.identifier) {
                 const warningThreshold = this.configuration.warningTokenThreshold;
                 const dangerThreshold = this.configuration.dangerTokenThreshold;
@@ -2112,7 +2138,8 @@ class PromptManager {
         this.normalizeAgentPromptMarkerDefinitions();
         this.ensureAgentPromptOrderReferences();
         toastr.success(t`Prompt import complete.`);
-        this.saveServiceSettings().then(() => this.render());
+        this.renderNowAndRefresh();
+        this.saveServiceSettings();
     }
 
     /**
