@@ -159,6 +159,19 @@ function SettingsApp({
                     />
                 </SettingRow>
 
+                <SettingRow
+                    label={tr('CodeMirror Editor')}
+                    helpTopic="codeMirrorEditor"
+                    helpTitle={tr('Learn more')}
+                    onHelp={showHelp}
+                >
+                    <ToggleSwitch
+                        checked={draft.codeMirrorEditorEnabled}
+                        ariaLabel={tr('CodeMirror Editor')}
+                        onChange={checked => controller.updateDraft('codeMirrorEditorEnabled', checked)}
+                    />
+                </SettingRow>
+
                 <SettingRow label={tr('Rust Regex Backend')}>
                     <ToggleSwitch
                         checked={draft.nativeRegexBackendEnabled}
