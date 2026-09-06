@@ -668,6 +668,7 @@ export async function activateRequiredChatSurfaceExtensions() {
         parallelism: 1,
         includeExtension: name => requiredNames.has(name),
         resetErrors: false,
+        throwOnError: true,
     });
 
     return Object.freeze(enabled.map(({ extensionName, participantId }) => Object.freeze({
@@ -723,7 +724,7 @@ async function getManifests(names) {
  * Tries to activate all available extensions that are not already active.
  * @returns {Promise<void>}
  */
-async function activateExtensions({ parallelism = 1, includeExtension = () => true, resetErrors = true } = {}) {
+async function activateExtensions({ parallelism = 1, includeExtension = () => true, resetErrors = true, throwOnError = false } = {}) {
     if (resetErrors) {
         extensionLoadErrors.clear();
     }
@@ -840,6 +841,9 @@ async function activateExtensions({ parallelism = 1, includeExtension = () => tr
         } catch (err) {
             console.log('Could not activate extension', name, err);
             extensionLoadErrors.add(t`Extension "${displayName}" failed to load: ${err}`);
+            if (throwOnError) {
+                throw err;
+            }
         }
     };
 

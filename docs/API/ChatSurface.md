@@ -119,6 +119,7 @@ activate({ source, mesid, element, content, signal }) => Disposable
 ## 错误与事件边界
 
 - registration 字段、协议版本和 hook 参数不合法时立即抛错；
+- 必需 renderer 激活失败时向启动调用者传播原始错误；只有激活流程正常返回后才检查 required participant，避免掩盖加载或 hook 的实际失败原因；
 - duplicate claim、ownership 分歧、异步 disposer 或同步写重入会 fault 当前有界 epoch；
 - participant 在 hook 外无法继续履约时调用 `registration.fault(error)`；
 - fault 保留完整 `chat[]` 和当前有界 DOM，不自动展开完整历史；

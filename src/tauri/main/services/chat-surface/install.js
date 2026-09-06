@@ -123,7 +123,9 @@ export function installChatSurfaceRuntime({
     } = {}) {
         const managed = isBoundedView();
         const mountedBefore = activeController.getMountedMessageIds();
-        const replaceMessageIds = mountedBefore.filter(messageId => messageId >= startIndex);
+        const replaceMessageIds = mountedBefore.filter(
+            messageId => messageId >= startIndex && messageId < messages.length,
+        );
 
         if (managed) {
             const materializeOptionsByMessageId = await prepareMaterializeOptions({
