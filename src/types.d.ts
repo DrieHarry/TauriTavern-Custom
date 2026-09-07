@@ -147,6 +147,29 @@ type TauriTavernAgentRunTimelineDelegationEdge = {
     updatedAt: string;
 };
 
+type TauriTavernAgentTaskDetail = {
+    runId: string;
+    taskId: string;
+    parentInvocationId: string;
+    childInvocationId: string;
+    targetProfileId: string;
+    workspaceKey: string;
+    continuation: 'return_to_parent' | 'transfer_control';
+    status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+    task: {
+        objective: string;
+        title?: string;
+        [key: string]: unknown;
+    };
+    resultRef: string | null;
+    result: {
+        summary: string;
+        summaryRef: string | null;
+        output: Record<string, unknown>;
+    } | null;
+    error: string | null;
+};
+
 type TauriTavernAgentRunTimelineProjection = {
     foregroundInvocationIds: string[];
     invocations: TauriTavernAgentRunTimelineInvocation[];
@@ -183,8 +206,18 @@ type TauriTavernAgentRunLiveToolCall =
         newStringWords: number;
     };
 
+type TauriTavernAgentRunLiveReasoning = {
+    invocationId: string;
+    invocationExitPolicy: TauriTavernAgentInvocationExitPolicy;
+    text: string;
+    toolIds: string[];
+};
+
 type TauriTavernAgentRunLiveUpdate =
-    | { type: 'snapshot'; calls: TauriTavernAgentRunLiveToolCall[] }
+    | { type: 'reasoningReplace'; reasoning: TauriTavernAgentRunLiveReasoning }
+    | { type: 'reasoningAppend'; invocationId: string; text: string; toolIds: string[] }
+    | { type: 'reasoningRemove'; invocationId: string }
+    | { type: 'snapshot'; calls: TauriTavernAgentRunLiveToolCall[]; reasoning: TauriTavernAgentRunLiveReasoning[] }
     | {
         type: 'append';
         invocationId: string;
@@ -598,7 +631,7 @@ type TauriTavernAgentApi = {
         frozenRunInputSnapshot?: any;
         generationIntent?: any;
         presentation?: TauriTavernAgentRunPresentation;
-        options?: { presentation?: TauriTavernAgentRunPresentation; stream?: boolean };
+        options?: { presentation?: TauriTavernAgentRunPresentation; stream?: boolean; startWithEmptyPersist?: boolean };
     }) => Promise<TauriTavernAgentRunHandle>;
     startRunFromLegacyGenerate: (input?: {
         chatRef?: TauriTavernChatRef;
@@ -608,7 +641,7 @@ type TauriTavernAgentApi = {
         profileId?: string | null;
         generationIntent?: any;
         presentation?: TauriTavernAgentRunPresentation;
-        options?: { presentation?: TauriTavernAgentRunPresentation; stream?: boolean };
+        options?: { presentation?: TauriTavernAgentRunPresentation; stream?: boolean; startWithEmptyPersist?: boolean };
     }) => Promise<TauriTavernAgentRunHandle>;
     cancel: (runId: string) => Promise<TauriTavernAgentRunHandle>;
     submitGuidance: (input: {
@@ -637,6 +670,11 @@ type TauriTavernAgentApi = {
         round: number;
         maxChars?: number;
     }) => Promise<TauriTavernAgentModelTurn>;
+    readTaskDetail: (input: {
+        runId: string;
+        taskId: string;
+        includeResult?: boolean;
+    }) => Promise<TauriTavernAgentTaskDetail>;
     subscribe: (
         runId: string,
         handler: (event: TauriTavernAgentRunEvent) => void,
@@ -688,7 +726,7 @@ type TauriTavernLlmConnectionDefinition = {
         sourceSpecific?: Record<string, any>;
     };
     auth: {
-        secretRef: {
+        secretRef?: {
             key: string;
             id: string;
             labelSnapshot?: string;
@@ -697,6 +735,8 @@ type TauriTavernLlmConnectionDefinition = {
     routing?: {
         reverseProxy?: {
             url: string;
+        } | {
+            preset: string;
         };
     };
     adapterHints?: {
@@ -1178,12 +1218,23 @@ type TauriTavernChatSurfaceRegistration = {
     fault: (error: unknown) => void;
 };
 
+type TauriTavernChatSurfaceContentProcessor = {
+    id: string;
+    prepare: (
+        context: { readonly message: ChatMessage; readonly mesid: number; readonly signal: AbortSignal },
+        renderBase: () => Promise<string>,
+    ) => string | Promise<string>;
+};
+
 type TauriTavernChatSurfaceApi = {
     readonly protocolVersion: 1;
     isManagedOwnershipRequired: () => boolean;
     registerParticipant: (
         participant: TauriTavernChatSurfaceParticipant,
     ) => TauriTavernChatSurfaceRegistration;
+    registerContentProcessor: (
+        processor: TauriTavernChatSurfaceContentProcessor,
+    ) => { refresh: () => Promise<void> };
 };
 
 type TauriTavernHostApi = {

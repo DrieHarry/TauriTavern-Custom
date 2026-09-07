@@ -85,13 +85,13 @@ export function assertActiveAgentMessage(chat, state) {
     }
 }
 
-export async function emitGeneratedMessageEvents(script, messageId, generationType) {
+export async function finalizeGeneratedMessage(script, messageId, generationType) {
     if (typeof script.eventSource?.emit !== 'function' || !script.event_types) {
         throw new Error('agent.message_events_unavailable: SillyTavern message events are unavailable');
     }
     const type = String(generationType || 'normal').trim() || 'normal';
     await script.eventSource.emit(script.event_types.MESSAGE_RECEIVED, messageId, type);
-    await script.eventSource.emit(script.event_types.CHARACTER_MESSAGE_RENDERED, messageId, type);
+    await script.finalizeMessageContent(messageId, script.event_types.CHARACTER_MESSAGE_RENDERED, type);
 }
 
 export function mergeAgentCommitExtraIntoMessage(chat, messageId, payload, file, commitSeq, runState = {}) {

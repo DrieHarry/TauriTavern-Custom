@@ -22,6 +22,7 @@ use super::backup_inventory::{
 };
 #[cfg(test)]
 use super::summary::ChatFileDescriptor;
+use crate::file_system::persist_file;
 
 enum BackupPublishOutcome {
     Created,
@@ -233,7 +234,7 @@ impl FileChatRepository {
         let file_name = format.physical_file_name(&logical_file_name);
         let final_path = self.backups_dir.join(&file_name);
         let temp_path = self.backup_temp_path();
-        let write_stats = match format {
+        let staged_backup = match format {
             BackupFormat::RawJsonl => {
                 copy_backup(chat_path, &temp_path, source_metadata.len()).await
             }
@@ -241,8 +242,8 @@ impl FileChatRepository {
                 compress_backup(chat_path, &temp_path, source_metadata.len()).await
             }
         };
-        let write_stats = match write_stats {
-            Ok(write_stats) => write_stats,
+        let (file, write_stats) = match staged_backup {
+            Ok(staged_backup) => staged_backup,
             Err(error) => {
                 let _ = fs::remove_file(&temp_path).await;
                 return Err(error);
@@ -303,7 +304,7 @@ impl FileChatRepository {
                 }
             },
         };
-        if let Err(error) = fs::rename(&temp_path, &final_path).await {
+        if let Err(error) = persist_file(fs::File::from_std(file), &temp_path, &final_path).await {
             let _ = fs::remove_file(&temp_path).await;
             return Err(DomainError::InternalError(format!(
                 "Failed to publish chat backup {:?}: {}",
@@ -423,14 +424,15 @@ impl FileChatRepository {
         let target_path = self.backups_dir.join(&target_file_name);
         let temp_path = self.backup_temp_path();
 
-        let (stored_bytes, jsonl_record_count) = match (source_entry.format, target_format) {
+        let (file, stored_bytes, jsonl_record_count) = match (source_entry.format, target_format) {
             (BackupFormat::RawJsonl, BackupFormat::Zstd) => {
-                let stats =
+                let (file, stats) =
                     compress_backup(&source_path, &temp_path, source_entry.byte_len).await?;
-                (stats.stored_bytes, Some(stats.jsonl_record_count))
+                (file, stats.stored_bytes, Some(stats.jsonl_record_count))
             }
             (BackupFormat::Zstd, BackupFormat::RawJsonl) => {
-                (decompress_backup(&source_path, &temp_path).await?, None)
+                let (file, stored_bytes) = decompress_backup(&source_path, &temp_path).await?;
+                (file, stored_bytes, None)
             }
             _ => return Ok(None),
         };
@@ -456,14 +458,7 @@ impl FileChatRepository {
             }
 
             set_backup_modified(&temp_path, source_entry.modified).await?;
-            fs::rename(&temp_path, &target_path)
-                .await
-                .map_err(|error| {
-                    DomainError::InternalError(format!(
-                        "Failed to publish converted chat backup {}: {error}",
-                        target_path.display()
-                    ))
-                })?;
+            persist_file(fs::File::from_std(file), &temp_path, &target_path).await?;
             match fs::remove_file(&source_path).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}

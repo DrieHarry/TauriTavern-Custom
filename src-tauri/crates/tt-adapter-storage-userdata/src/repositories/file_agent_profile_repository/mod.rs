@@ -7,7 +7,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 use tt_adapter_storage_core::file_system::{
-    list_files_with_extension, read_json_file, replace_file_with_fallback,
+    list_files_with_extension, read_json_file, replace_file,
 };
 use tt_domain::errors::DomainError;
 use tt_domain::models::agent::profile::{
@@ -183,7 +183,7 @@ impl AgentProfileRepository for FileAgentProfileRepository {
                 error
             ))
         })?;
-        replace_file_with_fallback(&temp, &target).await
+        replace_file(&temp, &target).await
     }
 
     async fn delete_profile(&self, id: &AgentProfileId) -> Result<(), DomainError> {
@@ -294,7 +294,7 @@ impl FileAgentProfileRepository {
                 error
             ))
         })?;
-        replace_file_with_fallback(&temp, &target).await
+        replace_file(&temp, &target).await
     }
 }
 

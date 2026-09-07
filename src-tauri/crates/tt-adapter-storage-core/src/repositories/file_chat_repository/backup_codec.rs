@@ -179,7 +179,7 @@ pub(super) async fn copy_backup(
     source_path: &Path,
     target_path: &Path,
     expected_source_len: u64,
-) -> Result<BackupWriteStats, DomainError> {
+) -> Result<(std::fs::File, BackupWriteStats), DomainError> {
     let source_path = source_path.to_path_buf();
     let target_path = target_path.to_path_buf();
     let task_target_path = target_path.clone();
@@ -208,7 +208,7 @@ pub(super) async fn compress_backup(
     source_path: &Path,
     target_path: &Path,
     expected_source_len: u64,
-) -> Result<BackupWriteStats, DomainError> {
+) -> Result<(std::fs::File, BackupWriteStats), DomainError> {
     let source_path = source_path.to_path_buf();
     let target_path = target_path.to_path_buf();
     let task_target_path = target_path.clone();
@@ -238,7 +238,7 @@ pub(super) async fn compress_backup(
 pub(super) async fn decompress_backup(
     source_path: &Path,
     target_path: &Path,
-) -> Result<u64, DomainError> {
+) -> Result<(std::fs::File, u64), DomainError> {
     let source_path = source_path.to_path_buf();
     let target_path = target_path.to_path_buf();
     let task_source_path = source_path.clone();
@@ -293,7 +293,7 @@ fn compress_backup_blocking(
     source_path: &Path,
     target_path: &Path,
     expected_source_len: u64,
-) -> io::Result<BackupWriteStats> {
+) -> io::Result<(std::fs::File, BackupWriteStats)> {
     let mut source = std::fs::File::open(source_path)?;
     let target = std::fs::OpenOptions::new()
         .create_new(true)
@@ -317,18 +317,18 @@ fn compress_backup_blocking(
 
     let mut target = encoder.finish()?;
     target.flush()?;
-    drop(target);
-    Ok(BackupWriteStats {
-        stored_bytes: std::fs::metadata(target_path)?.len(),
+    let stats = BackupWriteStats {
+        stored_bytes: target.get_ref().metadata()?.len(),
         jsonl_record_count,
-    })
+    };
+    Ok((target.into_inner()?, stats))
 }
 
 fn copy_backup_blocking(
     source_path: &Path,
     target_path: &Path,
     expected_source_len: u64,
-) -> io::Result<BackupWriteStats> {
+) -> io::Result<(std::fs::File, BackupWriteStats)> {
     let mut source = std::fs::File::open(source_path)?;
     let target = std::fs::OpenOptions::new()
         .create_new(true)
@@ -345,12 +345,11 @@ fn copy_backup_blocking(
         ));
     }
     target.flush()?;
-    drop(target);
-
-    Ok(BackupWriteStats {
-        stored_bytes: std::fs::metadata(target_path)?.len(),
+    let stats = BackupWriteStats {
+        stored_bytes: target.get_ref().metadata()?.len(),
         jsonl_record_count,
-    })
+    };
+    Ok((target.into_inner()?, stats))
 }
 
 fn copy_jsonl(source: &mut impl Read, target: &mut impl Write) -> io::Result<(u64, usize)> {
@@ -371,7 +370,10 @@ fn copy_jsonl(source: &mut impl Read, target: &mut impl Write) -> io::Result<(u6
     Ok((copied, counter.finish()))
 }
 
-fn decompress_backup_blocking(source_path: &Path, target_path: &Path) -> io::Result<u64> {
+fn decompress_backup_blocking(
+    source_path: &Path,
+    target_path: &Path,
+) -> io::Result<(std::fs::File, u64)> {
     let source = std::fs::File::open(source_path)?;
     let target = std::fs::OpenOptions::new()
         .create_new(true)
@@ -380,8 +382,8 @@ fn decompress_backup_blocking(source_path: &Path, target_path: &Path) -> io::Res
     let mut target = BufWriter::with_capacity(zstd::zstd_safe::DCtx::out_size(), target);
     zstd::stream::copy_decode(source, &mut target)?;
     target.flush()?;
-    drop(target);
-    std::fs::metadata(target_path).map(|metadata| metadata.len())
+    let stored_bytes = target.get_ref().metadata()?.len();
+    Ok((target.into_inner()?, stored_bytes))
 }
 
 pub(super) fn restore_staging_file_name() -> String {

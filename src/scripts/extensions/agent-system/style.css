@@ -323,7 +323,10 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     --ttas-run-panel-collapsed-width: 108px;
     --ttas-run-panel-collapsed-compact-height: 24px;
     --ttas-run-panel-default-height: clamp(112px, 18dvh, 210px);
-    --ttas-run-panel-height: var(--ttas-run-panel-user-height, var(--ttas-run-panel-default-height));
+    --ttas-run-panel-height: min(
+        var(--ttas-run-panel-user-height, var(--ttas-run-panel-default-height)),
+        var(--ttas-run-panel-available-height, 100dvh)
+    );
     --ttas-run-panel-collapsed-height: 34px;
     --ttas-run-panel-bg: var(--ttas-run-surface);
     --ttas-run-panel-bg-strong: var(--ttas-run-surface-strong);
@@ -341,6 +344,7 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     --ttas-run-tone-warn: #c59a50;
     --ttas-run-tone-error: var(--ttas-run-tone-error-public);
     --ttas-run-reasoning-color: var(--reasoning-body-color, var(--SmartThemeEmColor));
+    --ttas-run-reasoning-text-color: color-mix(in srgb, var(--ttas-run-reasoning-color) 76%, var(--SmartThemeBodyColor) 24%);
     --ttas-run-reasoning-bg: color-mix(in srgb, var(--ttas-run-reasoning-color) 9%, transparent);
     --ttas-run-reasoning-border: color-mix(in srgb, var(--ttas-run-reasoning-color) 52%, var(--ttas-run-panel-border-soft));
     --ttas-run-detail-block-bg: color-mix(in srgb, var(--SmartThemeBodyColor) 3%, transparent);
@@ -676,7 +680,7 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     min-height: var(--ttas-run-event-item-height);
 }
 
-.ttas-run-events.is-windowed .ttas-run-event {
+.ttas-run-events.is-windowed .ttas-run-event:not(.is-live) {
     height: var(--ttas-run-event-item-height);
     overflow: hidden;
 }
@@ -721,7 +725,7 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     bottom: 50%;
 }
 
-.ttas-run-event button {
+.ttas-run-event .ttas-run-event-card {
     position: relative;
     display: grid;
     grid-template-columns: 24px minmax(0, 1fr) auto;
@@ -740,17 +744,17 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     transition: background-color var(--ttas-transition), border-color var(--ttas-transition), transform var(--ttas-transition), box-shadow var(--ttas-transition);
 }
 
-.ttas-run-events.is-windowed .ttas-run-event button {
+.ttas-run-events.is-windowed .ttas-run-event:not(.is-live) .ttas-run-event-card {
     height: calc(var(--ttas-run-event-item-height) - 4px);
 }
 
-.ttas-run-event button:hover,
-.ttas-run-event.is-selected button {
+.ttas-run-event .ttas-run-event-card:hover,
+.ttas-run-event.is-selected .ttas-run-event-card {
     border-color: var(--ttas-run-panel-border-soft);
     background-color: var(--ttas-run-line-bg);
 }
 
-.ttas-run-event.is-latest button {
+.ttas-run-event.is-latest .ttas-run-event-card {
     border-color: color-mix(in srgb, var(--ttas-run-panel-accent) 38%, var(--ttas-run-panel-border));
     background:
         linear-gradient(90deg, color-mix(in srgb, currentColor 9%, transparent), transparent 66%),
@@ -813,14 +817,14 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     color: color-mix(in srgb, var(--ttas-run-panel-accent) 78%, var(--SmartThemeBodyColor) 22%);
 }
 
-.ttas-run-event.kind-narration button {
+.ttas-run-event.kind-narration .ttas-run-event-card {
     align-items: center;
     border-color: transparent;
     background-color: transparent;
     box-shadow: none;
 }
 
-.ttas-run-event.kind-narration button::after {
+.ttas-run-event.kind-narration .ttas-run-event-card::after {
     content: '';
     position: absolute;
     top: 12px;
@@ -859,20 +863,20 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     display: none;
 }
 
-.ttas-run-event.kind-narration button:hover,
-.ttas-run-event.kind-narration.is-selected button {
+.ttas-run-event.kind-narration .ttas-run-event-card:hover,
+.ttas-run-event.kind-narration.is-selected .ttas-run-event-card {
     border-color: color-mix(in srgb, var(--ttas-run-panel-accent) 22%, transparent);
     background-color: color-mix(in srgb, var(--SmartThemeBlurTintColor) 18%, transparent);
 }
 
-.ttas-run-event.kind-narration button:hover::after,
-.ttas-run-event.kind-narration.is-selected button::after,
-.ttas-run-event.kind-narration.is-latest button::after {
+.ttas-run-event.kind-narration .ttas-run-event-card:hover::after,
+.ttas-run-event.kind-narration.is-selected .ttas-run-event-card::after,
+.ttas-run-event.kind-narration.is-latest .ttas-run-event-card::after {
     opacity: 0.9;
     transform: scaleY(1);
 }
 
-.ttas-run-event.kind-narration.is-latest button {
+.ttas-run-event.kind-narration.is-latest .ttas-run-event-card {
     border-color: color-mix(in srgb, var(--ttas-run-panel-accent) 24%, transparent);
     background:
         linear-gradient(90deg, color-mix(in srgb, var(--ttas-run-panel-accent) 8%, transparent), transparent 72%),
@@ -880,7 +884,7 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     box-shadow: none;
 }
 
-.ttas-run-event.kind-handoff button {
+.ttas-run-event.kind-handoff .ttas-run-event-card {
     border-color: color-mix(in srgb, var(--ttas-run-panel-accent) 34%, var(--ttas-run-panel-border-soft));
     background:
         linear-gradient(90deg, color-mix(in srgb, var(--ttas-run-panel-accent) 12%, transparent), transparent 64%),
@@ -935,6 +939,12 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     white-space: nowrap;
 }
 
+.ttas-run-event-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 .ttas-run-event-meta {
     display: flex;
     flex-direction: column;
@@ -986,8 +996,68 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     animation-delay: 0.28s;
 }
 
-.ttas-run-event.is-live button {
+/* Active rows use browser layout; only history rows need fixed virtual heights. */
+.ttas-run-event.is-live .ttas-run-event-card {
+    display: block;
+    padding: 0;
+}
+
+.ttas-run-event.is-live summary {
+    display: grid;
+    grid-template-columns: 24px minmax(0, 1fr) auto;
     grid-template-rows: auto minmax(0, 1fr);
+    gap: 8px;
+    align-items: center;
+    padding: 6px 8px;
+    min-height: calc(var(--ttas-run-event-item-height) - 6px);
+    cursor: pointer;
+    list-style: none;
+}
+
+.ttas-run-event summary::-webkit-details-marker {
+    display: none;
+}
+
+.ttas-run-event summary:focus-visible {
+    outline: 1px solid var(--ttas-run-panel-accent);
+    outline-offset: -2px;
+    border-radius: inherit;
+}
+
+.ttas-run-event-chevron {
+    flex: none;
+    margin-inline-start: 5px;
+    align-self: center;
+    color: var(--ttas-run-line-text-muted);
+    font-size: 0.65rem;
+    transition: transform var(--ttas-transition);
+}
+
+.ttas-run-event-card[open] .ttas-run-event-chevron {
+    transform: rotate(90deg);
+}
+
+.ttas-run-event-card[open] summary {
+    min-height: 0;
+    grid-template-rows: auto;
+}
+
+.ttas-run-event-card[open] > .ttas-run-event-live {
+    margin: 4px 10px 10px 40px;
+}
+
+.ttas-run-event-card[open] .ttas-run-event-live-stream {
+    display: block;
+    overflow: visible;
+    -webkit-line-clamp: unset;
+}
+
+.ttas-run-event-live-label {
+    display: block;
+    margin-bottom: 4px;
+    color: inherit;
+    font-size: 0.68rem;
+    opacity: 0.8;
 }
 
 .ttas-run-event-live {
@@ -1030,6 +1100,41 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     background-color: color-mix(in srgb, var(--ttas-run-diff-delete-color) 62%, transparent);
 }
 
+.ttas-run-event.kind-reasoning {
+    --ttas-run-panel-accent: var(--ttas-run-reasoning-color);
+    --ttas-run-tone-active: var(--ttas-run-reasoning-color);
+    --ttas-run-line-bg-active: var(--ttas-run-reasoning-bg);
+}
+
+.ttas-run-event-tool-names {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 58%;
+    margin-inline-end: 5px;
+    padding: 1px 5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    border: 1px solid var(--ttas-run-reasoning-border);
+    border-radius: 4px;
+    background-color: var(--ttas-run-reasoning-bg);
+    color: var(--ttas-run-reasoning-text-color);
+    font-size: 0.72rem;
+    font-weight: 500;
+}
+
+.ttas-run-event-live.is-reasoning {
+    color: var(--ttas-run-reasoning-text-color);
+    background: linear-gradient(90deg, var(--ttas-run-reasoning-bg), transparent 72%);
+}
+
+.ttas-run-event-live.is-reasoning::before {
+    background-color: var(--ttas-run-reasoning-border);
+}
+
+.ttas-run-event-live.is-reasoning .ttas-run-event-live-stream {
+    font-family: inherit;
+}
+
 .ttas-run-event-live-stream {
     display: -webkit-box;
     overflow: hidden;
@@ -1048,7 +1153,7 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
     -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 1.4em);
 }
 
-.ttas-run-event.is-live .ttas-run-event-live-stream::after {
+.ttas-run-event-live.is-streaming .ttas-run-event-live-stream::after {
     content: '';
     display: inline-block;
     width: 0.5em;
@@ -1300,16 +1405,34 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
 }
 
 .ttas-run-nav-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 5px;
-    align-content: flex-start;
     min-width: 0;
     max-height: 64px;
     overflow-x: hidden;
     overflow-y: auto;
     overscroll-behavior: contain;
     scrollbar-width: thin;
+    overflow-anchor: none;
+}
+
+.ttas-run-nav-space,
+.ttas-run-nav-window {
+    /* Virtual geometry must settle before restoring the scroll anchor. */
+    transition: none;
+}
+
+.ttas-run-nav-space {
+    position: relative;
+}
+
+.ttas-run-nav-window {
+    position: absolute;
+    inset-inline: 0;
+    display: grid;
+}
+
+.ttas-run-nav-list .ttas-run-nav-load {
+    grid-column: 1 / -1;
+    max-width: none;
 }
 
 .ttas-run-nav-list::-webkit-scrollbar {
@@ -1587,7 +1710,7 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
 }
 
 .ttas-run-detail-block[data-ttas-block-kind="reasoning"] pre {
-    color: color-mix(in srgb, var(--ttas-run-reasoning-color) 76%, var(--SmartThemeBodyColor) 24%);
+    color: var(--ttas-run-reasoning-text-color);
     font-family: inherit;
     font-size: 0.74rem;
     line-height: 1.5;
@@ -1722,7 +1845,8 @@ body:is([data-generating="true"], [data-swiping="true"]) .ttas-agent-send-toggle
         min-height: var(--ttas-run-panel-collapsed-height);
     }
 
-    .ttas-run-event button {
+    .ttas-run-event button.ttas-run-event-card,
+    .ttas-run-event summary {
         gap: 7px;
         padding-right: 7px;
     }

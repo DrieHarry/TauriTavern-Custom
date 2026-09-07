@@ -1307,7 +1307,7 @@ impl CharacterService {
                 .into_iter()
                 .collect();
             let base_candidate = Self::strip_trailing_index_suffix(&base_name);
-            for suffix in 2..100_000 {
+            for suffix in 1..100_000 {
                 let candidate = Self::indexed_world_name(base_candidate, suffix)?;
                 if !names.contains(&candidate) {
                     return Ok((candidate, true));
@@ -1347,7 +1347,7 @@ impl CharacterService {
         base_name: &str,
         payload_canonical: &Value,
     ) -> Result<(String, bool), DomainError> {
-        for suffix in 2..100_000 {
+        for suffix in 1..100_000 {
             let candidate = Self::indexed_world_name(base_name, suffix)?;
             match self
                 .world_info_repository

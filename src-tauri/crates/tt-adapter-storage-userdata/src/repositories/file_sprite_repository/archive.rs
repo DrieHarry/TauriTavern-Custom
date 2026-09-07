@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use tt_adapter_storage_core::file_system::{replace_file_with_fallback_sync, unique_temp_path};
+use tt_adapter_storage_core::file_system::{replace_file_blocking, unique_temp_path};
 use tt_contracts::client_asset_paths::validate_path_segment;
 use tt_domain::errors::DomainError;
 use zip::read::ZipFile;
@@ -109,7 +109,7 @@ pub(super) fn import_sprite_pack(
 
     let count = prepared.len();
     for sprite in prepared {
-        replace_file_with_fallback_sync(&sprite.temp_path, &sprite.target_path)?;
+        replace_file_blocking(&sprite.temp_path, &sprite.target_path)?;
         delete_variants(destination, &sprite.stem, &sprite.file_name)?;
     }
     Ok(count)

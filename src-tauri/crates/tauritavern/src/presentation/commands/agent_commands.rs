@@ -19,13 +19,13 @@ use tt_application::dto::agent_dto::{
     AgentPreparePromptAssemblyResultDto, AgentProfileIdDto, AgentPromptAssemblyBrokerRequestDto,
     AgentPruneChatPersistentStatesDto, AgentPruneChatPersistentStatesResultDto, AgentReadEventsDto,
     AgentReadEventsResultDto, AgentReadModelTurnDto, AgentReadPromptAssemblyRequestDto,
-    AgentReadWorkspaceFileDto, AgentRepairProfileFileDto, AgentResolveChatCommitDto,
-    AgentResolvePersistentStateMetadataUpdateDto, AgentResolvePromptAssemblyDto,
-    AgentResolveSystemPromptDto, AgentResolveSystemPromptResultDto, AgentRetargetPresetRefsDto,
-    AgentRetargetPresetRefsResultDto, AgentRunHandleDto, AgentRunLiveUpdateDto,
-    AgentRunPruneApplyResultDto, AgentRunPrunePlanDto, AgentSaveProfileDto, AgentStartRunDto,
-    AgentSubmitGuidanceDto, AgentSubmitGuidanceResultDto, AgentSubscribeRunLiveProjectionDto,
-    AgentWorkspaceFileDto,
+    AgentReadTaskDetailDto, AgentReadWorkspaceFileDto, AgentRepairProfileFileDto,
+    AgentResolveChatCommitDto, AgentResolvePersistentStateMetadataUpdateDto,
+    AgentResolvePromptAssemblyDto, AgentResolveSystemPromptDto, AgentResolveSystemPromptResultDto,
+    AgentRetargetPresetRefsDto, AgentRetargetPresetRefsResultDto, AgentRunHandleDto,
+    AgentRunLiveUpdateDto, AgentRunPruneApplyResultDto, AgentRunPrunePlanDto, AgentSaveProfileDto,
+    AgentStartRunDto, AgentSubmitGuidanceDto, AgentSubmitGuidanceResultDto,
+    AgentSubscribeRunLiveProjectionDto, AgentTaskDetailDto, AgentWorkspaceFileDto,
 };
 use tt_application::errors::ApplicationError;
 use tt_application::services::agent_workspace_lifecycle_service::AgentChatWorkspaceTarget;
@@ -65,7 +65,10 @@ pub async fn subscribe_agent_run_live_projection(
             "Failed to subscribe to agent run live projection",
         ))?
     else {
-        let _ = channel.send(AgentRunLiveUpdateDto::Snapshot { calls: Vec::new() });
+        let _ = channel.send(AgentRunLiveUpdateDto::Snapshot {
+            calls: Vec::new(),
+            reasoning: Vec::new(),
+        });
         return Ok(());
     };
 
@@ -434,6 +437,20 @@ pub async fn read_agent_workspace_file(
         .read_workspace_file(dto)
         .await
         .map_err(map_command_error("Failed to read agent workspace file"))
+}
+
+#[tauri::command]
+pub async fn read_agent_task_detail(
+    dto: AgentReadTaskDetailDto,
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<AgentTaskDetailDto, CommandError> {
+    log_command("read_agent_task_detail");
+    app_state
+        .services
+        .agent_runtime_service
+        .read_task_detail(dto)
+        .await
+        .map_err(map_command_error("Failed to read agent task detail"))
 }
 
 #[tauri::command]

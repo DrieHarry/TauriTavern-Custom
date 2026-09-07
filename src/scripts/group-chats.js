@@ -31,6 +31,7 @@ import {
     characters,
     default_avatar,
     addOneMessage,
+    finalizeMessageContent,
     clearChat,
     Generate,
     select_rm_info,
@@ -343,7 +344,7 @@ export async function getGroupChat(groupId, reload = false, { allowNewChat = fal
                 await eventSource.emit(event_types.MESSAGE_RECEIVED, messageId, 'first_message');
                 addOneMessage(mes);
             });
-            await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, messageId, 'first_message');
+            await finalizeMessageContent(messageId, event_types.CHARACTER_MESSAGE_RENDERED, 'first_message');
         }
         await saveGroupChat(groupId, false, false, CHAT_COMMIT_REASON.MAINTENANCE);
     } else if (Array.isArray(data) && data.length) {

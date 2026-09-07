@@ -530,7 +530,7 @@ pub(crate) async fn request_runtime_data_root_change(
         migration_error: None,
     };
 
-    tt_adapter_storage_core::file_system::write_json_file(&runtime_config_path(app_root), &config)
+    tt_adapter_storage_core::file_system::persist_json_file(&runtime_config_path(app_root), &config)
         .await
 }
 
@@ -618,16 +618,7 @@ fn write_runtime_config_sync(
     path: &std::path::Path,
     config: &TauriTavernRuntimeConfig,
 ) -> Result<(), Box<dyn Error>> {
-    use tt_adapter_storage_core::file_system::{replace_file_with_fallback_sync, unique_temp_path};
-
-    let bytes = serde_json::to_vec_pretty(config)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let temp_path = unique_temp_path(path);
-    std::fs::write(&temp_path, &bytes)?;
-    replace_file_with_fallback_sync(&temp_path, path)
+    tt_adapter_storage_core::file_system::persist_json_file_blocking(path, config)
         .map_err(|error| Box::new(io::Error::other(error.to_string())) as Box<dyn Error>)?;
     Ok(())
 }

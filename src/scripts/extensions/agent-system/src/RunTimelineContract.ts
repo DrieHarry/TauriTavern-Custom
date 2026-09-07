@@ -44,20 +44,25 @@ export type TimelineReadResult = Omit<
 
 export type TimelineLiveToolId = 'builtin:workspace.write_file' | 'builtin:workspace.apply_patch';
 
-// Transient, non-authoritative projection of a tool call whose arguments are
-// still streaming. It disappears on live remove and never gains detail
-// targets; durable journal events remain independent.
-// The stream shows whichever field is currently arriving: for a patch that is
-// old_string in red while the model locates the text, then new_string in green
-// as the replacement streams in. A write is a single neutral stream.
+// Transient previews have no detail targets; durable journal events own history.
 export type TimelineLiveContent = {
-    toolId: TimelineLiveToolId;
     tail: string;
     truncated: boolean;
+    expanded: boolean;
+    blocks: Array<{
+        text: string;
+        streamTone: 'neutral' | 'added' | 'removed' | 'reasoning';
+        labelKey?: AgentSystemMessageKey;
+    }>;
+} & ({
     streamTone: 'neutral' | 'added' | 'removed';
+    toolId: TimelineLiveToolId;
     addedWords: number;
     removedWords: number;
-};
+} | {
+    streamTone: 'reasoning';
+    toolLabel: string;
+});
 
 export type TimelineItem = {
     id: string;
@@ -98,24 +103,9 @@ export type TimelineDetailTarget =
         showPath?: boolean;
     }
     | TimelineDetailTargetBase & {
-        type: 'subAgentTask';
+        type: 'agentTask';
         taskId: string;
-        childInvocationId: string;
-        targetProfileId: string;
-        workspaceKey: string;
-        status: string;
-        resultRef: string;
-        summaryRef: string;
-        error: string;
-    }
-    | TimelineDetailTargetBase & {
-        type: 'handoff';
-        taskId: string;
-        sourceInvocationId: string;
-        newInvocationId: string;
-        targetProfileId: string;
-        workspaceKey: string;
-        status: string;
+        view: 'brief' | 'result';
     }
     | TimelineDetailTargetBase & TimelineTextMetrics & {
         type: 'guidance';
@@ -232,7 +222,7 @@ export type SubAgentTimelineSnapshot = {
     virtualItems: TimelineVirtualWindow;
     selectedItem: TimelineItem | null;
     selectedSeq: number | null;
-    navItems: readonly TimelineItem[];
+    hasMoreBefore: boolean;
     loading: boolean;
     loadingOlder: boolean;
     autoStick: boolean;
@@ -244,12 +234,13 @@ export type RunTimelineSnapshot = {
     rootId: string;
     visible: boolean;
     displayItems: readonly TimelineItem[];
+    liveItems: readonly TimelineItem[];
     virtualItems: TimelineVirtualWindow;
     selectedItem: TimelineItem | null;
     selectedSeq: number | null;
     latestSeq: number | null;
     activeSeq: number | null;
-    navItems: readonly TimelineItem[];
+    hasMoreBefore: boolean;
     loading: boolean;
     loadingOlder: boolean;
     detail: TimelineDetailSnapshot;
@@ -291,6 +282,7 @@ export type RunTimelineController = {
     dispose: () => void;
     loadOlder: () => Promise<boolean>;
     selectItem: (seq: number) => void;
+    toggleLiveItem: (id: string) => void;
     toggleCollapsed: () => void;
     openDetails: () => void;
     showTimeline: () => void;

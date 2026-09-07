@@ -2,6 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::io::AsyncWriteExt;
 use tt_domain::errors::DomainError;
 use uuid::Uuid;
 
@@ -38,10 +39,28 @@ where
         DomainError::InvalidData(format!("Failed to serialize to JSON: {error}"))
     })?;
     let tmp_path = json_tmp_path(path);
-    tokio::fs::write(&tmp_path, contents)
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
         .await
-        .map_err(|error| DomainError::InternalError(format!("Failed to write file: {error}")))?;
-    replace_file_with_fallback(&tmp_path, path).await
+        .map_err(|error| {
+            DomainError::InternalError(format!("Failed to create {}: {error}", tmp_path.display()))
+        })?;
+    let result = async {
+        file.write_all(&contents).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp_path, path).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    }
+    result.map_err(|error| {
+        DomainError::InternalError(format!("Failed to save {}: {error}", path.display()))
+    })
 }
 
 fn json_tmp_path(path: &Path) -> PathBuf {
@@ -51,112 +70,6 @@ fn json_tmp_path(path: &Path) -> PathBuf {
         .filter(|name| !name.is_empty())
         .unwrap_or("data.json");
     path.with_file_name(format!("{file_name}.{}.tmp", Uuid::new_v4()))
-}
-
-async fn replace_file_with_fallback(
-    temp_path: &Path,
-    target_path: &Path,
-) -> Result<(), DomainError> {
-    let Some(temp_metadata) = optional_metadata(temp_path).await? else {
-        return Err(DomainError::NotFound(format!(
-            "Temp file not found: {}",
-            temp_path.display()
-        )));
-    };
-    if !temp_metadata.is_file() {
-        return Err(DomainError::InvalidData(format!(
-            "Temp path is not a file: {}",
-            temp_path.display()
-        )));
-    }
-
-    match tokio::fs::rename(temp_path, target_path).await {
-        Ok(()) => Ok(()),
-        Err(rename_error) => {
-            let temp_after = optional_metadata(temp_path).await?;
-            let target_after = optional_metadata(target_path).await?;
-
-            match (temp_after, target_after) {
-                (None, Some(target_metadata)) if target_metadata.is_file() => {
-                    tracing::warn!(
-                        "Rename reported an error after replacing file {:?} -> {:?}: {}",
-                        temp_path,
-                        target_path,
-                        rename_error
-                    );
-                    Ok(())
-                }
-                (Some(temp_metadata), target_after) if temp_metadata.is_file() => {
-                    if target_after.is_some_and(|metadata| !metadata.is_file()) {
-                        return Err(DomainError::InvalidData(format!(
-                            "Target path is not a file after failed replace: {}",
-                            target_path.display()
-                        )));
-                    }
-
-                    tracing::warn!(
-                        "Rename failed while replacing file {:?} -> {:?}: {}. Falling back to copy/remove.",
-                        temp_path,
-                        target_path,
-                        rename_error
-                    );
-
-                    if let Some(parent) = target_path.parent() {
-                        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                            DomainError::InternalError(format!(
-                                "Failed to create target parent directory {:?}: {}",
-                                parent, error
-                            ))
-                        })?;
-                    }
-
-                    tokio::fs::copy(temp_path, target_path)
-                        .await
-                        .map_err(|copy_error| {
-                            DomainError::InternalError(format!(
-                                "Failed to replace file {:?} -> {:?}. Rename error: {}. Copy fallback error: {}",
-                                temp_path, target_path, rename_error, copy_error
-                            ))
-                        })?;
-                    remove_temp_file(temp_path, target_path).await
-                }
-                (Some(_), _) => Err(DomainError::InvalidData(format!(
-                    "Temp path is not a file after failed replace: {}",
-                    temp_path.display()
-                ))),
-                (None, None) => Err(DomainError::InternalError(format!(
-                    "Failed to replace file {:?} -> {:?}. Rename error: {}. Temp and target are both missing after failure.",
-                    temp_path, target_path, rename_error
-                ))),
-                (None, Some(_)) => Err(DomainError::InvalidData(format!(
-                    "Target path is not a file after failed replace: {}",
-                    target_path.display()
-                ))),
-            }
-        }
-    }
-}
-
-async fn optional_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, DomainError> {
-    match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(DomainError::InternalError(format!(
-            "Failed to read file metadata {:?}: {}",
-            path, error
-        ))),
-    }
-}
-
-async fn remove_temp_file(temp_path: &Path, target_path: &Path) -> Result<(), DomainError> {
-    match tokio::fs::remove_file(temp_path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(DomainError::InternalError(format!(
-            "Replaced file {:?} -> {:?}, but failed to remove temp file: {}",
-            temp_path, target_path, error
-        ))),
-    }
 }
 
 #[cfg(test)]
@@ -217,18 +130,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_json_file_rejects_directory_target_after_failed_replace() {
+    async fn write_json_file_keeps_directory_target_on_failure() {
         let root = temp_root();
         let target = root.join("state.json");
         tokio::fs::create_dir_all(&target)
             .await
             .expect("create directory target");
 
-        let error = write_json_file(&target, &json!({ "ok": true }))
+        write_json_file(&target, &json!({ "ok": true }))
             .await
             .unwrap_err();
 
-        assert!(matches!(error, DomainError::InvalidData(_)));
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

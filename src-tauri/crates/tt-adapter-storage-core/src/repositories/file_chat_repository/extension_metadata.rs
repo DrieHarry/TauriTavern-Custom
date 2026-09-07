@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 use tokio::fs::File;
 use tokio::io::{self, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
-use crate::file_system::replace_file_with_fallback;
+use crate::file_system::persist_file;
 use tt_domain::errors::DomainError;
 
 use super::FileChatRepository;
@@ -94,12 +94,17 @@ impl FileChatRepository {
         let serialized = serialize_header_json(&header_value)?;
 
         let temp_path = Self::temp_payload_path(path);
-        let mut out = File::create(&temp_path).await.map_err(|error| {
-            DomainError::InternalError(format!(
-                "Failed to create chat payload temp file {:?}: {}",
-                temp_path, error
-            ))
-        })?;
+        let mut out = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await
+            .map_err(|error| {
+                DomainError::InternalError(format!(
+                    "Failed to create chat payload temp file {:?}: {}",
+                    temp_path, error
+                ))
+            })?;
 
         out.write_all(serialized.as_bytes())
             .await
@@ -132,7 +137,7 @@ impl FileChatRepository {
             DomainError::InternalError(format!("Failed to flush chat payload file: {}", error))
         })?;
 
-        replace_file_with_fallback(&temp_path, path).await?;
+        persist_file(out, &temp_path, path).await?;
         self.remove_summary_cache_for_path(path).await;
 
         tracing::debug!(

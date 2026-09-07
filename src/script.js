@@ -15,6 +15,7 @@ import { getPromptCacheUsage } from './scripts/util/prompt-cache-usage.js';
 import { formatGenerationTimer, updateMessageGenerationInfo } from './scripts/message-generation-info.js';
 import { registerLifecycleFlushHandler } from './tauri/main/services/lifecycle/lifecycle-flush-service.js';
 import {
+    prepareMesTextHtmlWithRuntimePolicy,
     replaceMesTextHtmlWithRuntimePolicy,
     replaceTransientMesTextHtmlWithRuntimePolicy,
 } from './scripts/tauri/message/mes-text-write.js';
@@ -725,12 +726,16 @@ const chatSurface = installChatSurfaceRuntime({
     root: /** @type {HTMLElement} */ (chatElement[0]),
     getMessages: () => chat,
     prepareMaterializeOptions: prepareMessageRegexOptions,
+    formatMessageContent: (message, messageId) => getMessageTextHTML(message, { messageId }),
+    prepareContentTransaction: prepareMesTextHtmlWithRuntimePolicy,
+    emitEvent: eventSource.emit.bind(eventSource),
     materializeMessage: ({ message, messageId, frontendSourceHandoffEvent, materializeOptions }) => updateMessageElement(message, {
         messageId,
         frontendSourceHandoffEvent,
         adjustMediaScroll: materializeOptions?.adjustMediaScroll ?? SCROLL_BEHAVIOR.NONE,
         regexSourceText: materializeOptions?.regexSourceText,
         regexedText: materializeOptions?.regexedText,
+        transient: materializeOptions?.transient,
     }),
     syncMountedViewState: syncMountedChatViewState,
     onFault: error => {
@@ -738,6 +743,8 @@ const chatSurface = installChatSurfaceRuntime({
         void offerChatVirtualizationRecovery(error);
     },
 });
+
+export const finalizeMessageContent = chatSurface.finishContent;
 
 let dialogueResolve = null;
 let dialogueCloseStop = false;
@@ -2700,19 +2707,18 @@ function insertSVGIcon(mes, extra) {
  * @param {boolean} [options.transient=false] Whether to defer decorators and embedded runtimes until final content
  */
 export function updateMessageBlock(messageId, message, { rerenderMessage = true, transient = false } = {}) {
+    if (rerenderMessage) chatSurface.setContentTransient(message, transient);
     const messageElement = chatElement.find(`[mesid="${messageId}"]`);
     if (messageElement.length === 0) {
         return;
     }
     if (rerenderMessage) {
-        const text = message?.extra?.display_text ?? message.mes;
         const replace = transient
             ? replaceTransientMesTextHtmlWithRuntimePolicy
             : replaceMesTextHtmlWithRuntimePolicy;
         replace(
             /** @type {HTMLElement} */ (messageElement[0]),
-            getToolMessageHTML(message, messageId)
-                ?? messageFormatting(text, message.name, message.is_system, message.is_user, messageId, {}, false),
+            getMessageTextHTML(message, { messageId }),
         );
     }
 
@@ -3348,9 +3354,10 @@ function updateToolCallUI(messageElement, messageId) {
  * @param {number} [options.insertBefore=null] Message ID to insert the new message before
  * @param {number} [options.forceId=null] Force the message ID
  * @param {boolean} [options.showSwipes=true] Whether to refresh the swipe buttons.
+ * @param {boolean} [options.transient=false] Whether content is still being generated.
  * @returns {JQuery<HTMLElement>} The newly added message element
  */
-export function addOneMessage(mes, { type = undefined, insertAfter = null, scroll = true, insertBefore = null, forceId = null, showSwipes = true } = {}) {
+export function addOneMessage(mes, { type = undefined, insertAfter = null, scroll = true, insertBefore = null, forceId = null, showSwipes = true, transient = false } = {}) {
     // Callers push the new message to chat before calling addOneMessage
     const messageId = (() => {
         if (typeof forceId === 'number') {
@@ -3378,13 +3385,13 @@ export function addOneMessage(mes, { type = undefined, insertAfter = null, scrol
         mes.swipes ??= [mes.mes];
         //This keeps listeners intact.
         messageElement = chatElement.find(`[mesid="${messageId}"]`);
-        updateMessageElement(mes, { messageId, messageElement, adjustMediaScroll: scroll ? SCROLL_BEHAVIOR.ADJUST : SCROLL_BEHAVIOR.NONE });
+        updateMessageElement(mes, { messageId, messageElement, adjustMediaScroll: scroll ? SCROLL_BEHAVIOR.ADJUST : SCROLL_BEHAVIOR.NONE, transient });
     } else {
         reconcileMountedChatSurface({
             includeMessageIds: [messageId],
             materializeOptionsByMessageId: new Map([[
                 messageId,
-                { adjustMediaScroll: scroll ? SCROLL_BEHAVIOR.ADJUST : SCROLL_BEHAVIOR.NONE },
+                { adjustMediaScroll: scroll ? SCROLL_BEHAVIOR.ADJUST : SCROLL_BEHAVIOR.NONE, transient },
             ]]),
         });
         messageElement = $(chatSurface.getMessageElement(messageId));
@@ -3411,9 +3418,10 @@ export function addOneMessage(mes, { type = undefined, insertAfter = null, scrol
  * @param {string|null} [options.frontendSourceHandoffEvent=null] Event after which detached frontend source cover is released.
  * @param {string} [options.regexSourceText] Original display text before regex.
  * @param {string} [options.regexedText] Precomputed display regex output.
+ * @param {boolean} [options.transient=false] Whether to defer content processors and runtimes.
  * @returns {JQuery<HTMLElement>} Rendered HTMLElement.
  */
-export function updateMessageElement(mes, { messageId = chat.length - 1, messageElement = messageTemplate.clone(), adjustMediaScroll = SCROLL_BEHAVIOR.NONE, frontendSourceHandoffEvent = null, regexSourceText, regexedText } = {}) {
+export function updateMessageElement(mes, { messageId = chat.length - 1, messageElement = messageTemplate.clone(), adjustMediaScroll = SCROLL_BEHAVIOR.NONE, frontendSourceHandoffEvent = null, regexSourceText, regexedText, transient = false } = {}) {
     let avatarImg = getThumbnailUrl('persona', user_avatar);
 
     //for non-user messages
@@ -3489,7 +3497,8 @@ export function updateMessageElement(mes, { messageId = chat.length - 1, message
     });
 
     appendMediaToMessage(mes, messageElement, adjustMediaScroll);
-    replaceMesTextHtmlWithRuntimePolicy(
+    const replaceContent = transient ? replaceTransientMesTextHtmlWithRuntimePolicy : replaceMesTextHtmlWithRuntimePolicy;
+    replaceContent(
         /** @type {HTMLElement} */ (messageElement[0]),
         messageHTML,
         { frontendSourceHandoffEvent },
@@ -4607,13 +4616,9 @@ class StreamingProcessor {
                     fadeIn: power_user.stream_fade_in,
                 })
             ) {
-                if (isFinal) {
-                    replaceMesTextHtmlWithRuntimePolicy(this.messageDom, formattedText);
-                } else {
-                    replaceTransientMesTextHtmlWithRuntimePolicy(this.messageDom, formattedText, {
-                        fadeIn: power_user.stream_fade_in,
-                    });
-                }
+                replaceTransientMesTextHtmlWithRuntimePolicy(this.messageDom, formattedText, {
+                    fadeIn: !isFinal && power_user.stream_fade_in,
+                });
                 this.lastCommittedHtml = formattedText;
             }
 
@@ -4700,8 +4705,8 @@ class StreamingProcessor {
             const emitMessageEvents = shouldEmitCharacterMessageEvents(message, hasToolCalls);
             if (emitMessageEvents) {
                 await eventSource.emit(event_types.MESSAGE_RECEIVED, this.messageId, this.type);
-                await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, this.messageId, this.type);
             }
+            await finalizeMessageContent(messageId, emitMessageEvents ? event_types.CHARACTER_MESSAGE_RENDERED : null, this.type);
         } else {
             await eventSource.emit(event_types.IMPERSONATE_READY, text);
         }
@@ -4723,16 +4728,18 @@ class StreamingProcessor {
         playMessageSound();
     }
 
-    onErrorStreaming() {
+    async onErrorStreaming() {
         this.abortController.abort();
         this.isStopped = true;
 
         this.markUIGenStopped();
 
-        const noEmitTypes = ['swipe', 'impersonate', 'continue'];
-        if (!noEmitTypes.includes(this.type)) {
-            eventSource.emit(event_types.MESSAGE_RECEIVED, this.messageId, this.type);
-            eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, this.messageId, this.type);
+        const emitMessageEvents = !['swipe', 'impersonate', 'continue'].includes(this.type);
+        if (emitMessageEvents) {
+            await eventSource.emit(event_types.MESSAGE_RECEIVED, this.messageId, this.type);
+        }
+        if (this.type !== 'impersonate' && this.messageId >= 0) {
+            await finalizeMessageContent(this.messageId, emitMessageEvents ? event_types.CHARACTER_MESSAGE_RENDERED : null, this.type);
         }
     }
 
@@ -4817,7 +4824,7 @@ class StreamingProcessor {
             // in the case of a self-inflicted abort, we have already cleaned up
             if (!this.isFinished) {
                 console.error(err);
-                this.onErrorStreaming();
+                await this.onErrorStreaming();
             }
             return this.result;
         }
@@ -7258,7 +7265,7 @@ export async function sendMessageAsUser(messageText, messageBias, insertAt = nul
             await eventSource.emit(event_types.MESSAGE_SENT, insertAt);
             await reloadCurrentChat();
         });
-        await eventSource.emit(event_types.USER_MESSAGE_RENDERED, insertAt);
+        await finalizeMessageContent(insertAt, event_types.USER_MESSAGE_RENDERED);
     } else {
         let chat_id;
         await withChatSurfaceStructureMutation(async () => {
@@ -7268,7 +7275,7 @@ export async function sendMessageAsUser(messageText, messageBias, insertAt = nul
             await eventSource.emit(event_types.MESSAGE_SENT, chat_id);
             addOneMessage(message);
         });
-        await eventSource.emit(event_types.USER_MESSAGE_RENDERED, chat_id);
+        await finalizeMessageContent(chat_id, event_types.USER_MESSAGE_RENDERED);
     }
 
     return message;
@@ -8081,8 +8088,8 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
             const chat_id = (chat.length - 1);
             const emitMessageEvents = !fromStreaming && shouldEmitCharacterMessageEvents(chat[chat_id], hasToolCalls);
             emitMessageEvents && await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
-            addOneMessage(chat[chat_id], { type: 'swipe' });
-            emitMessageEvents && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
+            addOneMessage(chat[chat_id], { type: 'swipe', transient: fromStreaming });
+            if (!fromStreaming) await finalizeMessageContent(chat_id, emitMessageEvents ? event_types.CHARACTER_MESSAGE_RENDERED : null, type);
         } else {
             lastMessage.mes = getMessage;
         }
@@ -8112,8 +8119,8 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         const chat_id = (chat.length - 1);
         const emitMessageEvents = !fromStreaming && shouldEmitCharacterMessageEvents(chat[chat_id], hasToolCalls);
         emitMessageEvents && await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
-        addOneMessage(chat[chat_id], { type: 'swipe' });
-        emitMessageEvents && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
+        addOneMessage(chat[chat_id], { type: 'swipe', transient: fromStreaming });
+        if (!fromStreaming) await finalizeMessageContent(chat_id, emitMessageEvents ? event_types.CHARACTER_MESSAGE_RENDERED : null, type);
     } else if (type === 'appendFinal') {
         oldMessage = lastMessage.mes;
         console.debug('Trying to appendFinal.');
@@ -8140,8 +8147,8 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         const chat_id = (chat.length - 1);
         const emitMessageEvents = !fromStreaming && shouldEmitCharacterMessageEvents(chat[chat_id], hasToolCalls);
         emitMessageEvents && await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
-        addOneMessage(chat[chat_id], { type: 'swipe' });
-        emitMessageEvents && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
+        addOneMessage(chat[chat_id], { type: 'swipe', transient: fromStreaming });
+        if (!fromStreaming) await finalizeMessageContent(chat_id, emitMessageEvents ? event_types.CHARACTER_MESSAGE_RENDERED : null, type);
     } else {
         console.debug('entering chat update routine for non-swipe post');
         if (power_user.trim_spaces) {
@@ -8188,9 +8195,9 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         await withChatSurfaceStructureMutation(async () => {
             chat.push(newMessage);
             emitMessageEvents && await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
-            addOneMessage(chat[chat_id]);
+            addOneMessage(chat[chat_id], { transient: fromStreaming });
         });
-        emitMessageEvents && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
+        if (!fromStreaming) await finalizeMessageContent(chat_id, emitMessageEvents ? event_types.CHARACTER_MESSAGE_RENDERED : null, type);
     }
 
     const item = chat[chat.length - 1];
@@ -9180,7 +9187,7 @@ async function getChatResult({ allowNewChat = false } = {}) {
     if (chat.length === 1) {
         const chat_id = (chat.length - 1);
         await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, 'first_message');
-        await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, 'first_message');
+        await finalizeMessageContent(chat_id, event_types.CHARACTER_MESSAGE_RENDERED, 'first_message');
     }
 }
 
@@ -9845,7 +9852,6 @@ export async function messageEdit(editMessageId) {
  * @param {number} [messageId=this_edit_mes_id]
  */
 async function messageEditCancel(messageId = this_edit_mes_id) {
-    let text = chat[messageId].mes;
     let thisMesDiv;
     // If this is the button then select it's parent. Otherwise, select by messageId.
     if (this?.classList?.contains('mes_edit_cancel')) {
@@ -9860,16 +9866,7 @@ async function messageEditCancel(messageId = this_edit_mes_id) {
 
     replaceMesTextHtmlWithRuntimePolicy(
         /** @type {HTMLElement} */ (thisMesDiv[0]),
-        getToolMessageHTML(chat[messageId], messageId)
-            ?? messageFormatting(
-                text,
-                this_edit_mes_chname,
-                chat[messageId].is_system,
-                chat[messageId].is_user,
-                messageId,
-                {},
-                false,
-            ),
+        getMessageTextHTML(chat[messageId], { messageId }),
     );
     appendMediaToMessage(chat[messageId], thisMesDiv);
 
@@ -9878,7 +9875,7 @@ async function messageEditCancel(messageId = this_edit_mes_id) {
         reasoningEditDone.trigger('click');
     }
 
-    await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+    await finalizeMessageContent(messageId, event_types.MESSAGE_UPDATED);
     if (messageId == this_edit_mes_id) {
         this_edit_mes_id = undefined;
         syncChatSurfaceProjectionHold();
@@ -9986,25 +9983,16 @@ async function messageEditDone(div) {
         return;
     }
 
-    let { mesBlock, text, mes, bias } = updateMessage(div);
+    const { mesBlock, bias } = updateMessage(div);
 
     await eventSource.emit(event_types.MESSAGE_EDITED, this_edit_mes_id);
-    text = chat[this_edit_mes_id]?.mes ?? text;
+    const mes = chat[this_edit_mes_id];
     mesBlock.find('.mes_edit_buttons').css('display', 'none');
     mesBlock.find('.mes_buttons').css('display', '');
 
     replaceMesTextHtmlWithRuntimePolicy(
         /** @type {HTMLElement} */ (div.closest('.mes')[0]),
-        getToolMessageHTML(mes, this_edit_mes_id)
-            ?? messageFormatting(
-                text,
-                this_edit_mes_chname,
-                mes.is_system,
-                mes.is_user,
-                this_edit_mes_id,
-                {},
-                false,
-            ),
+        getMessageTextHTML(mes, { messageId: this_edit_mes_id }),
     );
     mesBlock.find('.mes_bias').empty();
     mesBlock.find('.mes_bias').append(messageFormatting(bias, '', false, false, -1, {}, false));
@@ -10015,7 +10003,7 @@ async function messageEditDone(div) {
         reasoningEditDone.trigger('click');
     }
 
-    await eventSource.emit(event_types.MESSAGE_UPDATED, this_edit_mes_id);
+    await finalizeMessageContent(this_edit_mes_id, event_types.MESSAGE_UPDATED);
     this_edit_mes_id = undefined;
     syncChatSurfaceProjectionHold();
     await saveChatConditional();
@@ -11653,7 +11641,7 @@ export async function createOrEditCharacter(e) {
                     await clearChat();
                     await printMessages();
                 });
-                await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, messageId, 'first_message');
+                await finalizeMessageContent(messageId, event_types.CHARACTER_MESSAGE_RENDERED, 'first_message');
                 await saveChatConditional();
             }
         } catch (error) {
@@ -12023,6 +12011,7 @@ export async function swipe(event, direction, { source, repeated, message = chat
             const scroll = (mesId == chat.length - 1);
             //The swipe buttons will be refreshed in endSwipe(), refreshing them now will cause flickering.
             addOneMessage(chat[mesId], { type: 'swipe', forceId: mesId, scroll: scroll, showSwipes: false });
+            await finalizeMessageContent(mesId);
 
             if (shouldCountMessageTokens()) {
                 if (!chat[mesId].extra) {
@@ -12256,7 +12245,7 @@ export async function processDroppedFiles(files, data = new Map(), { replacement
 
         for (const avatarFileName of replacements) {
             try {
-                await resolveImportedCharacterLorebookConflict(avatarFileName);
+                await resolveCharacterLorebookConflict(avatarFileName);
             } catch (error) {
                 console.warn('Character replaced, but its World/Lorebook conflict could not be resolved:', error);
                 toastr.warning(error?.message, t`Character replaced; World/Lorebook follow-up failed`);
@@ -12551,11 +12540,14 @@ async function applyCharacterLorebookConflictResolution(avatarFileName, resoluti
     }
 }
 
-async function resolveImportedCharacterLorebookConflict(avatarFileName) {
+/**
+ * @returns {Promise<boolean>} Whether the conflict is resolved; false when deferred.
+ */
+async function resolveCharacterLorebookConflict(avatarFileName) {
     while (true) {
         const conflict = await getCharacterLorebookConflict(avatarFileName);
         if (!conflict?.conflict) {
-            return;
+            return true;
         }
 
         const conflictToken = String(conflict.conflict_token || '');
@@ -12565,44 +12557,39 @@ async function resolveImportedCharacterLorebookConflict(avatarFileName) {
         const currentWorldLabel = worldName
             ? `<code>${escapeHtml(worldName)}</code>`
             : `<code>${t`missing`}</code>`;
-        const unavailableMessage = currentAvailable
-            ? ''
-            : `<div>${t`The current local World/Lorebook is missing. Saving a copy will not bind it automatically.`}</div>`;
-        const keepCurrentMessage = currentAvailable
-            ? `<div>${t`Keeping the current version replaces the card's embedded copy with the local version.`}</div>`
-            : '';
+        const resolutionMessage = currentAvailable
+            ? `<div>${t`Using the embedded version overwrites the local World/Lorebook and may affect other characters.`}</div>
+               <div>${t`Saving a copy keeps the current link and stores the embedded version separately.`}</div>
+               <div>${t`Keeping the current version replaces the card's embedded copy with the local version.`}</div>`
+            : `<div>${t`The linked local World/Lorebook is missing. Use the embedded version to restore it, or save an unbound copy.`}</div>`;
         const popupBody = `
             <div>${t`The card's embedded World/Lorebook differs from the linked local version.`}</div>
             <div class="m-t-1">${t`Current local World/Lorebook:`} ${currentWorldLabel}</div>
             <div>${t`Embedded World/Lorebook:`} <code>${escapeHtml(embeddedName)}</code></div>
-            <div class="m-t-1">${t`Using the new version overwrites the local World/Lorebook and may affect other characters.`}</div>
-            <div>${t`Saving a copy keeps the current link and stores the new version separately.`}</div>
-            ${keepCurrentMessage}
-            ${unavailableMessage}
+            <div class="m-t-1">${resolutionMessage}</div>
         `;
         const customButtons = [
             {
-                text: t`Use New`,
+                text: t`Use Embedded`,
                 result: POPUP_RESULT.CUSTOM1,
             },
             {
-                text: t`Keep Both`,
+                text: currentAvailable ? t`Keep Both` : t`Save a Copy`,
                 result: POPUP_RESULT.CUSTOM2,
             },
         ];
         if (currentAvailable) {
             customButtons.push({
-                text: t`Keep Current`,
+                text: t`Keep Local`,
                 result: POPUP_RESULT.CUSTOM3,
             });
         }
 
         const result = await Popup.show.confirm(t`World/Lorebook conflict`, popupBody, {
             okButton: false,
-            cancelButton: false,
+            cancelButton: t`Not Now`,
             customButtons,
             defaultResult: currentAvailable ? POPUP_RESULT.CUSTOM2 : POPUP_RESULT.CUSTOM1,
-            allowEscapeClose: false,
         });
         const resolution = {
             [POPUP_RESULT.CUSTOM1]: 'embedded',
@@ -12610,7 +12597,7 @@ async function resolveImportedCharacterLorebookConflict(avatarFileName) {
             [POPUP_RESULT.CUSTOM3]: 'current',
         }[result];
         if (!resolution) {
-            throw new Error(t`World/Lorebook choice was cancelled.`);
+            return false;
         }
 
         try {
@@ -12619,7 +12606,7 @@ async function resolveImportedCharacterLorebookConflict(avatarFileName) {
                 resolution,
                 conflictToken,
             );
-            return;
+            return true;
         } catch (error) {
             if (error?.status === 409) {
                 continue;
@@ -12641,81 +12628,7 @@ async function resolveCharacterLorebookConflictBeforeNewChat() {
 
     try {
         await flushWorldInfoSaves('new_chat_lorebook_conflict_check');
-        while (true) {
-            const conflict = await getCharacterLorebookConflict(character.avatar);
-
-            if (!conflict?.conflict) {
-                return true;
-            }
-
-            const conflictToken = String(conflict.conflict_token || '');
-            const worldName = String(conflict.world || character?.data?.extensions?.world || '');
-            const embeddedName = String(conflict.embedded_name || t`Embedded World/Lorebook`);
-            const currentAvailable = Boolean(conflict.current_available);
-            const currentWorldLabel = worldName ? `<code>${escapeHtml(worldName)}</code>` : `<code>${t`missing`}</code>`;
-            const embeddedWorldLabel = `<code>${escapeHtml(embeddedName)}</code>`;
-            const unavailableMessage = currentAvailable
-                ? ''
-                : `<div class="m-t-1">${t`The linked local World/Lorebook file is missing. You can restore it from the embedded copy or cancel.`}</div>`;
-
-            const popupBody = `
-                <div>${t`The embedded World/Lorebook and linked local World/Lorebook are different.`}</div>
-                <div class="m-t-1">${t`Current local World/Lorebook:`} ${currentWorldLabel}</div>
-                <div>${t`Embedded World/Lorebook:`} ${embeddedWorldLabel}</div>
-                ${unavailableMessage}
-                <div class="m-t-1">${t`Choose which version to keep before starting a new chat. The other version will be overwritten.`}</div>
-            `;
-            const customButtons = [];
-
-            if (currentAvailable) {
-                customButtons.push({
-                    text: t`Save current World/Lorebook`,
-                    result: POPUP_RESULT.CUSTOM1,
-                });
-            }
-
-            customButtons.push(
-                {
-                    text: t`Overwrite with embedded World/Lorebook`,
-                    result: POPUP_RESULT.CUSTOM2,
-                },
-                {
-                    text: translate('Cancel', 'Cancel World/Lorebook conflict'),
-                    result: POPUP_RESULT.NEGATIVE,
-                },
-            );
-
-            const result = await Popup.show.confirm(t`World/Lorebook conflict`, popupBody, {
-                okButton: false,
-                cancelButton: false,
-                customButtons,
-                defaultResult: currentAvailable ? POPUP_RESULT.CUSTOM1 : POPUP_RESULT.CUSTOM2,
-            });
-
-            const resolution = result === POPUP_RESULT.CUSTOM1
-                ? 'current'
-                : result === POPUP_RESULT.CUSTOM2
-                    ? 'embedded'
-                    : '';
-
-            if (!resolution) {
-                return false;
-            }
-
-            try {
-                await applyCharacterLorebookConflictResolution(
-                    character.avatar,
-                    resolution,
-                    conflictToken,
-                );
-                return true;
-            } catch (error) {
-                if (error?.status === 409) {
-                    continue;
-                }
-                throw error;
-            }
-        }
+        return await resolveCharacterLorebookConflict(character.avatar);
     } catch (error) {
         console.error('Failed to resolve character lorebook conflict before new chat.', error);
         toastr.error(error?.message || t`Failed to resolve the World/Lorebook conflict.`, t`New chat cancelled`);

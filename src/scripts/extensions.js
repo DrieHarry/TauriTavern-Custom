@@ -510,7 +510,7 @@ function hasExtensionHook(name, hookName) {
  * Hooks are optional function names exported from the extension's JS entry point module.
  * The hook function can optionally return a Promise that will be awaited up to a diagnostic timeout.
  * @param {string} name Extension name
- * @param {'install' | 'update' | 'delete' | 'clean' | 'enable' | 'disable' | 'activate'} hookName The hook to call
+ * @param {'install' | 'update' | 'delete' | 'clean' | 'enable' | 'disable' | 'activate' | 'chatSurface'} hookName The hook to call
  * @returns {Promise<void>}
  */
 async function callExtensionHook(name, hookName) {
@@ -549,6 +549,11 @@ async function callExtensionHook(name, hookName) {
     }
 
     const hookCallResult = module[hookFunctionName]();
+
+    if (hookName === 'chatSurface') {
+        await hookCallResult;
+        return;
+    }
 
     const HOOK_TIMEOUT = 5000;
     const HOOK_RESULT = {
@@ -649,8 +654,7 @@ export function isCodeRenderDelegatedToThirdPartyRenderer() {
 }
 
 /**
- * Activates the one known renderer required by bounded ChatSurface before any
- * chat is materialized. Capability verification remains a separate host step.
+ * Initializes ChatSurface hooks and the required renderer before the first projection.
  */
 export async function activateRequiredChatSurfaceExtensions() {
     const enabled = getEnabledChatSurfaceRendererCapabilities();
@@ -659,17 +663,26 @@ export async function activateRequiredChatSurfaceExtensions() {
             'Bounded ChatSurface cannot start while JS-Slash-Runner and LittleWhiteBox are both enabled',
         );
     }
-    if (enabled.length === 0) {
-        return Object.freeze([]);
-    }
-
     const requiredNames = new Set(enabled.map(capability => capability.internalName));
+    const contentExtensions = extensionNames.filter(name =>
+        !extension_settings.disabledExtensions.includes(name)
+        && Object.hasOwn(manifests[name]?.hooks ?? {}, 'chatSurface'))
+        .sort((a, b) => sortManifestsByOrder(manifests[a], manifests[b]));
+    for (const name of contentExtensions) {
+        requiredNames.add(name);
+    }
     await activateExtensions({
         parallelism: 1,
         includeExtension: name => requiredNames.has(name),
         resetErrors: false,
         throwOnError: true,
     });
+    for (const name of contentExtensions) {
+        if (!activeExtensions.has(name)) {
+            throw new Error(`ChatSurface extension "${name}" could not activate`);
+        }
+        await callExtensionHook(name, 'chatSurface');
+    }
 
     return Object.freeze(enabled.map(({ extensionName, participantId }) => Object.freeze({
         extensionName,

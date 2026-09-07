@@ -730,11 +730,11 @@ async fn character_service_import_auto_links_embedded_lorebook_without_dropping_
     let named_stored_card = read_stored_card(&root, "Named").await;
     assert_eq!(
         named_stored_card.pointer("/data/extensions/world"),
-        Some(&json!("Embedded Lore (2)"))
+        Some(&json!("Embedded Lore (1)"))
     );
     assert!(
         world_repository
-            .get_world_info("Embedded Lore (2)", false)
+            .get_world_info("Embedded Lore (1)", false)
             .await
             .expect("read named import world info")
             .is_some()
@@ -807,7 +807,7 @@ async fn character_service_import_keeps_character_when_embedded_lorebook_import_
 }
 
 #[tokio::test]
-async fn character_service_replace_preserves_local_lorebook_binding() {
+async fn character_service_replace_and_copy_preserve_local_lorebook_binding() {
     let root = temp_root("character-preserved-import-lorebook");
     let (service, world_repository) = character_service_with_world_repository(&root).await;
     world_repository
@@ -896,7 +896,7 @@ async fn character_service_replace_preserves_local_lorebook_binding() {
     );
     assert!(
         world_repository
-            .get_world_info("Old Lore (2)", false)
+            .get_world_info("Old Lore (1)", false)
             .await
             .expect("check implicit lorebook copy")
             .is_none()
@@ -910,6 +910,39 @@ async fn character_service_replace_preserves_local_lorebook_binding() {
         .expect("check deferred lorebook conflict");
     assert!(conflict.conflict);
     assert!(conflict.current_available);
+
+    let resolved = service
+        .resolve_lorebook_conflict(ResolveCharacterLorebookConflictDto {
+            name: "Preserved".to_string(),
+            resolution: CharacterLorebookConflictResolution::Copy,
+            conflict_token: conflict.conflict_token,
+        })
+        .await
+        .expect("keep both lorebooks after replacement");
+    assert_eq!(resolved.world, "Old Lore");
+    assert_eq!(resolved.affected_world.as_deref(), Some("Old Lore (1)"));
+    let copy = world_repository
+        .get_world_info("Old Lore (1)", false)
+        .await
+        .expect("read copied world")
+        .expect("copy exists");
+    assert_eq!(
+        copy.pointer("/entries/0/content"),
+        Some(&json!("new embedded lore"))
+    );
+    assert_eq!(
+        world_repository
+            .get_world_info("Old Lore", false)
+            .await
+            .expect("read original world"),
+        Some(current_world)
+    );
+    assert_eq!(
+        read_stored_card(&root, "Preserved")
+            .await
+            .pointer("/data/extensions/world"),
+        Some(&json!("Old Lore"))
+    );
 
     let _ = fs::remove_dir_all(root).await;
 }

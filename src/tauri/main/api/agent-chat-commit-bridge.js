@@ -4,7 +4,7 @@ import { assertCurrentChat } from './agent-chat-identity.js';
 import {
     assertActiveAgentMessage,
     captureMessageTarget,
-    emitGeneratedMessageEvents,
+    finalizeGeneratedMessage,
     getActiveMessageId,
     initialCommitSaveType,
     isAutoCommitTextPath,
@@ -185,7 +185,7 @@ async function handleChatCommitRequested({ state, event, safeInvoke, readWorkspa
                 fromStreaming: firstPublishedOutput,
             });
             if (firstPublishedOutput) {
-                await emitLiveMessageEventsOnce(state, script, messageId, payload.generationType);
+                await finalizeLiveMessage(state, script, messageId, payload.generationType);
             }
         }
 
@@ -254,6 +254,9 @@ function applyLiveProjectionUpdate(state, update) {
             scheduleLiveWriteFrame(state);
             return;
         }
+        case 'reasoningReplace':
+        case 'reasoningAppend':
+        case 'reasoningRemove':
         case 'remove':
             // Removal means the live projection no longer owns this call. It
             // does not revoke content the user has already received.
@@ -371,15 +374,15 @@ async function finalizeLivePartial(state) {
         fromStreaming: firstPublishedOutput,
     });
     if (firstPublishedOutput) {
-        await emitLiveMessageEventsOnce(state, script, messageId, state.generationType);
+        await finalizeLiveMessage(state, script, messageId, state.generationType);
     }
     await state.persistChat(script, CHAT_COMMIT_REASON.GENERATION_CHECKPOINT);
     state.current = null;
 }
 
-async function emitLiveMessageEventsOnce(state, script, messageId, generationType) {
-    if (state.liveMessageEventsEmitted) return;
-    await emitGeneratedMessageEvents(script, messageId, generationType);
+async function finalizeLiveMessage(state, script, messageId, generationType) {
+    if (state.liveMessageEventsEmitted) return script.finalizeMessageContent(messageId);
+    await finalizeGeneratedMessage(script, messageId, generationType);
     state.liveMessageEventsEmitted = true;
 }
 

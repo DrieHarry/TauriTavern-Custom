@@ -11,7 +11,7 @@ use tokio::task::JoinSet;
 
 use crate::png_card_metadata::read_character_data_from_png_file;
 use tt_adapter_storage_core::file_system::{
-    list_files_with_extension, replace_file_with_fallback, unique_temp_path,
+    list_files_with_extension, replace_file, unique_temp_path,
 };
 use tt_domain::errors::DomainError;
 use tt_domain::models::character::Character;
@@ -282,7 +282,7 @@ impl FileCharacterRepository {
                 error
             ))
         })?;
-        replace_file_with_fallback(&temp_path, &self.shallow_index_path).await
+        replace_file(&temp_path, &self.shallow_index_path).await
     }
 
     async fn scan_shallow_index_entries(

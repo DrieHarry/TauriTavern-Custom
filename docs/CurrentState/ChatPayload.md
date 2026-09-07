@@ -40,6 +40,8 @@ transport 解析完整 JSONL 后直接把同一对象数组交给核心调用方
 
 保存失败必须向调用者传播。不存在局部 patch 失败后静默改走另一条写路径的降级逻辑。
 
+完整提交、导入、metadata extension 更新和备份发布共用 storage-core 的 `persist_file`：完成写入与 flush 后，将原写入句柄交给 helper 执行 `sync_all`，关闭后再严格 rename。备份编码器返回原写入句柄，保留到时间戳设置和内容同步完成。分块传输期间不逐块同步；聊天扩展 JSON store 使用同一发布机制，摘要缓存不强制同步。此保证覆盖文件内容同步和运行时原子替换，不包含 rename 后父目录项的断电持久化。
+
 ## 4. First-class Tool 消息
 
 Legacy Generate 的工具轮直接保存在同一扁平 `chat[]` 中：

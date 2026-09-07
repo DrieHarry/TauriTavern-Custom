@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use tt_adapter_quickjs::QuickJsScriptEngine;
-use tt_adapter_storage_core::FileChatRepository;
 use tt_adapter_storage_core::chat_directory_identity::new_shared_chat_alias_store_for_user_dir;
+use tt_adapter_storage_core::{FileChatRepository, FileSettingsRepository};
 use tt_adapter_storage_core::{FileLlmConnectionRepository, FileMcpServerRepository};
 use tt_adapter_storage_userdata::FileAgentProfileRepository;
 use tt_adapter_storage_userdata::FileAgentRepository;
@@ -38,7 +38,7 @@ use tt_application::dto::character_dto::{
 use tt_application::dto::chat_completion_dto::ChatCompletionGenerateRequestDto;
 use tt_application::errors::ApplicationError;
 use tt_application::services::agent_model_gateway::{
-    AgentModelExchange, AgentModelGateway, AgentToolCallDelta, decode_chat_completion_response,
+    AgentModelExchange, AgentModelGateway, AgentModelStreamDelta, decode_chat_completion_response,
 };
 use tt_application::services::agent_profile_service::{
     AgentProfileResolveInput, AgentProfileService,
@@ -207,9 +207,12 @@ fn agent_runtime_fixture_with_results(
     let skill_service = Arc::new(SkillService::new(Arc::new(FileSkillRepository::new(
         root.join("_tauritavern/skills"),
     ))));
-    let llm_connection_service = Arc::new(LlmConnectionService::new(Arc::new(
-        FileLlmConnectionRepository::new(root.join("_tauritavern/llm-connections")),
-    )));
+    let llm_connection_service = Arc::new(LlmConnectionService::new(
+        Arc::new(FileLlmConnectionRepository::new(
+            root.join("_tauritavern/llm-connections"),
+        )),
+        Arc::new(FileSettingsRepository::new(default_user.clone())),
+    ));
     let prompt_assembly_service = Arc::new(PromptAssemblyService::new(
         profile_service.clone(),
         preset_repository,
@@ -335,6 +338,7 @@ async fn start_contract_agent_run(
             options: AgentStartRunOptionsDto {
                 stream,
                 presentation: Some(presentation),
+                ..Default::default()
             },
         })
         .await
@@ -861,13 +865,10 @@ impl AgentModelGateway for MockAgentModelGateway {
     async fn generate_with_cancel(
         &self,
         request: &AgentModelRequest,
-        on_tool_call_delta: Option<&mut (dyn FnMut(AgentToolCallDelta) + Send)>,
+        on_delta: Option<&mut (dyn FnMut(AgentModelStreamDelta) + Send)>,
         _cancel: watch::Receiver<bool>,
     ) -> Result<AgentModelExchange, ApplicationError> {
-        self.stream_requests
-            .lock()
-            .await
-            .push(on_tool_call_delta.is_some());
+        self.stream_requests.lock().await.push(on_delta.is_some());
         self.requests.lock().await.push((*request).clone());
         let response = self.responses.lock().await.pop_front().ok_or_else(|| {
             ApplicationError::ValidationError(

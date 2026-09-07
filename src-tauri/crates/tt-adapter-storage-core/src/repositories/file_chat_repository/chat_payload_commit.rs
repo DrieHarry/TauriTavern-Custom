@@ -2,6 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::file_system::persist_file;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::fs;
@@ -114,21 +115,6 @@ impl FileChatRepository {
                 "Failed to remove rejected chat commit stage",
             ),
         }
-    }
-
-    async fn strict_publish_chat_payload(
-        stage_path: &Path,
-        target_path: &Path,
-    ) -> Result<(), DomainError> {
-        fs::rename(stage_path, target_path).await.map_err(|error| {
-            tracing::error!(
-                stage = %stage_path.display(),
-                target = %target_path.display(),
-                error = %error,
-                "Failed to publish chat payload",
-            );
-            DomainError::InternalError(format!("Failed to publish chat payload: {error}"))
-        })
     }
 }
 
@@ -303,8 +289,6 @@ impl ChatPayloadCommitRepository for FileChatRepository {
                     "Failed to flush chat commit session {session_id}: {error}"
                 ))
             })?;
-            drop(file);
-
             let actual_size = fs::metadata(&stage_path)
                 .await
                 .map_err(|error| {
@@ -351,7 +335,7 @@ impl ChatPayloadCommitRepository for FileChatRepository {
                 )?;
             }
 
-            Self::strict_publish_chat_payload(&stage_path, &target_path).await?;
+            persist_file(file, &stage_path, &target_path).await?;
             if let Some((epoch, content_signature)) = content_signature {
                 self.record_current_content_signature(&target_path, epoch, content_signature)
                     .await;
@@ -399,29 +383,5 @@ impl ChatPayloadCommitRepository for FileChatRepository {
                 "Failed to abort chat commit session {session_id}: {error}"
             ))),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn chat_commit_missing_stage_never_guesses_success_from_target_size() {
-        let root = std::env::temp_dir().join(format!(
-            "tauritavern-chat-strict-publish-{}",
-            Uuid::new_v4()
-        ));
-        fs::create_dir_all(&root).await.expect("create temp root");
-        let stage = root.join("missing-stage");
-        let target = root.join("target");
-        fs::write(&target, b"old").await.expect("write target");
-
-        FileChatRepository::strict_publish_chat_payload(&stage, &target)
-            .await
-            .expect_err("a missing stage must remain a failed publish");
-        assert_eq!(fs::read(&target).await.expect("read target"), b"old");
-
-        fs::remove_dir_all(root).await.expect("remove temp root");
     }
 }

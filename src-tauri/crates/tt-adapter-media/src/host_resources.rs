@@ -669,7 +669,7 @@ mod tests {
                 relative_path: Path::new("a.bin"),
             })
             .expect("open old");
-        tt_adapter_storage_core::file_system::replace_file_with_fallback_sync(&replacement, &file)
+        tt_adapter_storage_core::file_system::replace_file_blocking(&replacement, &file)
             .expect("replace path");
 
         assert_eq!(opened.metadata.content_length, 3);

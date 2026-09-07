@@ -1,5 +1,4 @@
 mod endpoint_url;
-mod file_replace;
 mod http_chat_completion_repository;
 mod http_embedding_repository;
 mod http_error;

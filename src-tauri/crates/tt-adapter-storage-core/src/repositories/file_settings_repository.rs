@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 
 use crate::file_system::{
-    list_files_with_extension, read_json_file, write_json_file, write_json_file_sync,
+    list_files_with_extension, persist_json_file, persist_json_file_blocking, read_json_file,
 };
 use crate::preset_file_naming::load_named_preset_files;
 use crate::sillytavern_sorting::{
@@ -100,7 +100,7 @@ impl FileSettingsRepository {
         &self,
         settings: &TauriTavernSettings,
     ) -> Result<(), DomainError> {
-        write_json_file_sync(&self.tauritavern_settings_file, settings)
+        persist_json_file_blocking(&self.tauritavern_settings_file, settings)
     }
 
     async fn ensure_directory_exists(&self) -> Result<(), DomainError> {
@@ -296,7 +296,7 @@ impl SettingsRepository for FileSettingsRepository {
     ) -> Result<(), DomainError> {
         self.ensure_directory_exists().await?;
 
-        write_json_file(&self.tauritavern_settings_file, settings).await?;
+        persist_json_file(&self.tauritavern_settings_file, settings).await?;
         Ok(())
     }
 
@@ -328,7 +328,7 @@ impl SettingsRepository for FileSettingsRepository {
             "Saving user settings to {}",
             self.user_settings_file.display()
         );
-        write_json_file(&self.user_settings_file, settings).await?;
+        persist_json_file(&self.user_settings_file, settings).await?;
         Ok(())
     }
 
@@ -353,7 +353,7 @@ impl SettingsRepository for FileSettingsRepository {
         let snapshot_file = snapshots_dir.join(format!("settings_{}.json", timestamp));
 
         tracing::info!("Creating settings snapshot: {}", snapshot_file.display());
-        write_json_file(&snapshot_file, &settings).await?;
+        persist_json_file(&snapshot_file, &settings).await?;
 
         Ok(())
     }

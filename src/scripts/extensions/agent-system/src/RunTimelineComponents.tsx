@@ -6,20 +6,17 @@ import type {
     TimelineDetailAction,
     TimelineDetailSection,
     TimelineItem,
-    TimelineLiveContent,
     TimelineViewport,
     TimelineVirtualWindow,
 } from './RunTimelineContract';
 import { readTimelineViewport } from './RunTimelineDom';
+import { RunTimelineDetailNav } from './RunTimelineDetailNav';
 import {
     subAgentStatusLabel,
     subAgentTaskStyle,
     subAgentTaskTone,
-    timelineItemShortLabel,
-    timelineItemTime,
-    timelineItemTitle,
 } from './run-timeline-display';
-import { timelineItemHeightPx, timelineItemRowSpan } from './run-timeline-virtual-list';
+import { RunTimelineEvent } from './RunTimelineEvent';
 
 const HISTORY_TOP_LOAD_THRESHOLD_PX = 72;
 
@@ -34,6 +31,7 @@ export type TimelineEventListProps = {
     emptyText: string;
     items: readonly TimelineItem[];
     virtualItems: TimelineVirtualWindow;
+    live?: { items: readonly TimelineItem[]; onToggle: (id: string) => void };
     selectedSeq: number | null;
     latestSeq: number | null;
     activeSeq: number | null;
@@ -48,6 +46,19 @@ export function RunTimelineEventList(props: TimelineEventListProps) {
         onTopReached,
         onViewport,
     } = props;
+
+    const live = props.live;
+    function renderItem(item: TimelineItem, onActivate: () => void) {
+        return <RunTimelineEvent
+            key={item.id}
+            item={item}
+            tr={props.tr}
+            selected={props.selectedSeq === item.seq}
+            latest={props.latestSeq === item.seq}
+            active={props.activeSeq === item.seq}
+            onActivate={onActivate}
+        />;
+    }
 
     useEffect(() => {
         const scroller = scrollerRef.current;
@@ -87,66 +98,7 @@ export function RunTimelineEventList(props: TimelineEventListProps) {
                             aria-hidden="true"
                         ></li>
                     )}
-                    {props.virtualItems.items.map(item => {
-                        const selected = props.selectedSeq != null && props.selectedSeq === item.seq;
-                        const latest = props.latestSeq != null && props.latestSeq === item.seq;
-                        const active = props.activeSeq != null && props.activeSeq === item.seq;
-                        const live = item.live;
-                        const time = timelineItemTime(item);
-                        const style = {
-                            '--ttas-run-event-item-height': `${timelineItemHeightPx(item)}px`,
-                        } as CSSProperties;
-                        return (
-                            <li
-                                key={item.id}
-                                className={[
-                                    'ttas-run-event',
-                                    `tone-${item.tone}`,
-                                    `kind-${item.kind}`,
-                                    latest && 'is-latest',
-                                    active && 'is-active',
-                                    selected && 'is-selected',
-                                    live && 'is-live',
-                                ].filter(Boolean).join(' ')}
-                                data-ttas-kind={item.kind}
-                                data-ttas-row-span={timelineItemRowSpan(item)}
-                                aria-live={live ? 'off' : undefined}
-                                style={style}
-                            >
-                                <button type="button" onClick={() => props.onSelect(item)}>
-                                    <span className="ttas-run-event-icon" aria-hidden="true">
-                                        <i className={`fa-solid ${item.icon}`}></i>
-                                    </span>
-                                    <span className="ttas-run-event-copy">
-                                        <span className="ttas-run-event-title">
-                                            {timelineItemTitle(item, props.tr)}
-                                            {live && <TimelineLiveMetric live={live} tr={props.tr} />}
-                                            {active && (
-                                                <span className="ttas-run-ellipsis" aria-hidden="true">
-                                                    <i>.</i><i>.</i><i>.</i>
-                                                </span>
-                                            )}
-                                        </span>
-                                        {!live && item.summary && <small>{item.summary}</small>}
-                                    </span>
-                                    <span className="ttas-run-event-meta">
-                                        <em>{timelineItemShortLabel(item, props.tr)}</em>
-                                        {time && <time>{time}</time>}
-                                    </span>
-                                    {live && (
-                                        <span className={`ttas-run-event-live is-${live.streamTone}`} aria-hidden="true">
-                                            <code
-                                                className="ttas-run-event-live-stream"
-                                                data-ttas-truncated={live.truncated ? '' : undefined}
-                                            >
-                                                {live.tail}
-                                            </code>
-                                        </span>
-                                    )}
-                                </button>
-                            </li>
-                        );
-                    })}
+                    {props.virtualItems.items.map(item => renderItem(item, () => props.onSelect(item)))}
                     {props.virtualItems.bottomPadding > 0 && (
                         <li
                             className="ttas-run-event-spacer"
@@ -154,27 +106,10 @@ export function RunTimelineEventList(props: TimelineEventListProps) {
                             aria-hidden="true"
                         ></li>
                     )}
+                    {live?.items.map(item => renderItem(item, () => live.onToggle(item.id)))}
                 </ol>
             )}
         </div>
-    );
-}
-
-function TimelineLiveMetric({ live, tr }: { live: TimelineLiveContent; tr: AgentSystemTr }) {
-    if (live.addedWords === 0 && live.removedWords === 0) return null;
-    if (live.toolId === 'builtin:workspace.apply_patch') {
-        return (
-            <em className="ttas-run-event-live-metric">
-                (<span className="is-added">+{tr('timelineWordCount', { count: live.addedWords })}</span>
-                {' / '}
-                <span className="is-removed">-{tr('timelineWordCount', { count: live.removedWords })}</span>)
-            </em>
-        );
-    }
-    return (
-        <em className="ttas-run-event-live-metric">
-            +{tr('timelineWordCount', { count: live.addedWords })}
-        </em>
     );
 }
 
@@ -184,7 +119,10 @@ export type TimelineDetailPaneProps = {
     ariaLabel: string;
     title: string;
     type: string;
-    navItems: readonly TimelineItem[];
+    items: readonly TimelineItem[];
+    hasMoreBefore: boolean;
+    loadingOlder: boolean;
+    onLoadOlder: () => Promise<boolean>;
     selectedSeq: number | null;
     loading: boolean;
     error: string;
@@ -216,26 +154,16 @@ export function RunTimelineDetailPane(props: TimelineDetailPaneProps) {
                 </div>
             </div>
 
-            {props.navItems.length > 1 && (
-                <div className="ttas-run-detail-nav">
-                    <div className="ttas-run-nav-list">
-                        {props.navItems.map(item => (
-                            <button
-                                key={`nav-${item.id}`}
-                                type="button"
-                                className={props.selectedSeq === item.seq ? 'is-selected' : ''}
-                                title={timelineItemTitle(item, props.tr)}
-                                onClick={(event) => {
-                                    event.stopPropagation();
-                                    props.onSelectNav(item);
-                                }}
-                            >
-                                <i aria-hidden="true"></i>
-                                <span>{timelineItemShortLabel(item, props.tr)}</span>
-                            </button>
-                        ))}
-                    </div>
-                </div>
+            {(props.items.length > 1 || props.hasMoreBefore) && (
+                <RunTimelineDetailNav
+                    items={props.items}
+                    selectedSeq={props.selectedSeq}
+                    hasMoreBefore={props.hasMoreBefore}
+                    loadingOlder={props.loadingOlder}
+                    onLoadOlder={props.onLoadOlder}
+                    onSelect={props.onSelectNav}
+                    tr={props.tr}
+                />
             )}
 
             <div className="ttas-run-detail-scroll">
@@ -321,7 +249,7 @@ export function RunTimelineDetailPane(props: TimelineDetailPaneProps) {
                                                         <span className="ttas-run-diff-gutter" role="cell">{row.oldLine || ''}</span>
                                                         <span className="ttas-run-diff-gutter" role="cell">{row.newLine || ''}</span>
                                                         <span className="ttas-run-diff-marker" role="cell">{row.marker}</span>
-                                                        <code className="ttas-run-diff-code" role="cell">{row.text}</code>
+                                                        <span className="ttas-run-diff-code" role="cell">{row.text}</span>
                                                     </div>
                                                 ))}
                                             </div>

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use crate::png_card_metadata::{read_character_data_from_png, write_character_data_to_png};
-use tt_adapter_storage_core::file_system::{replace_file_with_fallback, unique_temp_path};
+use tt_adapter_storage_core::file_system::{replace_file, unique_temp_path};
 use tt_contracts::client_asset_paths::validate_path_segment;
 use tt_domain::errors::DomainError;
 use tt_domain::models::character::Character;
@@ -619,7 +619,7 @@ impl FileCharacterRepository {
             ))
         })?;
         self.discard_character_read_cache(file_stem).await;
-        replace_file_with_fallback(&temp_path, &target_path).await?;
+        replace_file(&temp_path, &target_path).await?;
 
         Ok(target_path)
     }

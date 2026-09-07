@@ -90,7 +90,7 @@ Flatpak 构建配方位于 `packaging/flatpak/`，软件源发布工具位于
 - `tauri-before-build.mjs`
   统一生成 Tauri 打包所需的前端 bundle；pnpm 启动入口也复用它以覆盖移动端 IDE 构建。
 - `tauri-dev-server.mjs`
-  为 `tauri dev` 提供轻量静态前端服务器、页面刷新通道与开发态 Service Worker 会话 bootstrap，避免普通前端文件变化污染 Rust 编译指纹。
+  为 `tauri dev` 提供轻量静态前端服务器、页面刷新通道与开发态 Service Worker 会话 bootstrap。静态文件通过 `@parcel/watcher` 的原生事件监听，Rspack 依赖在成功重编译后刷新。
 - `check-frontend-guardrails.mjs`
   校验前端宿主层文件规模和依赖边界，避免 Host Kernel 持续膨胀。对应 `pnpm run check:frontend`。
 - `tauri-ios-xcode-script.sh`
