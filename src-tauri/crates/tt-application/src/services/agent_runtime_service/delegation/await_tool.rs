@@ -2,18 +2,17 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::rendering::{DelegatedResultContinuationHint, render_await_content};
 use super::task_status::task_is_terminal;
-use super::tool_error::tool_error_outcome;
 use crate::errors::ApplicationError;
 use crate::services::agent_runtime_service::{
     AgentCancelReceiver, AgentRuntimeService, PreparedInvocation,
 };
 use crate::services::agent_tools::{AgentToolDispatchOutcome, AgentToolEffect};
 use tt_domain::models::agent::{
-    AgentRunEventLevel, AgentTaskRecord, AgentTaskStatus, AgentToolResult, WorkspacePath,
+    AgentRunEventLevel, AgentTaskRecord, AgentTaskStatus, AgentToolResult,
 };
 use tt_domain::models::tool::ToolInvocation;
 
@@ -68,6 +67,7 @@ impl AgentRuntimeService {
         &self,
         prepared: &PreparedInvocation,
         call: &ToolInvocation,
+        args: &Map<String, Value>,
         committed_count: usize,
         cancel: &mut AgentCancelReceiver,
     ) -> Result<AgentToolDispatchOutcome, ApplicationError> {
@@ -76,13 +76,13 @@ impl AgentRuntimeService {
         let profile = &prepared.profile;
         let parent_tools = &prepared.request.tools;
         let started = Instant::now();
-        let args = match serde_json::from_value::<AgentAwaitArgs>(call.arguments.clone()) {
+        let args = match serde_json::from_value::<AgentAwaitArgs>(Value::Object(args.clone())) {
             Ok(args) => args,
             Err(error) => {
-                return Ok(tool_error_outcome(
+                return Ok(AgentToolDispatchOutcome::error(
                     call,
                     "tool.invalid_arguments",
-                    &format!("invalid agent.await arguments: {error}"),
+                    &format!("invalid arguments: {error}"),
                     started.elapsed().as_millis(),
                 ));
             }
@@ -90,7 +90,7 @@ impl AgentRuntimeService {
         let mode = args.mode.unwrap_or(AgentAwaitMode::NextCompleted);
         let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_AGENT_AWAIT_TIMEOUT_MS);
         if timeout_ms > MAX_AGENT_AWAIT_TIMEOUT_MS {
-            return Ok(tool_error_outcome(
+            return Ok(AgentToolDispatchOutcome::error(
                 call,
                 "tool.invalid_arguments",
                 &format!("timeoutMs must be <= {MAX_AGENT_AWAIT_TIMEOUT_MS}"),
@@ -100,7 +100,7 @@ impl AgentRuntimeService {
         let selected_ids = match normalize_task_ids(args.task_ids) {
             Ok(ids) => ids,
             Err(message) => {
-                return Ok(tool_error_outcome(
+                return Ok(AgentToolDispatchOutcome::error(
                     call,
                     "tool.invalid_arguments",
                     &message,
@@ -125,7 +125,14 @@ impl AgentRuntimeService {
         let scheduler = self.active_run_handle(run_id).await?.scheduler.clone();
         let mut task_events = scheduler.subscribe();
         let (tasks, timed_out) = loop {
-            self.ensure_not_cancelled(cancel)?;
+            if *cancel.borrow() {
+                return Ok(AgentToolDispatchOutcome::error(
+                    call,
+                    "agent.await_interrupted",
+                    "Waiting ended because this run stopped. Query the delegated tasks again after resuming.",
+                    started.elapsed().as_millis(),
+                ));
+            }
             let tasks = match self
                 .selected_child_tasks(run_id, invocation_id, selected_ids.as_ref())
                 .await
@@ -134,7 +141,7 @@ impl AgentRuntimeService {
                 Err(ApplicationError::ValidationError(message))
                     if message.contains("agent.await_task_not_found") =>
                 {
-                    return Ok(tool_error_outcome(
+                    return Ok(AgentToolDispatchOutcome::error(
                         call,
                         "agent.await_task_not_found",
                         &message,
@@ -144,7 +151,7 @@ impl AgentRuntimeService {
                 Err(error) => return Err(error),
             };
             if tasks.is_empty() {
-                return Ok(tool_error_outcome(
+                return Ok(AgentToolDispatchOutcome::error(
                     call,
                     "agent.no_child_tasks",
                     "No delegated tasks are selected.",
@@ -167,7 +174,6 @@ impl AgentRuntimeService {
                 _ = tokio::time::sleep(remaining) => {}
                 changed = cancel.changed() => {
                     let _ = changed;
-                    self.ensure_not_cancelled(cancel)?;
                 }
             }
         };
@@ -201,19 +207,11 @@ impl AgentRuntimeService {
         )
         .await?;
 
-        Ok(AgentToolDispatchOutcome {
-            result: AgentToolResult {
-                call_id: call.call_id.clone(),
-                tool_id: call.tool_id.clone(),
-                content,
-                structured,
-                is_error: false,
-                error_code: None,
-                resource_refs: Vec::new(),
-            },
-            effect: AgentToolEffect::None,
-            elapsed_ms: started.elapsed().as_millis(),
-        })
+        Ok(AgentToolDispatchOutcome::new(
+            AgentToolResult::ok(call, content, structured),
+            AgentToolEffect::None,
+            started.elapsed().as_millis(),
+        ))
     }
 
     async fn selected_child_tasks(
@@ -254,35 +252,26 @@ impl AgentRuntimeService {
     ) -> Result<Vec<AwaitTaskView>, ApplicationError> {
         let mut views = Vec::with_capacity(tasks.len());
         for task in tasks {
-            let result = match task.result_ref.as_ref() {
-                Some(path) => {
-                    let path = WorkspacePath::parse(path)?;
-                    let file = self.workspace_repository.read_text(run_id, &path).await?;
-                    Some(serde_json::from_str::<Value>(&file.text).map_err(|error| {
-                        ApplicationError::ValidationError(format!(
-                            "agent.await_result_invalid: result `{}` is invalid JSON: {error}",
-                            path.as_str()
-                        ))
-                    })?)
-                }
-                None => None,
+            let result = self.read_task_result(run_id, task).await?;
+            let output_field = |key| {
+                result
+                    .as_ref()
+                    .and_then(|result| result.output.get(key))
+                    .filter(|value| !value.is_null())
+                    .cloned()
             };
             views.push(AwaitTaskView {
                 task_id: task.id.clone(),
                 agent_id: task.target_profile_id.clone(),
                 status: task.status,
                 error: task.error.clone(),
-                summary: result_summary(result.as_ref()),
-                confidence: result_payload_field(result.as_ref(), "confidence"),
-                artifacts: result_payload_field(result.as_ref(), "artifacts"),
-                findings: result_payload_field(result.as_ref(), "findings"),
-                warnings: result_payload_field(result.as_ref(), "warnings"),
-                suggested_next_actions: result_payload_field(
-                    result.as_ref(),
-                    "suggestedNextActions",
-                ),
-                questions_for_caller: result_payload_field(result.as_ref(), "questionsForCaller")
-                    .or_else(|| result_payload_field(result.as_ref(), "questionsForParent")),
+                summary: result.as_ref().map(|result| result.summary.clone()),
+                confidence: output_field("confidence"),
+                artifacts: output_field("artifacts"),
+                findings: output_field("findings"),
+                warnings: output_field("warnings"),
+                suggested_next_actions: output_field("suggestedNextActions"),
+                questions_for_caller: output_field("questionsForCaller"),
             });
         }
         Ok(views)
@@ -355,21 +344,4 @@ fn await_condition_met(tasks: &[AgentTaskRecord], mode: AgentAwaitMode) -> bool 
         AgentAwaitMode::NextCompleted => tasks.iter().any(|task| task_is_terminal(task.status)),
         AgentAwaitMode::AllCompleted => tasks.iter().all(|task| task_is_terminal(task.status)),
     }
-}
-
-fn result_summary(result_doc: Option<&Value>) -> Option<String> {
-    result_doc
-        .and_then(|result| result.get("summary"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|summary| !summary.is_empty())
-        .map(str::to_string)
-}
-
-fn result_payload_field(result_doc: Option<&Value>, key: &str) -> Option<Value> {
-    result_doc
-        .and_then(|result| result.get("result"))
-        .and_then(|result| result.get(key))
-        .filter(|value| !value.is_null())
-        .cloned()
 }

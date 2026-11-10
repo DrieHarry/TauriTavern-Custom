@@ -8,6 +8,7 @@ use tt_ports::repositories::chat_completion_repository::{
 };
 
 use super::custom_api_format::CustomApiFormat;
+use super::opencode::{self, OpenCodeApiFormat};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatCompletionProviderFormat {
@@ -42,10 +43,30 @@ impl ChatCompletionProviderFormat {
                 CustomApiFormat::OpenAiResponses => Self::OpenAiResponses,
                 CustomApiFormat::ClaudeMessages => Self::ClaudeMessages,
                 CustomApiFormat::GeminiInteractions => Self::GeminiInteractions,
+                CustomApiFormat::GeminiGenerateContent => Self::Gemini,
+            });
+        }
+
+        if source == ChatCompletionSource::OpenCode {
+            return Ok(match opencode::format_from_payload(payload)? {
+                OpenCodeApiFormat::OpenAiCompat => Self::OpenAiCompatible,
+                OpenCodeApiFormat::OpenAiResponses => Self::OpenAiResponses,
+                OpenCodeApiFormat::ClaudeMessages => Self::ClaudeMessages,
+                OpenCodeApiFormat::Gemini => Self::Gemini,
             });
         }
 
         Ok(match source {
+            ChatCompletionSource::OpenAi
+                if payload
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .is_some_and(|model| {
+                        model.starts_with("gpt-6-") || model.starts_with("gpt-6.")
+                    }) =>
+            {
+                Self::OpenAiResponses
+            }
             ChatCompletionSource::Claude => Self::ClaudeMessages,
             ChatCompletionSource::AwsBedrock if is_bedrock_claude_payload(payload) => {
                 Self::ClaudeMessages

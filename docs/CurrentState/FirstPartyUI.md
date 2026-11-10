@@ -1,12 +1,13 @@
 # First-party UI 当前架构
 
-本文说明 TauriTavern 自有前端的现行架构与维护边界。SillyTavern 1.18.0 仍拥有页面、扩展加载和全局生命周期；TauriTavern 只在既有页面中挂载独立的 React client island，不建立第二套页面壳或路由。
+本文说明 TauriTavern 自有前端的现行架构与维护边界。SillyTavern 前端仍拥有页面、扩展加载和全局生命周期；TauriTavern 只在既有页面中挂载独立的 React client island，不建立第二套页面壳或路由。
 
 ## 1. 范围
 
 First-party UI 包含：
 
 - Agent System；
+- In-App Assistant；
 - MCP Manager；
 - Tauri Settings、Dev Logs 与 Sync。
 
@@ -35,6 +36,7 @@ Rspack 直接拥有以下 TypeScript/TSX 源码：
 
 ```text
 src/scripts/extensions/agent-system/src
+src/scripts/extensions/in-app-agent/src
 src/scripts/extensions/mcp-manager/src
 src/scripts/tauri/setting/settings-app
 src/scripts/tauri/setting/dev-logs-app
@@ -46,12 +48,17 @@ src/scripts/tauri/setting/sync-app
 | 功能 | Rspack entry | 输出 | 加载方 |
 | --- | --- | --- | --- |
 | Agent System | `agent-system/src/index.tsx` | `agent-system/dist/index.bundle.js` | Agent manifest |
+| In-App Assistant | `in-app-agent/src/index.ts` | `in-app-agent/dist/index.bundle.js`、`index.bundle.css` | Assistant manifest |
 | MCP Manager | `mcp-manager/src/index.tsx` | `mcp-manager/dist/index.bundle.js` | MCP manifest |
 | Settings | `settings-app/SettingsApp.tsx` | `setting/dist/settings.bundle.js` | `setting-panel/settings-popup.js` |
 | Dev Logs | `dev-logs-app/DevLogsApp.tsx` | `setting/dist/dev-logs.bundle.js` | `setting/dev-logs.js` |
 | Sync | `sync-app/index.ts` | `setting/dist/sync.bundle.js` | Sync popup 与 listener 外壳 |
 
+In-App Assistant 的 manifest 加载构建生成的 `dist/index.bundle.css`，因为光标样式要从 app-use 包导入；Agent System 与 MCP Manager 的 manifest 直接加载 `style.css`。所以改了助手的 `style.css`，要经 rspack 重新构建才会生效。
+
 本地 TS/TSX 模块使用无扩展名相对 import。显式 `.js` import 只指向磁盘上真实存在、由浏览器执行的 JavaScript 模块。
+
+[app-use](../../packages/app-use/README.md) 是例外：它的相对 import 写显式 `.ts`，构建时由 TypeScript 改写为 `.js`。包用自己的 tsconfig（NodeNext）做类型检查和 lint。TT 直接 import 包的源码，所以 `tsconfig.ui.json` 打开了 `allowImportingTsExtensions`。ESLint 按目录显式指定 tsconfig，因为自动查找会用到上游的 `src/jsconfig.json`。
 
 `src/scripts/tauri/setting/*.js` 与 `setting-panel/*.js` 是 WebView 直接加载的宿主适配层。它们拥有 Popup 生命周期、保存/关闭时序、原生事件接线和 bundle 动态导入，因此继续以浏览器 ESM 交付。`format-bytes.js` 同时服务宿主脚本与 TS bundle，并在实现中通过 `// @ts-check` 和 JSDoc 提供类型信息。
 
@@ -67,6 +74,13 @@ Production 与 development 共用 `rspack.config.js` 的 `createRspackConfigs(mo
 - `i18n.ts` 负责翻译与插值，消息 key 由静态 catalog 推导类型。
 - `chat-input-toggle.ts` 与 `embedded-assets-buttons.ts` 是接入上游 DOM 的原生适配器，不创建额外 React root。
 
+### In-App Assistant
+
+- 一个 React island 挂载于原 A 抽屉；SillyTavern 保留外围 DOM 与抽屉行为，隐藏不卸载。
+- `host.ts` 组合公共 API；controller 管理会话、任务与输入草稿，组件管理设置草稿和视图。
+
+启动顺序、消息归属与工具边界见 [应用内助手](InAppAssistant.md)。
+
 ### MCP Manager
 
 - `index.tsx` 负责挂载；`host.ts` 负责 Host 与 SillyTavern 边界。
@@ -76,6 +90,7 @@ Production 与 development 共用 `rspack.config.js` 的 `createRspackConfigs(mo
 
 - Raw Settings 外壳创建 Popup、读取 Host 数据并向 React root 注入 typed options、actions 与 translator。
 - React root 不读取外壳内部状态；外壳也不依赖 React component instance，只持有公开 mount handle。
+- 扩展菜单快捷入口是设备本地的展示偏好；Raw Settings 外壳复用上游 Popup 管理选择，并由 DOM adapter 投影到既有 `#extensionsMenu`，不新增 React root 或后端设置。
 - 三个功能共享同一 Rspack compiler，但保持独立 bundle 和独立生命周期。
 
 ## 5. 宿主调用契约
@@ -105,16 +120,21 @@ Agent 与 MCP 由 manifest 加载后自行启动。它们的外部契约是 mani
 
 ## 7. 测试与开发
 
-Rstest、Testing Library 与 `happy-dom` 覆盖组件交互、controller 行为、订阅生命周期和稳定边界。Node contract tests 覆盖 Host ABI 与浏览器 JavaScript 集成；Rust tests 覆盖后端领域和适配器行为。
+需要 DOM 的测试由 Rstest 在 Chromium 和 WebKit 中各运行一次，也就是发布端 WebView 的两种引擎；纯 Node 逻辑由 node:test 运行（`tests/*.test.mjs`），Rust tests 覆盖后端领域和适配器行为。
 
-`happy-dom` 不提供真实布局、滚动和平台 WebView 行为。涉及 pointer、focus、native dialog、scroll anchor、移动端 viewport 或主题级联的改动，还需要在真实 Tauri WebView 中验证。
+- 第一方组件测试与源码放在一起；宿主 JavaScript 的测试位于 `tests/webview/`。
+- 测试按产品的方式加载代码：产品中打包的代码由 Rstest 打包；WebView 原生加载的宿主 JavaScript 从测试服务器按 URL 导入，不打包也不 mock，依赖整个应用的模块在应用帧中运行。入口见 `tests/helpers/frontend.mjs`。
+- 依赖布局的测试加载组件样式，并在挂载前给容器真实尺寸。
+- 测试之间的清理与还原由 `rstest.config.mjs` 统一负责。
 
-常用命令：
+移动端 viewport、软键盘、主题级联和平台权限属于 WebView 嵌入层，仍需在 Tauri WebView 中验证。
+
+首次运行前安装浏览器：`pnpm exec playwright install chromium webkit`。常用命令：
 
 ```bash
 pnpm run check:types
 pnpm run check:lint
-pnpm run test:ui
+pnpm run test:dom
 pnpm run web:build
 pnpm run check
 ```

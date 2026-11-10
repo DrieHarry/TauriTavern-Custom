@@ -20,6 +20,7 @@ import {
     resolvePromptOrderFromDomIdentifiers,
 } from './prompt-manager-order-utils.js';
 import { createLatestTaskScheduler } from './util/latest-task-scheduler.js';
+import { getMountedCodeMirrorEditor, mountCodeMirrorEditor } from './tauri/codemirror-editor.js';
 
 function debouncePromise(func, delay) {
     let timeoutId;
@@ -303,10 +304,30 @@ export class PromptCollection {
     }
 }
 
+/**
+ * @param {string} html
+ * @returns {DocumentFragment}
+ */
+function parseHtml(html) {
+    const template = document.createElement('template');
+    template.innerHTML = html;
+    return template.content;
+}
+
 class PromptManager {
     #isVisible = false;
-    #dryRunPending = false;
+    #previewPending = false;
+    /** A skipped UI refresh is applied when the panel becomes visible. */
+    #uiStale = false;
+    /**
+     * Bumped on every UI render. Renders are async and may overlap (e.g. the
+     * immediate preview and the debounced refresh); a render whose generation
+     * is no longer current must stop writing to the DOM after each await.
+     */
+    #renderGeneration = 0;
     #visibilityObserver = null;
+    /** The markup each rendered part was built from; a part is rebuilt only when its markup changes. */
+    #renderedMarkup = new WeakMap();
 
     get promptSources() {
         return {
@@ -467,7 +488,9 @@ class PromptManager {
 
             counts[promptID] = null;
             promptOrderEntry.enabled = !promptOrderEntry.enabled;
-            this.render();
+
+            this.#renderListRows();
+            this.renderDebounced();
             this.saveServiceSettings();
         };
 
@@ -508,7 +531,7 @@ class PromptManager {
             this.detachPrompt(prompt, this.activeCharacter);
             this.hidePopup();
             this.clearEditForm();
-            this.render();
+            this.renderNowAndRefresh();
             this.saveServiceSettings();
         };
 
@@ -533,7 +556,7 @@ class PromptManager {
 
             this.hidePopup();
             this.clearEditForm();
-            this.render();
+            this.renderNowAndRefresh();
             this.saveServiceSettings();
         };
 
@@ -602,6 +625,7 @@ class PromptManager {
             forbidOverridesField.checked = prompt.forbid_overrides ?? false;
             forbidOverridesBlock.style.visibility = this.overridablePrompts.includes(prompt.identifier) ? 'visible' : 'hidden';
             promptField.disabled = prompt.marker ?? false;
+            getMountedCodeMirrorEditor(promptField)?.reset();
             entrySourceBlock.style.display = isPulledPrompt ? '' : 'none';
 
             if (isPulledPrompt) {
@@ -618,7 +642,7 @@ class PromptManager {
 
             if (prompt) {
                 this.appendPrompt(prompt, this.activeCharacter);
-                this.render();
+                this.renderNowAndRefresh();
                 this.saveServiceSettings();
             }
         };
@@ -639,7 +663,7 @@ class PromptManager {
 
                     this.hidePopup();
                     this.clearEditForm();
-                    this.render();
+                    this.renderNowAndRefresh();
                     this.saveServiceSettings();
                 }
             });
@@ -746,41 +770,49 @@ class PromptManager {
                     this.removePromptOrderForCharacter(this.activeCharacter);
                     this.addPromptOrderForCharacter(this.activeCharacter, promptManagerDefaultPromptOrder);
 
-                    this.render();
+                    this.renderNowAndRefresh();
                     this.saveServiceSettings();
                 });
         };
 
         // Fill quick edit fields for the first time
         if ('global' === this.configuration.promptOrder.strategy) {
-            const handleQuickEditSave = (event) => {
-                const promptId = event.target.dataset.pmPrompt;
+            const saveQuickEdit = (textarea) => {
+                const promptId = textarea.dataset.pmPrompt;
                 const prompt = this.getPromptById(promptId);
 
-                prompt.content = event.target.value;
+                prompt.content = textarea.value;
 
                 // Update edit form if present
                 // @see https://developer.mozilla.org/en-US/docs/Web/API/HTMLElement/offsetParent
                 const popupEditFormPrompt = /** @type {HTMLTextAreaElement} */(document.getElementById(this.configuration.prefix + 'prompt_manager_popup_entry_form_prompt'));
                 if (popupEditFormPrompt.offsetParent) {
                     popupEditFormPrompt.value = prompt.content;
+                    getMountedCodeMirrorEditor(popupEditFormPrompt)?.reset();
                 }
 
                 this.log('Saved prompt: ' + promptId);
                 this.saveServiceSettings().then(() => this.render());
             };
 
-            const mainPrompt = this.getPromptById('main');
-            const mainElementId = this.updateQuickEdit('main', mainPrompt);
-            document.getElementById(mainElementId).addEventListener('blur', handleQuickEditSave);
-
-            const nsfwPrompt = this.getPromptById('nsfw');
-            const nsfwElementId = this.updateQuickEdit('nsfw', nsfwPrompt);
-            document.getElementById(nsfwElementId).addEventListener('blur', handleQuickEditSave);
-
-            const jailbreakPrompt = this.getPromptById('jailbreak');
-            const jailbreakElementId = this.updateQuickEdit('jailbreak', jailbreakPrompt);
-            document.getElementById(jailbreakElementId).addEventListener('blur', handleQuickEditSave);
+            for (const identifier of ['main', 'nsfw', 'jailbreak']) {
+                const textarea = /** @type {HTMLTextAreaElement} */(document.getElementById(this.updateQuickEdit(identifier, this.getPromptById(identifier))));
+                textarea.addEventListener('blur', () => {
+                    if (!getMountedCodeMirrorEditor(textarea)) saveQuickEdit(textarea);
+                });
+                textarea.addEventListener('focus', () => {
+                    void mountCodeMirrorEditor(textarea).then(editor => {
+                        if (!editor) return;
+                        editor.wrapper.addEventListener('focusout', event => {
+                            if (event.relatedTarget instanceof Node && editor.wrapper.contains(event.relatedTarget)) return;
+                            editor.flush();
+                            saveQuickEdit(textarea);
+                            editor.destroy();
+                        });
+                        editor.focus();
+                    });
+                });
+            }
         }
 
         // Re-render when chat history changes.
@@ -829,6 +861,8 @@ class PromptManager {
         });
 
         // Prepare prompt edit form buttons
+        const injectionPositionField = document.getElementById(this.configuration.prefix + 'prompt_manager_popup_entry_form_injection_position');
+        injectionPositionField.addEventListener('change', event => this.handleInjectionPositionChange(event));
         document.getElementById(this.configuration.prefix + 'prompt_manager_popup_entry_form_save').addEventListener('click', this.handleSavePrompt);
         document.getElementById(this.configuration.prefix + 'prompt_manager_popup_entry_form_reset').addEventListener('click', this.handleResetPrompt);
 
@@ -857,7 +891,7 @@ class PromptManager {
 
             this.hidePopup();
             this.clearEditForm();
-            this.renderDebounced();
+            this.renderNowAndRefresh();
         });
 
         // Re-render prompt manager on world settings update
@@ -870,39 +904,24 @@ class PromptManager {
         const visibilityTarget = this.containerElement.closest('.drawer-content') ?? this.containerElement;
         this.#visibilityObserver = new IntersectionObserver(([entry]) => {
             this.#isVisible = entry.isIntersecting;
-            if (!this.#isVisible || !this.#dryRunPending) return;
-
-            this.#dryRunPending = false;
-            this.render();
+            if (this.#isVisible && this.#uiStale) this.render(false);
         });
         this.#visibilityObserver.observe(visibilityTarget);
     }
 
-    /**
-     * Get the scroll position of the prompt manager
-     * @returns {number} - Scroll position of the prompt manager
-     */
-    #getScrollPosition() {
-        return document.getElementById(this.configuration.prefix + 'prompt_manager')?.closest('.scrollableInner')?.scrollTop;
-    }
-
-    /**
-     * Set the scroll position of the prompt manager
-     * @param {number} scrollPosition - The scroll position to set
-     */
-    #setScrollPosition(scrollPosition) {
-        if (scrollPosition === undefined || scrollPosition === null) return;
-        document.getElementById(this.configuration.prefix + 'prompt_manager')?.closest('.scrollableInner')?.scrollTo(0, scrollPosition);
-    }
-
     async #renderPromptManagerUi() {
+        if (!this.#isVisible) {
+            this.#uiStale = true;
+            return;
+        }
+
+        this.#uiStale = false;
+        const generation = ++this.#renderGeneration;
         this.profileStart('render');
-        const scrollPosition = this.#getScrollPosition();
         try {
-            await this.renderPromptManager();
+            await this.renderPromptManager(generation);
+            if (generation !== this.#renderGeneration) return;
             await this.renderPromptManagerListItems();
-            this.makeDraggable();
-            this.#setScrollPosition(scrollPosition);
         } finally {
             this.profileEnd('render');
         }
@@ -921,46 +940,44 @@ class PromptManager {
     async #renderAfterTryGenerate() {
         if (!await this.#waitUntilGenerationIsIdle()) return;
 
-        this.error = null;
         this.profileStart('filling context');
         try {
             await this.tryGenerate();
+            this.#previewPending = false;
         } catch (error) {
             this.error = error instanceof Error ? error.message : String(error || t`Unknown error`);
             throw error;
         } finally {
             this.profileEnd('filling context');
-            await this.#renderPromptManagerUi();
+            await this.render(false);
         }
     }
 
-    async #renderWithoutTryGenerate() {
-        if (!await this.#waitUntilGenerationIsIdle()) return;
-        await this.#renderPromptManagerUi();
+    renderNowAndRefresh() {
+        if (main_api !== 'openai') return;
+        this.#previewPending = true;
+        this.render(false);
+        this.renderDebounced();
     }
 
     /**
      * Main rendering function
      *
-     * @param afterTryGenerate - Whether a dry run should be attempted before rendering
+     * @param {boolean} [afterTryGenerate=true] Whether to attempt a dry run before rendering
+     * @returns {Promise<void>|void} UI-only renders can be awaited; dry runs are scheduled.
      */
     render(afterTryGenerate = true) {
         if (main_api !== 'openai') return;
 
         if ('character' === this.configuration.promptOrder.strategy && null === this.activeCharacter) return;
-        this.error = null;
 
         if (afterTryGenerate === true) {
-            if (!this.#isVisible) {
-                this.#dryRunPending = true;
-                return;
-            }
-
+            // Previews also write variables and emit generation events while the panel is hidden.
             this.renderDryRunLatest();
             return;
         }
 
-        void this.#renderWithoutTryGenerate().catch(error => {
+        return this.#renderPromptManagerUi().catch(error => {
             console.error('Prompt manager render failed', error);
         });
     }
@@ -983,6 +1000,7 @@ class PromptManager {
         const attachIndexField = /** @type {HTMLInputElement} */(document.getElementById(this.configuration.prefix + 'prompt_manager_popup_entry_form_attach_index'));
         const attachSideField = /** @type {HTMLSelectElement} */(document.getElementById(this.configuration.prefix + 'prompt_manager_popup_entry_form_attach_side'));
 
+        getMountedCodeMirrorEditor(promptField)?.flush();
         prompt.name = nameField.value;
         prompt.role = roleField.value;
         prompt.content = promptField.value;
@@ -1536,6 +1554,7 @@ class PromptManager {
         const elementId = `${identifier}_prompt_quick_edit_textarea`;
         const textarea = /** @type {HTMLTextAreaElement} */(document.getElementById(elementId));
         textarea.value = prompt.content;
+        getMountedCodeMirrorEditor(textarea)?.reset();
 
         return elementId;
     }
@@ -1586,6 +1605,7 @@ class PromptManager {
         roleField.value = prompt.role || 'system';
         promptField.value = prompt.content ?? '';
         promptField.disabled = prompt.marker ?? false;
+        void mountCodeMirrorEditor(promptField).then(editor => editor?.reset());
         injectionPositionField.value = injectionPosition.toString();
         injectionDepthField.value = (prompt.injection_depth ?? DEFAULT_DEPTH).toString();
         injectionOrderField.value = (prompt.injection_order ?? DEFAULT_ORDER).toString();
@@ -1616,9 +1636,6 @@ class PromptManager {
         } else {
             resetPromptButton.style.display = 'none';
         }
-
-        injectionPositionField.removeEventListener('change', (e) => this.handleInjectionPositionChange(e));
-        injectionPositionField.addEventListener('change', (e) => this.handleInjectionPositionChange(e));
 
         const savePromptButton = document.getElementById(this.configuration.prefix + 'prompt_manager_popup_entry_form_save');
         savePromptButton.dataset.pmPrompt = prompt.identifier;
@@ -1713,6 +1730,7 @@ class PromptManager {
         roleField.selectedIndex = 0;
         promptField.value = '';
         promptField.disabled = false;
+        getMountedCodeMirrorEditor(promptField)?.destroy();
         injectionPositionField.selectedIndex = 0;
         injectionPositionField.removeAttribute('disabled');
         injectionDepthField.value = DEFAULT_DEPTH.toString();
@@ -1798,7 +1816,6 @@ class PromptManager {
      * @param {import('./openai.js').ChatCompletion} chatCompletion
      */
     setChatCompletion(chatCompletion) {
-        this.#dryRunPending = false;
         const messages = chatCompletion.getMessages();
 
         this.setMessages(messages);
@@ -1824,74 +1841,120 @@ class PromptManager {
     }
 
     /**
-     * Empties, then re-assembles the container containing the prompt list.
+     * Brings the header and footer in line with the current state. The list and its sortable are created once.
+     * @param {number} [generation] Render generation; stale renders stop after each await.
      */
-    async renderPromptManager() {
-        let selectedPromptIndex = 0;
-        const existingAppendSelect = document.getElementById(`${this.configuration.prefix}prompt_manager_footer_append_prompt`);
-        if (existingAppendSelect instanceof HTMLSelectElement) {
-            selectedPromptIndex = existingAppendSelect.selectedIndex;
-        }
-        const promptManagerDiv = this.containerElement;
-        promptManagerDiv.innerHTML = '';
-
+    async renderPromptManager(generation = this.#renderGeneration) {
+        const { prefix } = this.configuration;
         const errorDiv = this.error ? `
-                <div class="${this.configuration.prefix}prompt_manager_error">
+                <div class="${prefix}prompt_manager_error">
                     <span class="fa-solid tooltip fa-triangle-exclamation text_danger"></span> ${DOMPurify.sanitize(this.error)}
                 </div>
         ` : '';
 
-        const totalActiveTokens = this.tokenUsage;
+        const totalActiveTokens = this.#previewPending ? '-' : this.tokenUsage;
 
-        const headerHtml = await renderTemplateAsync('promptManagerHeader', { error: this.error, errorDiv, prefix: this.configuration.prefix, totalActiveTokens });
-        promptManagerDiv.insertAdjacentHTML('beforeend', headerHtml);
+        const headerHtml = await renderTemplateAsync('promptManagerHeader', { error: this.error, errorDiv, prefix, totalActiveTokens });
+        if (generation !== this.#renderGeneration) return;
+        const listHeaderHtml = this.listElement ? '' : await renderTemplateAsync('promptManagerListHeader', { prefix });
+        if (generation !== this.#renderGeneration) return;
 
-        this.listElement = promptManagerDiv.querySelector(`#${this.configuration.prefix}prompt_manager_list`);
-
+        let prompts = [];
+        let footerHtml = '';
         if (null !== this.activeCharacter) {
-            const prompts = [...this.serviceSettings.prompts]
+            prompts = [...this.serviceSettings.prompts]
                 .filter(prompt => prompt && !prompt?.system_prompt)
                 .sort((promptA, promptB) => promptA.name.localeCompare(promptB.name));
             const promptsHtml = prompts.reduce((acc, prompt) => acc + `<option value="${prompt.identifier}">${escapeHtml(prompt.name)}</option>`, '');
-
-            if (selectedPromptIndex > 0) {
-                selectedPromptIndex = Math.min(selectedPromptIndex, prompts.length - 1);
-            }
-
-            if (selectedPromptIndex === -1 && prompts.length) {
-                selectedPromptIndex = 0;
-            }
-
-            const rangeBlockDiv = promptManagerDiv.querySelector('.range-block');
-            const headerDiv = promptManagerDiv.querySelector('.completion_prompt_manager_header');
-            const footerHtml = await renderTemplateAsync('promptManagerFooter', { promptsHtml, prefix: this.configuration.prefix });
-            headerDiv.insertAdjacentHTML('afterend', footerHtml);
-            rangeBlockDiv.querySelector('#prompt-manager-reset-character').addEventListener('click', this.handleCharacterReset);
-
-            const footerDiv = rangeBlockDiv.querySelector(`.${this.configuration.prefix}prompt_manager_footer`);
-            footerDiv.querySelector('.menu_button:nth-child(2)').addEventListener('click', this.handleAppendPrompt);
-            footerDiv.querySelector('.caution').addEventListener('click', this.handleDeletePrompt);
-            footerDiv.querySelector('.menu_button:last-child').addEventListener('click', this.handleNewPrompt);
-            footerDiv.querySelector('select').selectedIndex = selectedPromptIndex;
-
-            // Add prompt export dialogue and options
-            footerDiv.querySelector('#prompt-manager-import').addEventListener('click', this.handleImport);
-            footerDiv.querySelector('#prompt-manager-export').addEventListener('click', this.handleFullExport);
+            footerHtml = await renderTemplateAsync('promptManagerFooter', { promptsHtml, prefix });
+            if (generation !== this.#renderGeneration) return;
         }
+
+        const partSelector = part => `:scope > .${prefix}prompt_manager_${part}`;
+        let rangeBlockDiv = this.listElement?.parentElement;
+        if (!rangeBlockDiv) {
+            rangeBlockDiv = parseHtml(headerHtml).querySelector('.range-block');
+            this.listElement = rangeBlockDiv.querySelector(`#${prefix}prompt_manager_list`);
+            this.listElement.innerHTML = listHeaderHtml;
+            this.containerElement.replaceChildren(rangeBlockDiv);
+            this.#renderedMarkup.set(rangeBlockDiv.querySelector(partSelector('header')), headerHtml);
+            this.makeDraggable();
+        }
+
+        // The list's siblings keep their elements; only their content is rebuilt.
+        const headerDiv = rangeBlockDiv.querySelector(partSelector('header'));
+        if (this.#renderedMarkup.get(headerDiv) !== headerHtml) {
+            const templateBlock = parseHtml(headerHtml).querySelector('.range-block');
+            const currentErrorDiv = rangeBlockDiv.querySelector(partSelector('error'));
+            const templateErrorDiv = templateBlock.querySelector(partSelector('error'));
+            if (currentErrorDiv && templateErrorDiv) currentErrorDiv.replaceChildren(...templateErrorDiv.childNodes);
+            else if (templateErrorDiv) rangeBlockDiv.prepend(templateErrorDiv);
+            else currentErrorDiv?.remove();
+            headerDiv.replaceChildren(...templateBlock.querySelector(partSelector('header')).childNodes);
+            this.#renderedMarkup.set(headerDiv, headerHtml);
+        }
+
+        let footerDiv = rangeBlockDiv.querySelector(partSelector('footer'));
+        if ((footerDiv ? this.#renderedMarkup.get(footerDiv) : '') === footerHtml) return;
+        if (!footerHtml) {
+            footerDiv.remove();
+            return;
+        }
+
+        let selectedPromptIndex = footerDiv?.querySelector('select').selectedIndex ?? 0;
+        const templateFooterDiv = parseHtml(footerHtml).firstElementChild;
+        if (footerDiv) {
+            footerDiv.replaceChildren(...templateFooterDiv.childNodes);
+        } else {
+            footerDiv = templateFooterDiv;
+            this.listElement.before(footerDiv);
+        }
+        this.#renderedMarkup.set(footerDiv, footerHtml);
+
+        if (selectedPromptIndex > 0) {
+            selectedPromptIndex = Math.min(selectedPromptIndex, prompts.length - 1);
+        }
+
+        if (selectedPromptIndex === -1 && prompts.length) {
+            selectedPromptIndex = 0;
+        }
+
+        footerDiv.querySelector('#prompt-manager-reset-character').addEventListener('click', this.handleCharacterReset);
+        footerDiv.querySelector('.menu_button:nth-child(2)').addEventListener('click', this.handleAppendPrompt);
+        footerDiv.querySelector('.caution').addEventListener('click', this.handleDeletePrompt);
+        footerDiv.querySelector('.menu_button:last-child').addEventListener('click', this.handleNewPrompt);
+        footerDiv.querySelector('select').selectedIndex = selectedPromptIndex;
+
+        // Add prompt export dialogue and options
+        footerDiv.querySelector('#prompt-manager-import').addEventListener('click', this.handleImport);
+        footerDiv.querySelector('#prompt-manager-export').addEventListener('click', this.handleFullExport);
     }
 
     /**
-     * Empties, then re-assembles the prompt list
+     * Brings the prompt list in line with the current state.
      */
     async renderPromptManagerListItems() {
         if (!this.serviceSettings.prompts) return;
+        this.#renderListRows();
+    }
 
+    /**
+     * Rows follow the list head in prompt order. A row is rebuilt only when its markup outside the
+     * token count changes; the token count is rebuilt on its own.
+     */
+    #renderListRows() {
         const promptManagerList = this.listElement;
-        promptManagerList.innerHTML = '';
-
         const { prefix } = this.configuration;
+        const previewPending = this.#previewPending;
+        const dragHandleClass = isMobile() ? ' ui-sortable-handle' : '';
 
-        let listItemHtml = await renderTemplateAsync('promptManagerListHeader', { prefix });
+        const existingRows = new Map();
+        for (const row of promptManagerList.querySelectorAll(`:scope > .${prefix}prompt_manager_prompt`)) {
+            existingRows.set(row.dataset.pmIdentifier, row);
+        }
+        const rows = [];
+        const newRows = [];
+        const newTokenCells = [];
 
         this.getPromptsForCharacter(this.activeCharacter).forEach(prompt => {
             if (!prompt) return;
@@ -1900,14 +1963,14 @@ class PromptManager {
             const enabledClass = listEntry.enabled ? '' : `${prefix}prompt_manager_prompt_disabled`;
             const draggableClass = `${prefix}prompt_manager_prompt_draggable`;
             const markerClass = prompt.marker ? `${prefix}prompt_manager_marker` : '';
-            const tokens = this.tokenHandler?.getCounts()[prompt.identifier] ?? 0;
+            const tokens = previewPending ? 0 : (this.tokenHandler?.getCounts()[prompt.identifier] ?? 0);
 
             // Warn the user if the chat history goes below certain token thresholds.
             let warningClass = '';
             let warningTitle = '';
 
             const tokenBudget = this.serviceSettings.openai_max_context - this.serviceSettings.openai_max_tokens;
-            if (this.tokenUsage > tokenBudget * 0.8 &&
+            if (!previewPending && this.tokenUsage > tokenBudget * 0.8 &&
                 'chatHistory' === prompt.identifier) {
                 const warningThreshold = this.configuration.warningTokenThreshold;
                 const dangerThreshold = this.configuration.dangerTokenThreshold;
@@ -1973,9 +2036,8 @@ class PromptManager {
             const roleIcon = promptRoles[iconLookup]?.roleIcon || '';
             const roleTitle = promptRoles[iconLookup]?.roleTitle || '';
 
-            listItemHtml += `
-                <li class="${prefix}prompt_manager_prompt ${draggableClass} ${enabledClass} ${markerClass} ${importantClass}" data-pm-identifier="${escapeHtml(prompt.identifier)}">
-                    <span class="drag-handle">☰</span>
+            const rowStart = `<li class="${prefix}prompt_manager_prompt ${draggableClass} ${enabledClass} ${markerClass} ${importantClass}" data-pm-identifier="${escapeHtml(prompt.identifier)}">
+                    <span class="drag-handle${dragHandleClass}">☰</span>
                     <span class="${prefix}prompt_manager_prompt_name" data-pm-name="${encodedName}">
                         ${isMarkerPrompt ? '<span class="fa-fw fa-solid fa-thumb-tack" title="Marker"></span>' : ''}
                         ${isSystemPrompt ? '<span class="fa-fw fa-solid fa-square-poll-horizontal" title="Global Prompt"></span>' : ''}
@@ -1999,29 +2061,60 @@ class PromptManager {
                             </span>
                     </span>
 
-                    <span class="prompt_manager_prompt_tokens" data-pm-tokens="${calculatedTokens}"><span class="${warningClass}" title="${warningTitle}"> </span>${calculatedTokens}</span>
-                </li>
-            `;
+                    `;
+            const tokenCellHtml = `<span class="prompt_manager_prompt_tokens" data-pm-tokens="${calculatedTokens}"><span class="${warningClass}" title="${warningTitle}"> </span>${calculatedTokens}</span>`;
+            const rowEnd = `
+                </li>`;
+
+            const rowHtml = rowStart + rowEnd;
+            const existingRow = existingRows.get(prompt.identifier);
+            existingRows.delete(prompt.identifier);
+            if (existingRow && this.#renderedMarkup.get(existingRow) === rowHtml) {
+                const tokenCell = existingRow.querySelector(':scope > .prompt_manager_prompt_tokens');
+                if (this.#renderedMarkup.get(tokenCell) !== tokenCellHtml) newTokenCells.push({ tokenCell, html: tokenCellHtml });
+                rows.push(existingRow);
+            } else {
+                newRows.push({ index: rows.length, rowHtml, tokenCellHtml, html: rowStart + tokenCellHtml + rowEnd });
+                rows.push(null);
+            }
         });
 
-        promptManagerList.insertAdjacentHTML('beforeend', listItemHtml);
-
-        // Now that the new elements are in the DOM, you can add the event listeners.
-        Array.from(promptManagerList.getElementsByClassName('prompt-manager-detach-action')).forEach(el => {
-            el.addEventListener('click', this.handleDetach);
+        [...parseHtml(newRows.map(row => row.html).join('')).children].forEach((element, i) => {
+            const { index, rowHtml, tokenCellHtml } = newRows[i];
+            rows[index] = element;
+            this.#renderedMarkup.set(element, rowHtml);
+            this.#renderedMarkup.set(element.querySelector(':scope > .prompt_manager_prompt_tokens'), tokenCellHtml);
+            element.querySelector('.prompt-manager-detach-action')?.addEventListener('click', this.handleDetach);
+            element.querySelector('.prompt-manager-inspect-action')?.addEventListener('click', this.handleInspect);
+            element.querySelector('.prompt-manager-edit-action')?.addEventListener('click', this.handleEdit);
+            element.querySelector('.prompt-manager-toggle-action')?.addEventListener('click', this.handleToggle);
         });
 
-        Array.from(promptManagerList.getElementsByClassName('prompt-manager-inspect-action')).forEach(el => {
-            el.addEventListener('click', this.handleInspect);
+        [...parseHtml(newTokenCells.map(cell => cell.html).join('')).children].forEach((element, i) => {
+            const { tokenCell, html } = newTokenCells[i];
+            tokenCell.replaceWith(element);
+            this.#renderedMarkup.set(element, html);
         });
 
-        Array.from(promptManagerList.getElementsByClassName('prompt-manager-edit-action')).forEach(el => {
-            el.addEventListener('click', this.handleEdit);
-        });
-
-        Array.from(promptManagerList.querySelectorAll('.prompt-manager-toggle-action')).forEach(el => {
-            el.addEventListener('click', this.handleToggle);
-        });
+        // Rows already in place are not moved.
+        const kept = new Set(rows);
+        let cursor = promptManagerList.querySelector(`:scope > .${prefix}prompt_manager_list_separator`).nextElementSibling;
+        const skipRemoved = () => {
+            while (cursor && !kept.has(cursor)) {
+                const next = cursor.nextElementSibling;
+                cursor.remove();
+                cursor = next;
+            }
+        };
+        for (const row of rows) {
+            skipRemoved();
+            if (row === cursor) {
+                cursor = cursor.nextElementSibling;
+            } else {
+                promptManagerList.insertBefore(row, cursor);
+            }
+        }
+        skipRemoved();
     }
 
     /**
@@ -2112,7 +2205,8 @@ class PromptManager {
         this.normalizeAgentPromptMarkerDefinitions();
         this.ensureAgentPromptOrderReferences();
         toastr.success(t`Prompt import complete.`);
-        this.saveServiceSettings().then(() => this.render());
+        this.renderNowAndRefresh();
+        this.saveServiceSettings();
     }
 
     /**
@@ -2165,8 +2259,10 @@ class PromptManager {
      */
     makeDraggable() {
         $(`#${this.configuration.prefix}prompt_manager_list`).sortable({
+            appendTo: document.body,
             delay: this.configuration.sortableDelay,
             handle: isMobile() ? '.drag-handle' : null,
+            helper: 'clone',
             items: `.${this.configuration.prefix}prompt_manager_prompt_draggable`,
             update: (event, ui) => {
                 const promptOrder = this.getPromptOrderForCharacter(this.activeCharacter);

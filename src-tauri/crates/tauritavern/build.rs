@@ -1,19 +1,29 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 fn main() {
-    let needs_embedded_resources = needs_embedded_resources();
+    println!("cargo:rustc-check-cfg=cfg(embedded_resources)");
+    let embedded_resources = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android")
+        || std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("ohos");
+    if embedded_resources {
+        println!("cargo:rustc-cfg=embedded_resources");
+    }
+    let needs_embedded_resources =
+        embedded_resources || std::env::var_os("CARGO_FEATURE_PORTABLE").is_some();
+    emit_ios_factory_profile();
 
     // These are the frontend/resource directories that feed generated Rust artifacts.
     println!("cargo:rerun-if-changed=../../../default/content");
+    println!("cargo:rerun-if-changed=../../../default/skills");
     if needs_embedded_resources {
         println!("cargo:rerun-if-changed=../../../src/scripts/templates");
         println!("cargo:rerun-if-changed=../../../src/scripts/extensions");
     }
-    println!("cargo:rerun-if-changed=../../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../../.git/refs");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rerun-if-env-changed=TAURITAVERN_BUILD_BRANCH");
@@ -25,15 +35,60 @@ fn main() {
         panic!("Failed to generate resource artifacts: {}", error);
     }
 
-    tauri_build::build()
+    // `capabilities/pilot/` grants the pilot plugin, which only devtools-pilot builds compile.
+    let capabilities = if std::env::var_os("CARGO_FEATURE_DEVTOOLS_PILOT").is_some() {
+        "./capabilities/**/*.json"
+    } else {
+        "./capabilities/*.json"
+    };
+    println!("cargo:rerun-if-changed=capabilities");
+
+    tauri_build::try_build(
+        tauri_build::Attributes::new()
+            .capabilities_path_pattern(capabilities)
+            .plugin(
+                "speech-synthesis",
+                tauri_build::InlinedPlugin::new().commands(&["initialize", "speak", "cancel"]),
+            ),
+    )
+    .expect("Failed to build Tauri application")
 }
 
-fn needs_embedded_resources() -> bool {
-    std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android")
-        || std::env::var_os("CARGO_FEATURE_PORTABLE").is_some()
+fn emit_ios_factory_profile() {
+    println!("cargo:rerun-if-env-changed=TAURITAVERN_IOS_POLICY_PROFILE");
+    let value = std::env::var("TAURITAVERN_IOS_POLICY_PROFILE").unwrap_or_default();
+    let profile = if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
+        value.trim()
+    } else {
+        ""
+    };
+    match profile {
+        "" | "full" | "ios_internal_full" | "ios_external_beta" => {}
+        _ => panic!("Unsupported TAURITAVERN_IOS_POLICY_PROFILE: {profile:?}"),
+    }
+    println!("cargo:rustc-env=TAURITAVERN_IOS_POLICY_PROFILE={profile}");
 }
 
 fn emit_git_build_metadata() {
+    let head_ref = normalize_git_value(run_git_command(&["symbolic-ref", "--quiet", "HEAD"]));
+    for reference in ["HEAD", "packed-refs"]
+        .into_iter()
+        .chain(head_ref.as_deref())
+    {
+        if let Some(path) =
+            normalize_git_value(run_git_command(&["rev-parse", "--git-path", reference]))
+        {
+            let path = Path::new(&path);
+            if reference == "packed-refs" && !path.exists() {
+                continue;
+            }
+            // A packed branch gets a loose ref on its next commit; watch its parent until then.
+            if let Some(path) = path.ancestors().find(|path| path.exists()) {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
+
     let git_branch = normalize_git_branch(
         std::env::var("TAURITAVERN_BUILD_BRANCH")
             .ok()
@@ -99,16 +154,39 @@ struct ResourceEntry {
 }
 
 fn generate_resource_artifacts(needs_embedded_resources: bool) -> Result<(), Box<dyn Error>> {
-    let content_root = PathBuf::from("../../../default/content");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
-
-    let mut content_files = collect_relative_files(&content_root, &content_root)?;
-    content_files.sort();
-
-    let content_manifest = serde_json::to_string(&content_files)?;
+    let mut manifest = BTreeMap::new();
+    let mut embedded_resources = Vec::new();
+    for root in ["content", "skills"] {
+        let source_root = PathBuf::from("../../../default").join(root);
+        let mut files = collect_relative_files(&source_root, &source_root)?;
+        files.sort();
+        if root == "skills" {
+            let mut digest = Sha256::new();
+            for relative in &files {
+                let bytes = fs::read(source_root.join(relative))?;
+                digest.update((relative.len() as u64).to_le_bytes());
+                digest.update(relative.as_bytes());
+                digest.update((bytes.len() as u64).to_le_bytes());
+                digest.update(bytes);
+            }
+            let digest = digest.finalize()[..8]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            println!("cargo:rustc-env=TAURITAVERN_BUILTIN_SKILLS_DIGEST={digest}");
+        }
+        if needs_embedded_resources {
+            embedded_resources.extend(files.iter().map(|relative| ResourceEntry {
+                virtual_path: format!("default/{root}/{relative}"),
+                source_path: source_root.join(relative),
+            }));
+        }
+        manifest.insert(root, files);
+    }
     write_if_changed(
-        &out_dir.join("default_content_manifest.json"),
-        content_manifest.as_bytes(),
+        &out_dir.join("default_files_manifest.json"),
+        &serde_json::to_vec(&manifest)?,
     )?;
 
     if !needs_embedded_resources {
@@ -117,17 +195,6 @@ fn generate_resource_artifacts(needs_embedded_resources: bool) -> Result<(), Box
 
     let template_root = PathBuf::from("../../../src/scripts/templates");
     let extension_root = PathBuf::from("../../../src/scripts/extensions");
-    let mut embedded_resources = Vec::new();
-    embedded_resources.extend(
-        content_files
-            .iter()
-            .map(|relative| ResourceEntry {
-                virtual_path: format!("default/content/{}", relative),
-                source_path: content_root.join(relative),
-            })
-            .collect::<Vec<_>>(),
-    );
-
     let template_files = collect_relative_files(&template_root, &template_root)?;
     embedded_resources.extend(
         template_files

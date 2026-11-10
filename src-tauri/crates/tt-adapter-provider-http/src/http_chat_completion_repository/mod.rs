@@ -1,33 +1,40 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use serde_json::Value;
 
-use tt_adapter_http::{HttpClientPool, HttpClientProfile};
+use tt_adapter_http::{HttpClientPool, HttpClientProfile, upstream};
 use tt_domain::errors::DomainError;
 use tt_domain::models::endpoint_url::append_endpoint_path;
 use tt_ports::repositories::chat_completion_repository::{
     ChatCompletionApiConfig, ChatCompletionCancelReceiver, ChatCompletionRepository,
-    ChatCompletionRepositoryGenerateResponse, ChatCompletionSource, ChatCompletionStreamSender,
-    ChatCompletionToolCallDelta,
+    ChatCompletionRepositoryGenerateResponse, ChatCompletionSource, ChatCompletionStreamDelta,
+    ChatCompletionStreamSender,
 };
 
 mod aws_bedrock;
 mod claude;
 pub(crate) mod codex;
 mod cohere;
+mod context_overflow;
+mod gemini;
 mod gemini_interactions;
 mod makersuite;
+#[cfg(test)]
+mod makersuite_tests;
 mod normalizers;
 mod openai;
 pub(crate) mod openai_responses;
+mod pollinations;
 mod response_body;
 mod vertexai;
 pub(crate) mod vertexai_auth;
 mod workers_ai;
+mod xai;
 
 #[derive(Debug, Clone, Copy)]
 struct PromptCachePerformanceUsage {
@@ -109,13 +116,6 @@ impl SseEventAccumulator {
         Ok(())
     }
 
-    fn finish<F: FnMut(&[u8]) -> Result<(), DomainError>>(
-        &mut self,
-        on_event: &mut F,
-    ) -> Result<(), DomainError> {
-        self.dispatch(on_event)
-    }
-
     fn dispatch<F: FnMut(&[u8]) -> Result<(), DomainError>>(
         &mut self,
         on_event: &mut F,
@@ -188,15 +188,7 @@ impl HttpChatCompletionRepository {
     }
 
     fn stream_client(&self, config: &ChatCompletionApiConfig) -> Result<Client, DomainError> {
-        if config.user_configured_endpoint
-            && !tt_domain::models::endpoint_url::is_codex_endpoint(&config.base_url)
-        {
-            self.http_clients
-                .user_endpoint_client(HttpClientProfile::ChatCompletionStream, &config.base_url)
-        } else {
-            self.http_clients
-                .client(HttpClientProfile::ChatCompletionStream)
-        }
+        self.client_for_profile(config, HttpClientProfile::ChatCompletionStream)
     }
 
     fn websocket_client(
@@ -305,6 +297,20 @@ impl HttpChatCompletionRepository {
         }
     }
 
+    async fn send_checked(
+        request: RequestBuilder,
+        provider_name: &str,
+        error_context: &str,
+    ) -> Result<reqwest::Response, DomainError> {
+        let response = request.send().await.map_err(upstream::request_failure)?;
+
+        if !response.status().is_success() {
+            return Err(Self::map_error_response(provider_name, response, error_context).await);
+        }
+
+        Ok(response)
+    }
+
     async fn map_error_response(
         provider_name: &str,
         response: reqwest::Response,
@@ -321,9 +327,28 @@ impl HttpChatCompletionRepository {
         body: &str,
         default_message: &str,
     ) -> DomainError {
-        let message = extract_error_message(body, default_message);
+        let body = body.trim();
+        let parsed = serde_json::from_str::<Value>(body).ok();
+        let error = parsed.as_ref().and_then(response_body::provider_error);
+        let message = parsed
+            .as_ref()
+            .and_then(|value| match error {
+                Some(error) => Some(response_body::provider_error_message(error, value)),
+                None => value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+            .unwrap_or_else(|| {
+                if body.is_empty() {
+                    default_message
+                } else {
+                    body
+                }
+                .to_string()
+            });
 
-        match status {
+        let status_error = |message: String| match status {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 DomainError::AuthenticationError(message)
             }
@@ -340,23 +365,16 @@ impl HttpChatCompletionRepository {
                 "{provider_name} endpoint failed with status {}: {message}",
                 status.as_u16()
             )),
-        }
-    }
+        };
 
-    fn map_transport_error(label: &str, error: reqwest::Error) -> DomainError {
-        let failure = crate::http_error::reqwest_transport_failure(&error);
-        tracing::warn!(
-            operation = label,
-            code = %failure.code,
-            category = %failure.category,
-            endpoint = failure.endpoint.as_deref().unwrap_or(""),
-            timeout = error.is_timeout(),
-            connect = error.is_connect(),
-            body = error.is_body(),
-            request = error.is_request(),
-            "upstream transport request failed",
-        );
-        DomainError::upstream_failure(failure)
+        match status {
+            StatusCode::PAYLOAD_TOO_LARGE => context_overflow::context_overflow_error(message),
+            StatusCode::BAD_REQUEST => {
+                let error = error.map_or_else(|| body.to_owned(), Value::to_string);
+                context_overflow::context_overflow_or(error, message, status_error)
+            }
+            _ => status_error(message),
+        }
     }
 
     async fn stream_sse_response(
@@ -393,7 +411,7 @@ impl HttpChatCompletionRepository {
         .await
     }
 
-    pub(crate) async fn stream_sse_response_internal<F>(
+    pub(crate) async fn stream_sse_response_with_hook<F>(
         provider_name: &str,
         response: reqwest::Response,
         sender: ChatCompletionStreamSender,
@@ -429,32 +447,83 @@ impl HttpChatCompletionRepository {
             return Ok(());
         }
 
-        let consume = Self::consume_sse_response(provider_name, response, framing, |payload| {
-            hook(payload)?;
-            let payload = std::str::from_utf8(payload).map_err(|error| {
-                DomainError::InternalError(format!("SSE payload is not valid UTF-8: {error}"))
-            })?;
-            let _ = sender.send(payload.to_string());
-            Ok(())
-        });
+        let consume =
+            Self::consume_sse_response_with_framing(provider_name, response, framing, |payload| {
+                hook(payload)?;
+                let payload = std::str::from_utf8(payload).map_err(|error| {
+                    DomainError::InternalError(format!("SSE payload is not valid UTF-8: {error}"))
+                })?;
+                let _ = sender.send(payload.to_string());
+                Ok(())
+            });
         tokio::pin!(consume);
 
-        loop {
-            tokio::select! {
-                result = &mut consume => return result,
-                changed = cancel.changed() => {
-                    if changed.is_err() {
-                        return consume.await;
-                    }
-                    if *cancel.borrow() {
-                        return Ok(());
-                    }
-                }
-            }
+        tokio::select! {
+            result = &mut consume => result,
+            Ok(_) = cancel.wait_for(|cancelled| *cancelled) => Ok(()),
         }
     }
 
+    async fn stream_sse_response_with_cache_logging(
+        provider_name: &str,
+        model: String,
+        response: reqwest::Response,
+        sender: ChatCompletionStreamSender,
+        cancel: ChatCompletionCancelReceiver,
+    ) -> Result<(), DomainError> {
+        let mut logged = false;
+        Self::stream_sse_response_with_hook(
+            provider_name,
+            response,
+            sender,
+            cancel,
+            move |payload| {
+                if logged {
+                    return Ok(());
+                }
+
+                let has_cache_usage = [
+                    b"cache_read_input_tokens".as_slice(),
+                    b"cache_creation_input_tokens".as_slice(),
+                ]
+                .into_iter()
+                .any(|field| payload.windows(field.len()).any(|window| window == field));
+                if !has_cache_usage {
+                    return Ok(());
+                }
+
+                let Ok(value) = serde_json::from_slice::<Value>(payload) else {
+                    return Ok(());
+                };
+                logged = log_prompt_cache_performance_if_present(
+                    provider_name,
+                    Some(model.as_str()),
+                    &value,
+                );
+                Ok(())
+            },
+        )
+        .await
+    }
+
     async fn consume_sse_response<F>(
+        provider_name: &str,
+        response: reqwest::Response,
+        on_event: F,
+    ) -> Result<(), DomainError>
+    where
+        F: FnMut(&[u8]) -> Result<(), DomainError>,
+    {
+        Self::consume_sse_response_with_framing(
+            provider_name,
+            response,
+            SseDataFraming::EventDelimited,
+            on_event,
+        )
+        .await
+    }
+
+    async fn consume_sse_response_with_framing<F>(
         provider_name: &str,
         mut response: reqwest::Response,
         framing: SseDataFraming,
@@ -468,22 +537,10 @@ impl HttpChatCompletionRepository {
         let endpoint = response.url().clone();
 
         loop {
-            let chunk = response.chunk().await.map_err(|error| {
-                let failure = crate::http_error::reqwest_body_failure(&error, Some(&endpoint));
-                tracing::warn!(
-                    provider = provider_name,
-                    operation = "stream",
-                    code = %failure.code,
-                    category = %failure.category,
-                    endpoint = failure.endpoint.as_deref().unwrap_or(""),
-                    timeout = error.is_timeout(),
-                    connect = error.is_connect(),
-                    body = error.is_body(),
-                    request = error.is_request(),
-                    "upstream stream read failed",
-                );
-                DomainError::upstream_failure(failure)
-            })?;
+            let chunk = response
+                .chunk()
+                .await
+                .map_err(|error| upstream::body_failure(error, &endpoint))?;
 
             let Some(chunk) = chunk else {
                 break;
@@ -493,13 +550,17 @@ impl HttpChatCompletionRepository {
             Self::forward_sse_events(&mut buffer, &mut accumulator, &mut on_event)?;
         }
 
-        if !buffer.is_empty() {
-            Self::forward_sse_events(&mut buffer, &mut accumulator, &mut on_event)?;
-            Self::forward_sse_line(buffer.as_slice(), &mut accumulator, &mut on_event)?;
-            buffer.clear();
+        // An event cut off by the end of the stream is never dispatched (SSE).
+        let discarded_bytes = buffer.len() + accumulator.data.len();
+        if discarded_bytes > 0 {
+            tracing::warn!(
+                provider = provider_name,
+                operation = "stream",
+                endpoint = upstream::sanitize_endpoint(&endpoint),
+                discarded_bytes,
+                "upstream stream ended mid-event",
+            );
         }
-
-        accumulator.finish(&mut on_event)?;
         Ok(())
     }
 
@@ -532,19 +593,6 @@ impl HttpChatCompletionRepository {
 
         Ok(())
     }
-
-    fn forward_sse_line<F: FnMut(&[u8]) -> Result<(), DomainError>>(
-        line: &[u8],
-        accumulator: &mut SseEventAccumulator,
-        on_event: &mut F,
-    ) -> Result<(), DomainError> {
-        let mut line = line;
-        if line.last().is_some_and(|byte| *byte == b'\r') {
-            line = &line[..line.len() - 1];
-        }
-
-        accumulator.on_line(line, on_event)
-    }
 }
 
 fn payload_contains_cache_control(value: &Value) -> bool {
@@ -560,6 +608,13 @@ fn payload_contains_cache_control(value: &Value) -> bool {
 
 fn is_retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn log_prompt_cache_performance_if_present(
@@ -633,14 +688,31 @@ fn parse_prompt_cache_performance_usage(
 }
 
 fn value_to_u64(value: Option<&Value>) -> Option<u64> {
-    value.and_then(|value| {
-        value.as_u64().or_else(|| {
-            value
-                .as_i64()
-                .filter(|number| *number >= 0)
-                .and_then(|number| u64::try_from(number).ok())
-        })
-    })
+    value.and_then(Value::as_u64)
+}
+
+fn provider_transport_source(
+    source: ChatCompletionSource,
+    endpoint_path: &str,
+) -> Result<ChatCompletionSource, DomainError> {
+    if source == ChatCompletionSource::Custom
+        && matches!(endpoint_path, "/generateContent" | "/streamGenerateContent")
+    {
+        return Ok(ChatCompletionSource::Makersuite);
+    }
+
+    if source != ChatCompletionSource::OpenCode {
+        return Ok(source);
+    }
+
+    match endpoint_path {
+        "/chat/completions" | "/responses" => Ok(ChatCompletionSource::OpenAi),
+        "/messages" => Ok(ChatCompletionSource::Claude),
+        "/generateContent" | "/streamGenerateContent" => Ok(ChatCompletionSource::Makersuite),
+        path => Err(DomainError::InvalidData(format!(
+            "Unsupported OpenCode endpoint path: {path}"
+        ))),
+    }
 }
 
 #[async_trait]
@@ -658,6 +730,7 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
 
         match source {
             ChatCompletionSource::OpenAi
+            | ChatCompletionSource::OpenCode
             | ChatCompletionSource::OpenRouter
             | ChatCompletionSource::DeepSeek
             | ChatCompletionSource::Groq
@@ -677,6 +750,8 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
                 .await
             }
             ChatCompletionSource::WorkersAi => workers_ai::list_models(self, config).await,
+            ChatCompletionSource::Pollinations => pollinations::list_models(self, config).await,
+            ChatCompletionSource::Xai => xai::list_models(self, config).await,
             ChatCompletionSource::Cohere => cohere::list_models(self, config).await,
             ChatCompletionSource::NanoGpt => {
                 openai::list_models_with_path(self, config, source_name, "/models?detailed=true")
@@ -704,71 +779,81 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
         }
 
         let source_name = source.display_name();
+        let source = provider_transport_source(source, endpoint_path)?;
 
-        match source {
-            ChatCompletionSource::OpenAi
-            | ChatCompletionSource::OpenRouter
-            | ChatCompletionSource::DeepSeek
-            | ChatCompletionSource::Groq
-            | ChatCompletionSource::Moonshot
-            | ChatCompletionSource::NanoGpt
-            | ChatCompletionSource::Chutes
-            | ChatCompletionSource::SiliconFlow
-            | ChatCompletionSource::WorkersAi
-            | ChatCompletionSource::Zai
-            | ChatCompletionSource::MiniMax => {
-                openai::generate(self, config, endpoint_path, payload, source_name)
+        match (source, endpoint_path) {
+            (ChatCompletionSource::OpenAi, "/responses") => {
+                openai_responses::generate(self, config, endpoint_path, payload, "OpenAI Responses")
+                    .await
+            }
+            (ChatCompletionSource::Custom, "/responses") => {
+                openai_responses::generate(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    "Custom OpenAI Responses",
+                )
+                .await
+            }
+            (ChatCompletionSource::Custom, "/interactions") => {
+                gemini_interactions::generate(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    "Custom Gemini Interactions",
+                )
+                .await
+            }
+            (ChatCompletionSource::Custom, "/messages") => {
+                claude::generate(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    "Custom Claude Messages",
+                )
+                .await
+            }
+            (
+                ChatCompletionSource::OpenAi
+                | ChatCompletionSource::OpenRouter
+                | ChatCompletionSource::Custom
+                | ChatCompletionSource::DeepSeek
+                | ChatCompletionSource::Groq
+                | ChatCompletionSource::Moonshot
+                | ChatCompletionSource::NanoGpt
+                | ChatCompletionSource::Chutes
+                | ChatCompletionSource::SiliconFlow
+                | ChatCompletionSource::WorkersAi
+                | ChatCompletionSource::Zai
+                | ChatCompletionSource::MiniMax
+                | ChatCompletionSource::Xai
+                | ChatCompletionSource::Pollinations,
+                _,
+            ) => openai::generate(self, config, endpoint_path, payload, source_name)
+                .await
+                .map(ChatCompletionRepositoryGenerateResponse::from_body),
+            (ChatCompletionSource::Cohere, _) => {
+                cohere::generate(self, config, endpoint_path, payload)
                     .await
                     .map(ChatCompletionRepositoryGenerateResponse::from_body)
             }
-            ChatCompletionSource::Custom => {
-                if endpoint_path == "/responses" {
-                    openai_responses::generate(
-                        self,
-                        config,
-                        endpoint_path,
-                        payload,
-                        "Custom OpenAI Responses",
-                    )
-                    .await
-                } else if endpoint_path == "/interactions" {
-                    gemini_interactions::generate(
-                        self,
-                        config,
-                        endpoint_path,
-                        payload,
-                        "Custom Gemini Interactions",
-                    )
-                    .await
-                } else if endpoint_path == "/messages" {
-                    claude::generate(
-                        self,
-                        config,
-                        endpoint_path,
-                        payload,
-                        "Custom Claude Messages",
-                    )
-                    .await
-                } else {
-                    openai::generate(self, config, endpoint_path, payload, source_name)
-                        .await
-                        .map(ChatCompletionRepositoryGenerateResponse::from_body)
-                }
-            }
-            ChatCompletionSource::Cohere => cohere::generate(self, config, endpoint_path, payload)
-                .await
-                .map(ChatCompletionRepositoryGenerateResponse::from_body),
-            ChatCompletionSource::Claude => {
+            (ChatCompletionSource::Claude, _) => {
                 claude::generate(self, config, endpoint_path, payload, source_name).await
             }
-            ChatCompletionSource::AwsBedrock => {
+            (ChatCompletionSource::AwsBedrock, _) => {
                 aws_bedrock::generate(self, config, endpoint_path, payload).await
             }
-            ChatCompletionSource::Makersuite => {
+            (ChatCompletionSource::Makersuite, _) => {
                 makersuite::generate(self, config, endpoint_path, payload).await
             }
-            ChatCompletionSource::VertexAi => {
+            (ChatCompletionSource::VertexAi, _) => {
                 vertexai::generate(self, config, endpoint_path, payload).await
+            }
+            (ChatCompletionSource::OpenCode, _) => {
+                unreachable!("OpenCode source is resolved to its wire transport before dispatch")
             }
         }
     }
@@ -796,19 +881,74 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
         }
 
         let source_name = source.display_name();
+        let source = provider_transport_source(source, endpoint_path)?;
 
-        match source {
-            ChatCompletionSource::OpenAi
-            | ChatCompletionSource::OpenRouter
-            | ChatCompletionSource::DeepSeek
-            | ChatCompletionSource::Groq
-            | ChatCompletionSource::Moonshot
-            | ChatCompletionSource::NanoGpt
-            | ChatCompletionSource::Chutes
-            | ChatCompletionSource::SiliconFlow
-            | ChatCompletionSource::WorkersAi
-            | ChatCompletionSource::Zai
-            | ChatCompletionSource::MiniMax => {
+        match (source, endpoint_path) {
+            (ChatCompletionSource::OpenAi, "/responses") => {
+                openai_responses::generate_stream(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    "OpenAI Responses",
+                    sender,
+                    cancel,
+                )
+                .await
+            }
+            (ChatCompletionSource::Custom, "/responses") => {
+                openai_responses::generate_stream(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    "Custom OpenAI Responses",
+                    sender,
+                    cancel,
+                )
+                .await
+            }
+            (ChatCompletionSource::Custom, "/interactions") => {
+                gemini_interactions::generate_stream(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    "Custom Gemini Interactions",
+                    sender,
+                    cancel,
+                )
+                .await
+            }
+            (ChatCompletionSource::Custom, "/messages") => {
+                claude::generate_stream(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    "Custom Claude Messages",
+                    sender,
+                    cancel,
+                )
+                .await
+            }
+            (
+                ChatCompletionSource::OpenAi
+                | ChatCompletionSource::OpenRouter
+                | ChatCompletionSource::Custom
+                | ChatCompletionSource::DeepSeek
+                | ChatCompletionSource::Groq
+                | ChatCompletionSource::Moonshot
+                | ChatCompletionSource::NanoGpt
+                | ChatCompletionSource::Chutes
+                | ChatCompletionSource::SiliconFlow
+                | ChatCompletionSource::WorkersAi
+                | ChatCompletionSource::Zai
+                | ChatCompletionSource::MiniMax
+                | ChatCompletionSource::Xai
+                | ChatCompletionSource::Pollinations,
+                _,
+            ) => {
                 openai::generate_stream(
                     self,
                     config,
@@ -820,57 +960,10 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
                 )
                 .await
             }
-            ChatCompletionSource::Custom => {
-                if endpoint_path == "/responses" {
-                    openai_responses::generate_stream(
-                        self,
-                        config,
-                        endpoint_path,
-                        payload,
-                        "Custom OpenAI Responses",
-                        sender,
-                        cancel,
-                    )
-                    .await
-                } else if endpoint_path == "/interactions" {
-                    gemini_interactions::generate_stream(
-                        self,
-                        config,
-                        endpoint_path,
-                        payload,
-                        "Custom Gemini Interactions",
-                        sender,
-                        cancel,
-                    )
-                    .await
-                } else if endpoint_path == "/messages" {
-                    claude::generate_stream(
-                        self,
-                        config,
-                        endpoint_path,
-                        payload,
-                        "Custom Claude Messages",
-                        sender,
-                        cancel,
-                    )
-                    .await
-                } else {
-                    openai::generate_stream(
-                        self,
-                        config,
-                        endpoint_path,
-                        payload,
-                        source,
-                        sender,
-                        cancel,
-                    )
-                    .await
-                }
-            }
-            ChatCompletionSource::Cohere => {
+            (ChatCompletionSource::Cohere, _) => {
                 cohere::generate_stream(self, config, endpoint_path, payload, sender, cancel).await
             }
-            ChatCompletionSource::Claude => {
+            (ChatCompletionSource::Claude, _) => {
                 claude::generate_stream(
                     self,
                     config,
@@ -882,81 +975,139 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
                 )
                 .await
             }
-            ChatCompletionSource::AwsBedrock => {
+            (ChatCompletionSource::AwsBedrock, _) => {
                 aws_bedrock::generate_stream(self, config, endpoint_path, payload, sender, cancel)
                     .await
             }
-            ChatCompletionSource::Makersuite => {
+            (ChatCompletionSource::Makersuite, _) => {
                 makersuite::generate_stream(self, config, endpoint_path, payload, sender, cancel)
                     .await
             }
-            ChatCompletionSource::VertexAi => {
+            (ChatCompletionSource::VertexAi, _) => {
                 vertexai::generate_stream(self, config, endpoint_path, payload, sender, cancel)
                     .await
+            }
+            (ChatCompletionSource::OpenCode, _) => {
+                unreachable!("OpenCode source is resolved to its wire transport before dispatch")
             }
         }
     }
 
-    async fn generate_with_tool_call_deltas(
+    async fn generate_with_deltas(
         &self,
         source: ChatCompletionSource,
         config: &ChatCompletionApiConfig,
         endpoint_path: &str,
         payload: &Value,
-        on_tool_call_delta: &mut (dyn FnMut(ChatCompletionToolCallDelta) + Send),
+        on_delta: &mut (dyn FnMut(ChatCompletionStreamDelta) + Send),
     ) -> Result<ChatCompletionRepositoryGenerateResponse, DomainError> {
-        if source != ChatCompletionSource::OpenAi || endpoint_path != "/chat/completions" {
-            return Err(DomainError::InvalidData(format!(
+        let source_name = source.display_name();
+        let source = provider_transport_source(source, endpoint_path)?;
+
+        match (source, endpoint_path) {
+            (ChatCompletionSource::OpenAi, "/responses") => {
+                openai_responses::generate_with_deltas(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    "OpenAI Responses",
+                    on_delta,
+                )
+                .await
+            }
+            (ChatCompletionSource::Custom, "/responses") => {
+                openai_responses::generate_with_deltas(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    "Custom OpenAI Responses",
+                    on_delta,
+                )
+                .await
+            }
+            (ChatCompletionSource::Custom, "/interactions") => {
+                gemini_interactions::generate_with_deltas(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    "Custom Gemini Interactions",
+                    on_delta,
+                )
+                .await
+            }
+            (ChatCompletionSource::Custom, "/messages") => {
+                claude::generate_with_deltas(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    "Custom Claude Messages",
+                    on_delta,
+                )
+                .await
+            }
+            (ChatCompletionSource::Claude, _) => {
+                claude::generate_with_deltas(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    source_name,
+                    on_delta,
+                )
+                .await
+            }
+            (ChatCompletionSource::Makersuite, _) => {
+                makersuite::generate_with_deltas(self, config, endpoint_path, payload, on_delta)
+                    .await
+            }
+            (ChatCompletionSource::VertexAi, _) => {
+                vertexai::generate_with_deltas(self, config, endpoint_path, payload, on_delta).await
+            }
+            (ChatCompletionSource::AwsBedrock, _) => {
+                aws_bedrock::generate_with_deltas(self, config, endpoint_path, payload, on_delta)
+                    .await
+            }
+            (
+                ChatCompletionSource::OpenAi
+                | ChatCompletionSource::OpenRouter
+                | ChatCompletionSource::Custom
+                | ChatCompletionSource::DeepSeek
+                | ChatCompletionSource::Groq
+                | ChatCompletionSource::Moonshot
+                | ChatCompletionSource::NanoGpt
+                | ChatCompletionSource::Chutes
+                | ChatCompletionSource::SiliconFlow
+                | ChatCompletionSource::WorkersAi
+                | ChatCompletionSource::Zai
+                | ChatCompletionSource::MiniMax
+                | ChatCompletionSource::Xai
+                | ChatCompletionSource::Pollinations,
+                "/chat/completions",
+            ) => {
+                openai::generate_with_deltas(
+                    self,
+                    config,
+                    endpoint_path,
+                    payload,
+                    source_name,
+                    on_delta,
+                )
+                .await
+            }
+            (source, endpoint_path) => Err(DomainError::InvalidData(format!(
                 "Tool-call delta streaming is unsupported for source `{}` endpoint `{endpoint_path}`",
                 source.key()
-            )));
+            ))),
         }
-
-        openai::generate_with_tool_call_deltas(
-            self,
-            config,
-            endpoint_path,
-            payload,
-            source.display_name(),
-            on_tool_call_delta,
-        )
-        .await
     }
 
     async fn close_provider_session(&self, session_id: &str) {
         self.openai_responses_ws_sessions.close(session_id).await;
     }
-}
-
-fn extract_error_message(body: &str, default_message: &str) -> String {
-    let body = body.trim();
-    if body.is_empty() {
-        return default_message.to_string();
-    }
-
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
-        if let Some(message) = value
-            .get("error")
-            .and_then(Value::as_object)
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return message.to_string();
-        }
-
-        if let Some(message) = value
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return message.to_string();
-        }
-    }
-
-    body.to_string()
 }
 
 #[cfg(test)]
@@ -968,9 +1119,25 @@ mod tests {
     use serde_json::{Value, json};
 
     use tt_domain::errors::DomainError;
-    use tt_ports::repositories::chat_completion_repository::ChatCompletionApiConfig;
+    use tt_ports::repositories::chat_completion_repository::{
+        ChatCompletionApiConfig, ChatCompletionSource,
+    };
 
-    use super::HttpChatCompletionRepository;
+    use super::{HttpChatCompletionRepository, provider_transport_source};
+
+    #[test]
+    fn opencode_routes_by_wire_format() {
+        assert_eq!(
+            provider_transport_source(ChatCompletionSource::OpenCode, "/messages").unwrap(),
+            ChatCompletionSource::Claude
+        );
+        assert_eq!(
+            provider_transport_source(ChatCompletionSource::OpenCode, "/streamGenerateContent")
+                .unwrap(),
+            ChatCompletionSource::Makersuite
+        );
+        assert!(provider_transport_source(ChatCompletionSource::OpenCode, "/unknown").is_err());
+    }
 
     #[test]
     fn apply_extra_headers_with_filter_skips_matching_headers() {
@@ -1061,30 +1228,71 @@ mod tests {
     }
 
     #[test]
-    fn error_status_classification_marks_retryable_provider_failures() {
-        let rate_limited = HttpChatCompletionRepository::map_error_status(
-            "OpenAI",
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            r#"{"error":{"message":"slow down"}}"#,
-            "Generation request failed",
-        );
-        assert!(matches!(rate_limited, DomainError::RateLimited { .. }));
-
-        let gateway_timeout = HttpChatCompletionRepository::map_error_status(
-            "OpenAI",
-            reqwest::StatusCode::BAD_GATEWAY,
-            "upstream unavailable",
-            "Generation request failed",
-        );
-        assert!(matches!(gateway_timeout, DomainError::Transient(_)));
-
-        let bad_request = HttpChatCompletionRepository::map_error_status(
-            "OpenAI",
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"bad payload"}}"#,
-            "Generation request failed",
-        );
-        assert!(matches!(bad_request, DomainError::InvalidData(_)));
+    fn error_status_classification_preserves_recovery_semantics() {
+        for (status, body, overflow) in [
+            (
+                400,
+                "prompt is too long: 213462 tokens > 200000 maximum",
+                true,
+            ),
+            (
+                400,
+                "input length and `max_tokens` exceed context limit: 190000 + 32768 > 200000",
+                true,
+            ),
+            (
+                400,
+                "Your input exceeds the context window of this model",
+                true,
+            ),
+            (
+                400,
+                "This model's maximum context length is 131072 tokens. However, you requested 140000 tokens",
+                true,
+            ),
+            (
+                400,
+                "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)",
+                true,
+            ),
+            (
+                400,
+                r#"{"error":{"code":"context_length_exceeded","message":"invalid request"}}"#,
+                true,
+            ),
+            (400, r#"{"message":"prompt is too long"}"#, true),
+            (413, "<html>Request Entity Too Large</html>", true),
+            (
+                400,
+                "Request payload size exceeds the limit: 20971520 bytes.",
+                true,
+            ),
+            (400, "Invalid value for temperature", false),
+            (400, "rate limit: too many tokens", false),
+            (
+                429,
+                "ThrottlingException: Too many tokens, please wait before trying again.",
+                false,
+            ),
+            (502, "upstream unavailable", false),
+        ] {
+            let error = HttpChatCompletionRepository::map_error_status(
+                "Provider",
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                body,
+                "Generation request failed",
+            );
+            assert_eq!(
+                matches!(&error, DomainError::InvalidData(message) if message.starts_with("model.context_overflow:")),
+                overflow,
+                "{status}: {body}: {error}"
+            );
+            match status {
+                429 => assert!(matches!(error, DomainError::RateLimited { .. })),
+                502 => assert!(matches!(error, DomainError::Transient(_))),
+                _ => assert!(matches!(error, DomainError::InvalidData(_))),
+            }
+        }
     }
 
     #[test]
@@ -1198,26 +1406,20 @@ mod tests {
         assert!(buffer.is_empty());
     }
 
-    #[test]
-    fn forward_sse_events_can_flush_pending_event_at_end_of_stream() {
-        let mut events = Vec::<Vec<u8>>::new();
-        let mut buffer = b"data: tail\n".to_vec();
+    #[tokio::test]
+    async fn consume_sse_response_discards_an_event_cut_off_by_end_of_stream() {
+        for body in ["data: a\n\ndata: b\n", "data: a\n\ndata: b"] {
+            let response = reqwest::Response::from(http::Response::new(body));
+            let mut events = Vec::<Vec<u8>>::new();
+            HttpChatCompletionRepository::consume_sse_response("test", response, |event| {
+                events.push(event.to_vec());
+                Ok(())
+            })
+            .await
+            .unwrap();
 
-        let mut on_event = |event: &[u8]| {
-            events.push(event.to_vec());
-            Ok(())
-        };
-        let mut accumulator = super::SseEventAccumulator::default();
-        HttpChatCompletionRepository::forward_sse_events(
-            &mut buffer,
-            &mut accumulator,
-            &mut on_event,
-        )
-        .unwrap();
-
-        accumulator.finish(&mut on_event).unwrap();
-
-        assert_eq!(events, [b"tail".to_vec()]);
+            assert_eq!(events, [b"a".to_vec()], "{body:?}");
+        }
     }
 
     #[test]

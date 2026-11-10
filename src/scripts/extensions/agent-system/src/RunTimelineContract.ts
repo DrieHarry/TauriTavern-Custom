@@ -5,6 +5,7 @@ import type { TimelineVirtualResult } from './run-timeline-virtual-list';
 export type TimelineRun = {
     runId: string;
     generationType?: string;
+    afterSeq?: number;
 };
 
 export type TimelineReadInput = Parameters<TauriTavernAgentApi['readEvents']>[0] & { limit: number };
@@ -42,6 +43,28 @@ export type TimelineReadResult = Omit<
     timelineProjection?: unknown;
 };
 
+export type TimelineLiveToolId = 'builtin:workspace.write_file' | 'builtin:workspace.apply_patch';
+
+// Transient previews have no detail targets; durable journal events own history.
+export type TimelineLiveContent = {
+    tail: string;
+    truncated: boolean;
+    expanded: boolean;
+    blocks: Array<{
+        text: string;
+        streamTone: 'neutral' | 'added' | 'removed' | 'reasoning';
+        labelKey?: AgentSystemMessageKey;
+    }>;
+} & ({
+    streamTone: 'neutral' | 'added' | 'removed';
+    toolId: TimelineLiveToolId;
+    addedWords: number;
+    removedWords: number;
+} | {
+    streamTone: 'reasoning';
+    toolLabel: string;
+});
+
 export type TimelineItem = {
     id: string;
     seq: number;
@@ -57,6 +80,7 @@ export type TimelineItem = {
     summary: string;
     rawEvent?: TauriTavernAgentRunEvent;
     rowSpan?: number;
+    live?: TimelineLiveContent;
     detailTargets?: TimelineDetailTarget[];
 };
 
@@ -80,24 +104,9 @@ export type TimelineDetailTarget =
         showPath?: boolean;
     }
     | TimelineDetailTargetBase & {
-        type: 'subAgentTask';
+        type: 'agentTask';
         taskId: string;
-        childInvocationId: string;
-        targetProfileId: string;
-        workspaceKey: string;
-        status: string;
-        resultRef: string;
-        summaryRef: string;
-        error: string;
-    }
-    | TimelineDetailTargetBase & {
-        type: 'handoff';
-        taskId: string;
-        sourceInvocationId: string;
-        newInvocationId: string;
-        targetProfileId: string;
-        workspaceKey: string;
-        status: string;
+        view: 'brief' | 'result';
     }
     | TimelineDetailTargetBase & TimelineTextMetrics & {
         type: 'guidance';
@@ -131,7 +140,7 @@ type TimelineDetailActionBase = {
 
 export type TimelineDetailAction =
     | TimelineDetailActionBase & { kind: 'openSubAgent'; invocationId: string }
-    | TimelineDetailActionBase & { kind: 'retry' };
+    | TimelineDetailActionBase & { kind: 'retry' | 'resume' };
 
 export type TimelineDetailField = {
     label: string;
@@ -214,7 +223,7 @@ export type SubAgentTimelineSnapshot = {
     virtualItems: TimelineVirtualWindow;
     selectedItem: TimelineItem | null;
     selectedSeq: number | null;
-    navItems: readonly TimelineItem[];
+    hasMoreBefore: boolean;
     loading: boolean;
     loadingOlder: boolean;
     autoStick: boolean;
@@ -226,15 +235,18 @@ export type RunTimelineSnapshot = {
     rootId: string;
     visible: boolean;
     displayItems: readonly TimelineItem[];
+    liveItems: readonly TimelineItem[];
     virtualItems: TimelineVirtualWindow;
     selectedItem: TimelineItem | null;
     selectedSeq: number | null;
     latestSeq: number | null;
     activeSeq: number | null;
-    navItems: readonly TimelineItem[];
+    hasMoreBefore: boolean;
     loading: boolean;
     loadingOlder: boolean;
     detail: TimelineDetailSnapshot;
+    presentationError: string;
+    savingPresentation: boolean;
     collapsed: boolean;
     detailsOpen: boolean;
     autoStick: boolean;
@@ -273,6 +285,7 @@ export type RunTimelineController = {
     dispose: () => void;
     loadOlder: () => Promise<boolean>;
     selectItem: (seq: number) => void;
+    toggleLiveItem: (id: string) => void;
     toggleCollapsed: () => void;
     openDetails: () => void;
     showTimeline: () => void;
@@ -282,6 +295,7 @@ export type RunTimelineController = {
     loadOlderSubAgent: () => Promise<boolean>;
     selectSubAgentItem: (seq: number) => void;
     invokeDetailAction: (action: TimelineDetailAction) => void;
+    retryPresentation: () => Promise<void>;
     setTimelineViewport: (viewport: TimelineViewport) => void;
     setSubAgentViewport: (viewport: TimelineViewport) => void;
     startViewGesture: (event: PointerEvent) => void;
@@ -315,13 +329,18 @@ export type ActiveTimelineOptions = {
         subscribeRunState: (listener: (state: {
             activeRun: TimelineRun | null;
             lastEvent: TauriTavernAgentRunEvent | null;
+            presentationError?: string;
         }) => void) => () => void;
         subscribeRunEvents: (listener: (event: TauriTavernAgentRunEvent) => void) => () => void;
+        subscribeLiveProjection?: TauriTavernAgentApi['subscribeLiveProjection'];
+        scheduleFrame?: (callback: () => void) => void;
         retryFailure: (input: {
             run: TimelineRun | null;
             events: readonly TauriTavernAgentRunEvent[];
             terminalEvent: TauriTavernAgentRunEvent | null;
         }) => Promise<unknown>;
+        resumeRun: (runId: string) => Promise<unknown>;
+        retryPresentation: (runId: string) => Promise<void>;
     };
 };
 

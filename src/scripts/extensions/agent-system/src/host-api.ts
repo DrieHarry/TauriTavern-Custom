@@ -18,8 +18,7 @@ function getSillyTavernContext(): unknown {
 }
 
 export function waitForHostReady(): Promise<void> {
-    const ready = window.__TAURITAVERN__?.ready
-        ?? window.__TAURITAVERN_MAIN_READY__;
+    const ready = window.__TAURITAVERN__?.ready;
     if (ready == null) {
         throw new Error(tr('hostReadyUnavailable'));
     }
@@ -44,6 +43,12 @@ export function requireAgentApi(): TauriTavernAgentApi {
 
 export function requireSkillApi(): TauriTavernSkillApi {
     return requireHostApi('skill');
+}
+
+export function loadCodeMirrorEditor() {
+    // Keep the initialized host module shared with the unbundled frontend.
+    const url = '/scripts/tauri/codemirror-editor.js';
+    return import(url /* webpackIgnore: true */) as Promise<typeof import('../../../tauri/codemirror-editor.js')>;
 }
 
 export function requireLlmConnectionsApi(): TauriTavernLlmConnectionsApi {

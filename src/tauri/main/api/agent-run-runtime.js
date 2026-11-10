@@ -1,15 +1,16 @@
 // @ts-check
 import { resolveStableChatId } from './agent-chat-identity.js';
 import { createAgentRunGuidanceApi } from './agent-run-guidance.js';
+import { createAgentRunRetentionApi } from './agent-run-retention.js';
+import { readByteResponse } from '../kernel/byte-protocol.js';
 const DEFAULT_EVENT_POLL_MS = 500;
 const MAX_RUN_LIST_LIMIT = 200;
-const MAX_RUN_PRUNE_DETAIL_LIMIT = 1000;
-const MAX_AGENT_RETENTION_KEEP_RUNS = 10000;
 const AGENT_RUN_STATUSES = new Set([
     'created',
     'initializing_workspace',
     'assembling_context',
     'calling_model',
+    'compacting_context',
     'dispatching_tool',
     'applying_workspace_patch',
     'awaiting_host_commit',
@@ -42,7 +43,10 @@ export function createAgentRunRuntimeApi({ safeInvoke }) {
             throw new Error('chatRef must be an object');
         }
 
-        const stableChatId = normalizeOptionalString(input.stableChatId ?? input.stable_chat_id);
+        const stableChatId = input.stableChatId ?? input.stable_chat_id;
+        if (stableChatId != null && (typeof stableChatId !== 'string' || stableChatId.length === 0)) {
+            throw new Error('stableChatId must be a non-empty string');
+        }
         const statuses = normalizeRunStatuses(input.statuses);
         const before = normalizeRunListBefore(input.before);
         const limit = normalizeRunListLimit(input.limit);
@@ -50,67 +54,10 @@ export function createAgentRunRuntimeApi({ safeInvoke }) {
         return safeInvoke('list_agent_runs', {
             dto: {
                 ...(chatRef ? { chatRef } : {}),
-                ...(stableChatId ? { stableChatId } : {}),
+                ...(stableChatId == null ? {} : { stableChatId }),
                 ...(statuses ? { statuses } : {}),
                 ...(before ? { before } : {}),
                 ...(limit == null ? {} : { limit }),
-            },
-        });
-    }
-
-    async function readRetentionSettings() {
-        const settings = await safeInvoke('get_tauritavern_settings');
-        return normalizeRetentionSettings(settings?.agent?.retention);
-    }
-
-    async function updateRetentionSettings(input = {}) {
-        const retention = normalizeRetentionSettingsPatch(input);
-        if (Object.keys(retention).length === 0) {
-            throw new Error('Agent retention update cannot be empty');
-        }
-
-        const settings = await safeInvoke('update_tauritavern_settings', {
-            dto: {
-                agent: {
-                    retention: toSettingsRetentionPatch(retention),
-                },
-            },
-        });
-        return normalizeRetentionSettings(settings?.agent?.retention);
-    }
-
-    async function planRunPrune(input = {}) {
-        if (!isPlainObject(input)) {
-            throw new Error('Agent planRunPrune input must be an object');
-        }
-
-        const retention = input.retention == null
-            ? undefined
-            : normalizeRetentionSettings(input.retention);
-        const detailLimit = normalizeRunPruneDetailLimit(input.detailLimit ?? input.detail_limit);
-
-        return safeInvoke('plan_agent_run_prune', {
-            dto: {
-                ...(retention ? { retention: toRunPruneRetention(retention) } : {}),
-                ...(detailLimit == null ? {} : { detailLimit }),
-            },
-        });
-    }
-
-    async function applyRunPrune(input = {}) {
-        if (!isPlainObject(input)) {
-            throw new Error('Agent applyRunPrune input must be an object');
-        }
-
-        const retention = input.retention == null
-            ? undefined
-            : normalizeRetentionSettings(input.retention);
-        const detailLimit = normalizeRunPruneDetailLimit(input.detailLimit ?? input.detail_limit);
-
-        return safeInvoke('apply_agent_run_prune', {
-            dto: {
-                ...(retention ? { retention: toRunPruneRetention(retention) } : {}),
-                ...(detailLimit == null ? {} : { detailLimit }),
             },
         });
     }
@@ -135,10 +82,23 @@ export function createAgentRunRuntimeApi({ safeInvoke }) {
     }
 
     async function readWorkspaceFile(input) {
+        return safeInvoke('read_agent_workspace_file', { dto: workspaceReadInput(input) });
+    }
+
+    async function readWorkspaceBytes(input) {
+        const data = await safeInvoke('read_agent_workspace_bytes', { dto: workspaceReadInput(input) });
+        return readByteResponse(data);
+    }
+
+    async function readTaskDetail(input) {
         const runId = requireRunId(input?.runId);
-        const path = String(input?.path || '').trim();
-        if (!path) throw new Error('path is required');
-        return safeInvoke('read_agent_workspace_file', { dto: { runId, path } });
+        const taskId = String(input?.taskId || '').trim();
+        if (!taskId) throw new Error('taskId is required');
+        const includeResult = input?.includeResult ?? false;
+        if (typeof includeResult !== 'boolean') {
+            throw new Error('includeResult must be a boolean');
+        }
+        return safeInvoke('read_agent_task_detail', { dto: { runId, taskId, includeResult } });
     }
 
     async function readModelTurn(input) {
@@ -171,9 +131,9 @@ export function createAgentRunRuntimeApi({ safeInvoke }) {
         if (!chatRef || typeof chatRef !== 'object') {
             throw new Error('chatRef is required');
         }
-        const stableChatId = String(input.stableChatId || '').trim() || await resolveStableChatId(chatRef);
-        if (!stableChatId) {
-            throw new Error('stableChatId is required');
+        const stableChatId = input.stableChatId ?? await resolveStableChatId(chatRef);
+        if (typeof stableChatId !== 'string' || stableChatId.length === 0) {
+            throw new Error('stableChatId must be a non-empty string');
         }
         const candidateStateIdsInput = Object.prototype.hasOwnProperty.call(input, 'candidateStateIds')
             ? input.candidateStateIds
@@ -213,10 +173,12 @@ export function createAgentRunRuntimeApi({ safeInvoke }) {
                 });
                 const events = Array.isArray(result?.events) ? result.events : [];
                 for (const event of events) {
+                    if (stopped) return;
                     afterSeq = Math.max(afterSeq, Number(event?.seq || 0));
                     handler(event);
                 }
             } catch (error) {
+                if (stopped) return;
                 if (typeof options?.onError === 'function') {
                     options.onError(error);
                 } else {
@@ -246,18 +208,22 @@ export function createAgentRunRuntimeApi({ safeInvoke }) {
         cancel,
         submitGuidance: guidance.submitGuidance,
         listRuns,
-        retention: {
-            readSettings: readRetentionSettings,
-            updateSettings: updateRetentionSettings,
-            planPrune: planRunPrune,
-            applyPrune: applyRunPrune,
-        },
+        retention: createAgentRunRetentionApi({ safeInvoke }),
         readEvents,
         readWorkspaceFile,
+        readWorkspaceBytes,
+        readTaskDetail,
         readModelTurn,
         pruneChatPersistentStates,
         subscribe,
     };
+}
+
+function workspaceReadInput(input) {
+    const runId = requireRunId(input?.runId);
+    const path = String(input?.path || '').trim();
+    if (!path) throw new Error('path is required');
+    return { runId, path };
 }
 
 function requireRunId(value) {
@@ -266,14 +232,6 @@ function requireRunId(value) {
         throw new Error('runId is required');
     }
     return runId;
-}
-
-function normalizeOptionalString(value) {
-    if (value == null || value === '') {
-        return undefined;
-    }
-    const text = String(value).trim();
-    return text || undefined;
 }
 
 function normalizeRunStatuses(value) {
@@ -346,120 +304,6 @@ function normalizeRunListLimit(value) {
         throw new Error(`limit must be an integer between 1 and ${MAX_RUN_LIST_LIMIT}`);
     }
     return limit;
-}
-
-function normalizeRetentionSettings(value) {
-    if (!isPlainObject(value)) {
-        throw new Error('Agent retention settings must be an object');
-    }
-
-    const autoPruneEnabled = normalizeRetentionAutoPrune(
-        value.autoPruneEnabled ?? value.auto_prune_enabled ?? false,
-        'autoPruneEnabled',
-    );
-    const keepRecentTerminalRuns = normalizeRetentionRunCount(
-        value.keepRecentTerminalRuns ?? value.keep_recent_terminal_runs,
-        'keepRecentTerminalRuns',
-    );
-    const keepFullRecentRuns = normalizeRetentionRunCount(
-        value.keepFullRecentRuns ?? value.keep_full_recent_runs,
-        'keepFullRecentRuns',
-    );
-
-    if (keepFullRecentRuns > keepRecentTerminalRuns) {
-        throw new Error('keepFullRecentRuns must be less than or equal to keepRecentTerminalRuns');
-    }
-
-    return {
-        autoPruneEnabled,
-        keepRecentTerminalRuns,
-        keepFullRecentRuns,
-    };
-}
-
-function normalizeRetentionSettingsPatch(value) {
-    if (!isPlainObject(value)) {
-        throw new Error('Agent retention settings update must be an object');
-    }
-
-    const patch = {};
-    if (Object.prototype.hasOwnProperty.call(value, 'autoPruneEnabled')
-        || Object.prototype.hasOwnProperty.call(value, 'auto_prune_enabled')) {
-        patch.autoPruneEnabled = normalizeRetentionAutoPrune(
-            value.autoPruneEnabled ?? value.auto_prune_enabled,
-            'autoPruneEnabled',
-        );
-    }
-    if (Object.prototype.hasOwnProperty.call(value, 'keepRecentTerminalRuns')
-        || Object.prototype.hasOwnProperty.call(value, 'keep_recent_terminal_runs')) {
-        patch.keepRecentTerminalRuns = normalizeRetentionRunCount(
-            value.keepRecentTerminalRuns ?? value.keep_recent_terminal_runs,
-            'keepRecentTerminalRuns',
-        );
-    }
-    if (Object.prototype.hasOwnProperty.call(value, 'keepFullRecentRuns')
-        || Object.prototype.hasOwnProperty.call(value, 'keep_full_recent_runs')) {
-        patch.keepFullRecentRuns = normalizeRetentionRunCount(
-            value.keepFullRecentRuns ?? value.keep_full_recent_runs,
-            'keepFullRecentRuns',
-        );
-    }
-    if (patch.keepRecentTerminalRuns != null
-        && patch.keepFullRecentRuns != null
-        && patch.keepFullRecentRuns > patch.keepRecentTerminalRuns) {
-        throw new Error('keepFullRecentRuns must be less than or equal to keepRecentTerminalRuns');
-    }
-    return patch;
-}
-
-function normalizeRetentionAutoPrune(value, label) {
-    if (typeof value !== 'boolean') {
-        throw new Error(`${label} must be a boolean`);
-    }
-    return value;
-}
-
-function normalizeRetentionRunCount(value, label) {
-    if (value == null || value === '') {
-        throw new Error(`${label} is required`);
-    }
-    const count = Number(value);
-    if (!Number.isInteger(count) || count < 0 || count > MAX_AGENT_RETENTION_KEEP_RUNS) {
-        throw new Error(`${label} must be an integer between 0 and ${MAX_AGENT_RETENTION_KEEP_RUNS}`);
-    }
-    return count;
-}
-
-function normalizeRunPruneDetailLimit(value) {
-    if (value == null) {
-        return undefined;
-    }
-    const limit = Number(value);
-    if (!Number.isInteger(limit) || limit < 0 || limit > MAX_RUN_PRUNE_DETAIL_LIMIT) {
-        throw new Error(`detailLimit must be an integer between 0 and ${MAX_RUN_PRUNE_DETAIL_LIMIT}`);
-    }
-    return limit;
-}
-
-function toSettingsRetentionPatch(retention) {
-    return {
-        ...(retention.autoPruneEnabled == null ? {} : {
-            auto_prune_enabled: retention.autoPruneEnabled,
-        }),
-        ...(retention.keepRecentTerminalRuns == null ? {} : {
-            keep_recent_terminal_runs: retention.keepRecentTerminalRuns,
-        }),
-        ...(retention.keepFullRecentRuns == null ? {} : {
-            keep_full_recent_runs: retention.keepFullRecentRuns,
-        }),
-    };
-}
-
-function toRunPruneRetention(retention) {
-    return {
-        keepRecentTerminalRuns: retention.keepRecentTerminalRuns,
-        keepFullRecentRuns: retention.keepFullRecentRuns,
-    };
 }
 
 function normalizeStateIdList(value) {

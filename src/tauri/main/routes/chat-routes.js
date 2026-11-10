@@ -9,25 +9,22 @@ import { resolveRouteCharacterId } from './character-route-utils.js';
 import { registerChatImportRoutes } from './chat-import-routes.js';
 import { mapChatSummaryResults } from './chat-route-utils.js';
 import { registerChatRecentRoutes } from './chat-recent-routes.js';
+import { createReadableFileStreamService } from '../services/files/readable-file-stream-service.js';
+import { streamResponse } from '../http-utils.js';
 
 export function registerChatRoutes(router, context, { jsonResponse }) {
     registerChatImportRoutes(router, context, { jsonResponse });
     const allowMissingChat = (body) => Boolean(body?.allow_not_found ?? body?.allowNotFound);
+    const { createByteStream } = createReadableFileStreamService({
+        invoke: (...args) => context.invokeTransport(...args),
+    });
 
-    const isIntegrityError = (error) => {
-        const serialized = (() => {
-            try {
-                return JSON.stringify(error);
-            } catch {
-                return '';
-            }
-        })();
-
-        return [error?.message, error, serialized]
-            .map((value) => String(value || '').toLowerCase())
-            .join(' ')
-            .includes('integrity');
-    };
+    async function openChatResponse(target, allowNotFound) {
+        const rid = await context.invokeTransport('open_chat_payload_json', { target, allowNotFound });
+        return rid === null
+            ? jsonResponse([])
+            : streamResponse(createByteStream(rid), { headers: { 'Content-Type': 'application/json' } });
+    }
 
     router.post('/api/chats/get', async ({ body }) => {
         const allowNotFound = allowMissingChat(body);
@@ -47,13 +44,7 @@ export function registerChatRoutes(router, context, { jsonResponse }) {
         }
 
         try {
-            const payload = await loadCharacterChatPayload({
-                characterName: characterId,
-                avatarUrl: body?.avatar_url,
-                fileName,
-                allowNotFound,
-            });
-            return jsonResponse(payload);
+            return await openChatResponse({ kind: 'character', characterId, fileName }, allowNotFound);
         } catch (error) {
             return jsonResponse(
                 {
@@ -90,7 +81,7 @@ export function registerChatRoutes(router, context, { jsonResponse }) {
             });
             return jsonResponse({ ok: true });
         } catch (error) {
-            if (isIntegrityError(error)) {
+            if (error?.code === 'integrity') {
                 return jsonResponse({ error: 'integrity' }, 400);
             }
 
@@ -299,8 +290,7 @@ export function registerChatRoutes(router, context, { jsonResponse }) {
         }
 
         try {
-            const payload = await loadGroupChatPayload({ id, allowNotFound });
-            return jsonResponse(payload);
+            return await openChatResponse({ kind: 'group', chatId: context.stripJsonl(id) }, allowNotFound);
         } catch (error) {
             return jsonResponse(
                 {
@@ -376,7 +366,7 @@ export function registerChatRoutes(router, context, { jsonResponse }) {
             });
             return jsonResponse({ ok: true });
         } catch (error) {
-            if (isIntegrityError(error)) {
+            if (error?.code === 'integrity') {
                 return jsonResponse({ error: 'integrity' }, 400);
             }
 

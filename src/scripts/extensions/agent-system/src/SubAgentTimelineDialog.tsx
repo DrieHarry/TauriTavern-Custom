@@ -82,7 +82,6 @@ export function SubAgentTimelineDialog(props: {
         <dialog
             ref={dialogRef}
             className="ttas-dialog ttas-subagent-dialog"
-            data-tt-mobile-surface="fullscreen-window"
             onCancel={(event) => {
                 event.preventDefault();
                 close();
@@ -133,7 +132,10 @@ export function SubAgentTimelineDialog(props: {
                         ariaLabel={tr('timelineDetails')}
                         title={snapshot.selectedItem ? timelineItemTitle(snapshot.selectedItem, tr) : tr('timelineDetails')}
                         type={snapshot.selectedItem?.type ?? ''}
-                        navItems={snapshot.navItems}
+                        items={snapshot.displayItems}
+                        hasMoreBefore={snapshot.hasMoreBefore}
+                        loadingOlder={snapshot.loadingOlder}
+                        onLoadOlder={controller.loadOlderSubAgent}
                         selectedSeq={snapshot.selectedSeq}
                         loading={snapshot.detail.loading}
                         error={snapshot.detail.error}

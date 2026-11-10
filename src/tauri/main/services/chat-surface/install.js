@@ -9,6 +9,7 @@ import { DYNAMIC_THEME_CHANGED_EVENT } from '../dynamic-theme/constants.js';
 import { createBoundedChatSurface } from './bounded-chat-surface.js';
 import { createChatSurfaceController } from './chat-surface-controller.js';
 import { isChatVirtualizationEnabled } from './chat-virtualization-state.js';
+import { createContentPreparation } from './content-preparation.js';
 import {
     getChatSurfaceParticipantRegistry,
     installChatSurfaceController,
@@ -22,7 +23,12 @@ export const CHAT_LAYOUT_CHANGED_EVENT = 'sillytavern:chat-layout-changed';
  * @param {{
  *   root: HTMLElement;
  *   getMessages: () => any[];
+ *   prepareMaterializeOptions: (input: { messages: any[]; messageIds: number[] }) => Promise<Map<number, any>>;
  *   materializeMessage: (input: any) => any;
+ *   formatMessageContent: (message: any, messageId: number) => string;
+ *   refreshMessageDetails: (element: HTMLElement) => void;
+ *   prepareContentTransaction: (element: HTMLElement, html: string) => { content: HTMLElement; commit: () => unknown };
+ *   emitEvent: (event: string, messageId: number, ...args: any[]) => Promise<void>;
  *   syncMountedViewState: (messageIds: readonly number[]) => void;
  *   onFault: (error: Error) => void;
  * }} deps
@@ -30,17 +36,36 @@ export const CHAT_LAYOUT_CHANGED_EVENT = 'sillytavern:chat-layout-changed';
 export function installChatSurfaceRuntime({
     root,
     getMessages,
+    prepareMaterializeOptions,
     materializeMessage,
+    formatMessageContent,
+    refreshMessageDetails,
+    prepareContentTransaction,
+    emitEvent,
     syncMountedViewState,
     onFault,
 }) {
-    if (!(root instanceof HTMLElement)) {
-        throw new TypeError('ChatSurface install requires a root element');
+    if (!(root instanceof HTMLElement) || typeof prepareMaterializeOptions !== 'function') {
+        throw new TypeError('ChatSurface install requires a root element and materialization preparer');
     }
     installFrontendSourceHandoff(root);
 
     /** @type {ReturnType<typeof createChatSurfaceController> | null} */
     let controller = null;
+    const contentPreparation = createContentPreparation({
+        getMessages,
+        formatMessage: formatMessageContent,
+        commit(messageId, html) {
+            const element = activeController.getMessageElement(messageId);
+            if (element) {
+                const transaction = prepareContentTransaction(element, html);
+                transaction.content.removeAttribute('aria-busy');
+                activeController.commitContent(element, transaction);
+            }
+        },
+        refresh: refreshContent,
+        onFault: error => activeController.fault(error),
+    });
     const domAdapter = createChatDomAdapter({
         root,
         guardUnauthorizedMutations: false,
@@ -63,8 +88,9 @@ export function installChatSurfaceRuntime({
         domAdapter,
         scrollAdapter,
         participantRegistry: getChatSurfaceParticipantRegistry(),
+        contentPreparation,
     });
-    installChatSurfaceController(controller);
+    installChatSurfaceController(controller, contentPreparation);
     const activeController = controller;
     const bounded = createBoundedChatSurface({
         controller: activeController,
@@ -74,6 +100,46 @@ export function installChatSurfaceRuntime({
         onProjectionCommitted: syncMountedViewState,
         onFault,
     });
+
+    /** @param {number} messageId */
+    function updateContent(messageId) {
+        const element = activeController.getMessageElement(messageId);
+        if (element) {
+            const html = formatMessageContent(getMessages()[messageId], messageId);
+            activeController.updateContent(element, prepareContentTransaction(element, html));
+        }
+    }
+
+    async function refreshContent() {
+        const messages = getMessages();
+        const canRefresh = (/** @type {any} */ message, /** @type {HTMLElement | null} */ element) => element
+            && !contentPreparation.isTransient(message)
+            && !element.querySelector('.reasoning_edit_textarea');
+        const entries = activeController.getMountedMessageIds()
+            .map(messageId => ({ messageId, message: messages[messageId] }))
+            .filter(({ messageId, message }) => canRefresh(message, activeController.getMessageElement(messageId)));
+        const messageIds = entries.map(entry => entry.messageId);
+        const contents = await prepareMaterializeOptions({ messages, messageIds });
+        for (const { messageId, message } of entries) {
+            const element = activeController.getMessageElement(messageId);
+            // A display refresh never replaces an editor or a superseded message.
+            if (getMessages()[messageId] !== message || !canRefresh(message, element)) continue;
+            activeController.updateContent(element, prepareContentTransaction(element, contents.get(messageId).messageHtml));
+            refreshMessageDetails(element);
+        }
+        await contentPreparation.ready(messageIds);
+    }
+
+    /** @param {number} messageId @param {string | null} [event] @param {...any} args */
+    async function finishContent(messageId, event = null, ...args) {
+        const message = getMessages()[messageId];
+        if (contentPreparation.isTransient(message)) {
+            contentPreparation.setTransient(message, false);
+            updateContent(messageId);
+        }
+        await contentPreparation.ready([messageId]);
+        if (event && getMessages()[messageId] === message) await emitEvent(event, messageId, ...args);
+    }
 
     let lastLayoutWidth = root.clientWidth;
     let layoutFrame = 0;
@@ -114,22 +180,32 @@ export function installChatSurfaceRuntime({
     /**
      * @param {{ messages?: any[]; startIndex?: number; frontendSourceHandoffEvent?: string | null }} [options]
      */
-    function render({
+    async function render({
         messages = getMessages(),
         startIndex = 0,
         frontendSourceHandoffEvent = null,
     } = {}) {
         const managed = isBoundedView();
-        prepareRuntimeAdmission(managed);
         const mountedBefore = activeController.getMountedMessageIds();
-        const replaceMessageIds = mountedBefore.filter(messageId => messageId >= startIndex);
+        const replaceMessageIds = mountedBefore.filter(
+            messageId => messageId >= startIndex && messageId < messages.length,
+        );
 
         if (managed) {
+            const materializeOptionsByMessageId = await prepareMaterializeOptions({
+                messages,
+                messageIds: [...new Set([
+                    ...replaceMessageIds,
+                    ...bounded.materializationCandidates(messages.length),
+                ])],
+            });
+            prepareRuntimeAdmission(managed);
             if (bounded.snapshot().state === 'inactive') {
-                bounded.open({ messages });
+                bounded.open({ messages, materializeOptionsByMessageId });
             } else {
-                bounded.reconcile({ messages, replaceMessageIds });
+                bounded.reconcile({ messages, replaceMessageIds, materializeOptionsByMessageId });
             }
+            await contentPreparation.ready(activeController.getMountedMessageIds());
             return Object.freeze({
                 bounded: true,
                 mountedCount: activeController.getMountedMessageIds().length,
@@ -142,12 +218,16 @@ export function installChatSurfaceRuntime({
             ? Array.from({ length: Math.max(0, messages.length - startIndex) }, (_value, index) => startIndex + index)
             : mountedIds.filter(messageId => messageId < messages.length);
         const replacements = nextIds.filter(messageId => messageId >= startIndex);
+        const materializeOptionsByMessageId = await prepareMaterializeOptions({ messages, messageIds: replacements });
+        prepareRuntimeAdmission(managed);
         activeController.reconcile({
             indices: nextIds,
             messages,
             replaceMessageIds: replacements,
             frontendSourceHandoffEvent,
+            materializeOptionsByMessageId,
         });
+        await contentPreparation.ready(activeController.getMountedMessageIds());
         return Object.freeze({
             bounded: false,
             replaceMessageIds: replacements,
@@ -200,6 +280,8 @@ export function installChatSurfaceRuntime({
         getMessageElement: activeController.getMessageElement,
         getMountedMessageIds: activeController.getMountedMessageIds,
         isBoundedView,
+        finishContent,
+        refreshContent,
         jumpToMessage,
         reconcileMounted,
         render,
@@ -207,5 +289,6 @@ export function installChatSurfaceRuntime({
         resetEpoch,
         scroll: activeController.scroll,
         setProjectionHeld,
+        setContentTransient: contentPreparation.setTransient,
     });
 }

@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef } from 'react';
 
+import { CodeMirrorTextarea } from '../CodeMirrorTextarea';
 import type { SkillManagerController, SkillManagerSnapshot, SkillManagerTr } from './SkillManagerContract';
 import { buildSkillFileTree, SkillFileTree, SkillFileViewer } from './SkillManagerFiles';
 
@@ -60,7 +61,6 @@ export function SkillScopeDialog(props: {
         <dialog
             ref={ref}
             className="ttas-scope-dialog"
-            data-tt-mobile-surface="fullscreen-window"
             onCancel={(event) => { event.preventDefault(); controller.closeScopeDialog(); }}
             onClose={controller.closeScopeDialog}
         >
@@ -142,7 +142,6 @@ export function SkillSourceDialog(props: {
         <dialog
             ref={ref}
             className="ttas-scope-dialog ttas-skill-source-dialog"
-            data-tt-mobile-surface="fullscreen-window"
             onCancel={(event) => { event.preventDefault(); controller.closeSourceDialog(); }}
             onClose={controller.closeSourceDialog}
         >
@@ -158,29 +157,30 @@ export function SkillSourceDialog(props: {
                         </button>
                     </header>
                     <div className="ttas-skill-source-body">
-                        <label className="ttas-field ttas-skill-source-field">
+                        <div className="ttas-field ttas-skill-source-field">
                             <span>{tr(download ? 'skillDownloadUrl' : 'skillMdContent')}</span>
                             {download ? (
                                 <input
                                     className="text_pole"
                                     type="url"
+                                    aria-label={tr('skillDownloadUrl')}
                                     disabled={state.loading}
                                     placeholder={tr('skillDownloadUrlPlaceholder')}
                                     value={state.url}
                                     onChange={event => controller.setSourceUrl(event.target.value)}
                                 />
                             ) : (
-                                <textarea
+                                <CodeMirrorTextarea
                                     className="text_pole textarea_compact ttas-skill-source-textarea"
+                                    label={tr('skillMdContent')}
                                     rows={16}
-                                    spellCheck={false}
                                     disabled={state.loading}
                                     placeholder={tr('skillMdContentPlaceholder')}
                                     value={state.content}
-                                    onChange={event => controller.setSourceContent(event.target.value)}
+                                    onChange={controller.setSourceContent}
                                 />
                             )}
-                        </label>
+                        </div>
                     </div>
                     <footer className="ttas-scope-picker-actions">
                         <button type="button" className="menu_button menu_button_icon" disabled={state.loading} onClick={controller.closeSourceDialog}>
@@ -216,7 +216,6 @@ export function SkillPreviewDialog(props: {
         <dialog
             ref={ref}
             className="ttas-file-dialog ttas-skill-preview-dialog"
-            data-tt-mobile-surface="fullscreen-window"
             onCancel={(event) => { event.preventDefault(); controller.previewCancelled(); }}
             onClose={controller.previewClosed}
         >

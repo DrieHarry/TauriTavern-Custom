@@ -11,6 +11,7 @@ use crate::dto::agent_dto::{
     AgentRunPruneReasonDto, AgentRunPruneRetentionDto, AgentRunSummaryDto,
 };
 use crate::errors::ApplicationError;
+use crate::services::agent_identity::validate_stable_chat_id;
 use crate::services::agent_run_retention_planner::{
     AgentRunPruneAction, AgentRunPruneBlockReason, AgentRunPruneBlockedRun, AgentRunPruneCandidate,
     AgentRunPruneReason, AgentRunRetentionPlan, AgentRunRetentionPlanDetailMode,
@@ -34,7 +35,7 @@ pub struct AgentRunHistoryService {
     run_repository: Arc<dyn AgentRunRepository>,
     settings_repository: Arc<dyn SettingsRepository>,
     run_activity: Arc<dyn AgentRunActivity>,
-    run_prune_apply_lock: Mutex<()>,
+    run_lifecycle_lock: Arc<Mutex<()>>,
 }
 
 impl AgentRunHistoryService {
@@ -42,12 +43,13 @@ impl AgentRunHistoryService {
         run_repository: Arc<dyn AgentRunRepository>,
         settings_repository: Arc<dyn SettingsRepository>,
         run_activity: Arc<dyn AgentRunActivity>,
+        run_lifecycle_lock: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             run_repository,
             settings_repository,
             run_activity,
-            run_prune_apply_lock: Mutex::new(()),
+            run_lifecycle_lock,
         }
     }
 
@@ -60,7 +62,11 @@ impl AgentRunHistoryService {
             .run_repository
             .list_runs(AgentRunListQuery {
                 chat_ref: dto.chat_ref,
-                stable_chat_id: normalize_optional_string(dto.stable_chat_id),
+                stable_chat_id: dto
+                    .stable_chat_id
+                    .as_deref()
+                    .map(validate_stable_chat_id)
+                    .transpose()?,
                 statuses: if dto.statuses.is_empty() {
                     None
                 } else {
@@ -114,7 +120,7 @@ impl AgentRunHistoryService {
         dto: AgentApplyRunPruneDto,
     ) -> Result<AgentRunPruneApplyResultDto, ApplicationError> {
         let detail_limit = normalize_prune_detail_limit(dto.detail_limit)?;
-        let _guard = self.run_prune_apply_lock.lock().await;
+        let _guard = self.run_lifecycle_lock.lock().await;
         self.apply_run_prune_locked(dto, detail_limit).await
     }
 
@@ -123,7 +129,7 @@ impl AgentRunHistoryService {
         dto: AgentApplyRunPruneDto,
     ) -> Result<Option<AgentRunPruneApplyResultDto>, ApplicationError> {
         let detail_limit = normalize_prune_detail_limit(dto.detail_limit)?;
-        let Ok(_guard) = self.run_prune_apply_lock.try_lock() else {
+        let Ok(_guard) = self.run_lifecycle_lock.try_lock() else {
             return Ok(None);
         };
         self.apply_run_prune_locked(dto, detail_limit)
@@ -343,11 +349,16 @@ impl AgentRunPrunePlanDto {
 
 impl AgentRunPruneCandidateDto {
     fn from_candidate(candidate: AgentRunPruneCandidate) -> Self {
+        let chat = candidate
+            .run
+            .chat_target()
+            .expect("Chat history repository returned a Session")
+            .clone();
         Self {
             run_id: candidate.run.id,
             workspace_id: candidate.run.workspace_id,
-            stable_chat_id: candidate.run.stable_chat_id,
-            chat_ref: candidate.run.chat_ref,
+            stable_chat_id: chat.stable_chat_id,
+            chat_ref: chat.chat_ref,
             status: candidate.run.status,
             created_at: candidate.run.created_at,
             updated_at: candidate.run.updated_at,
@@ -361,11 +372,16 @@ impl AgentRunPruneCandidateDto {
 
 impl AgentRunPruneBlockedRunDto {
     fn from_blocked_run(blocked: AgentRunPruneBlockedRun) -> Self {
+        let chat = blocked
+            .run
+            .chat_target()
+            .expect("Chat history repository returned a Session")
+            .clone();
         Self {
             run_id: blocked.run.id,
             workspace_id: blocked.run.workspace_id,
-            stable_chat_id: blocked.run.stable_chat_id,
-            chat_ref: blocked.run.chat_ref,
+            stable_chat_id: chat.stable_chat_id,
+            chat_ref: chat.chat_ref,
             status: blocked.run.status,
             created_at: blocked.run.created_at,
             updated_at: blocked.run.updated_at,
@@ -379,11 +395,16 @@ impl AgentRunPruneBlockedRunDto {
 
 impl AgentRunPruneFailedRunDto {
     fn from_candidate(candidate: AgentRunPruneCandidate, message: String) -> Self {
+        let chat = candidate
+            .run
+            .chat_target()
+            .expect("Chat history repository returned a Session")
+            .clone();
         Self {
             run_id: candidate.run.id,
             workspace_id: candidate.run.workspace_id,
-            stable_chat_id: candidate.run.stable_chat_id,
-            chat_ref: candidate.run.chat_ref,
+            stable_chat_id: chat.stable_chat_id,
+            chat_ref: chat.chat_ref,
             status: candidate.run.status,
             created_at: candidate.run.created_at,
             updated_at: candidate.run.updated_at,
@@ -429,17 +450,21 @@ impl From<AgentRunPruneBlockReason> for AgentRunPruneBlockReasonDto {
 
 impl AgentRunSummaryDto {
     fn from_run_and_projection(run: AgentRun, projection: AgentRunSummaryProjection) -> Self {
+        let chat = run
+            .chat_target()
+            .expect("Chat history repository returned a Session")
+            .clone();
         Self {
             run_id: run.id,
             workspace_id: run.workspace_id,
-            stable_chat_id: run.stable_chat_id,
-            chat_ref: run.chat_ref,
-            generation_type: run.generation_type,
+            stable_chat_id: chat.stable_chat_id,
+            chat_ref: chat.chat_ref,
+            generation_type: chat.generation_type,
             profile_id: run.profile_id,
-            skill_scope_refs: run.skill_scope_refs,
-            persist_base_state_id: run.persist_base_state_id,
-            input_message_count: run.input_message_count,
-            presentation: run.presentation,
+            skill_scope_refs: chat.skill_scope_refs,
+            persist_base_state_id: chat.persist_base_state_id,
+            input_message_count: chat.input_message_count,
+            presentation: chat.presentation,
             status: run.status,
             created_at: run.created_at,
             updated_at: run.updated_at,
@@ -590,17 +615,6 @@ fn normalize_cursor(
     })
 }
 
-fn normalize_optional_string(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,17 +673,21 @@ mod tests {
         AgentRun {
             id: "run_summary_test".to_string(),
             workspace_id: "chat_summary_test".to_string(),
-            stable_chat_id: "stable_summary_test".to_string(),
-            chat_ref: AgentChatRef::Character {
-                character_id: "Seraphina".to_string(),
-                file_name: "Seraphina.png".to_string(),
-            },
-            generation_type: "normal".to_string(),
+            target: tt_domain::models::agent::AgentRunTarget::Chat(
+                tt_domain::models::agent::AgentChatRunTarget {
+                    stable_chat_id: "stable_summary_test".to_string(),
+                    chat_ref: AgentChatRef::Character {
+                        character_id: "Seraphina".to_string(),
+                        file_name: "Seraphina.png".to_string(),
+                    },
+                    generation_type: "normal".to_string(),
+                    skill_scope_refs: AgentRunSkillScopeRefs::default(),
+                    persist_base_state_id: None,
+                    input_message_count: Some(12),
+                    presentation: AgentRunPresentation::Background,
+                },
+            ),
             profile_id: Some("writer".to_string()),
-            skill_scope_refs: AgentRunSkillScopeRefs::default(),
-            persist_base_state_id: None,
-            input_message_count: Some(12),
-            presentation: AgentRunPresentation::Background,
             status: AgentRunStatus::Completed,
             created_at: instant("2026-01-01T00:00:00Z"),
             updated_at: instant("2026-01-01T00:05:00Z"),
@@ -756,6 +774,7 @@ mod tests {
             run_repository,
             settings_repository,
             TestRunActivity::none(),
+            Arc::new(Mutex::new(())),
         );
         let plan = service
             .plan_run_prune(AgentPlanRunPruneDto {
@@ -816,6 +835,7 @@ mod tests {
             run_repository,
             settings_repository,
             TestRunActivity::none(),
+            Arc::new(Mutex::new(())),
         );
         let plan = service
             .plan_run_prune(AgentPlanRunPruneDto {
@@ -855,6 +875,7 @@ mod tests {
             run_repository,
             settings_repository,
             TestRunActivity::none(),
+            Arc::new(Mutex::new(())),
         );
         let plan = service
             .plan_run_prune(AgentPlanRunPruneDto {
@@ -895,6 +916,7 @@ mod tests {
             run_repository,
             settings_repository,
             TestRunActivity::with_active(vec![run.id.clone()]),
+            Arc::new(Mutex::new(())),
         );
         let plan = service
             .plan_run_prune(AgentPlanRunPruneDto {
@@ -932,6 +954,7 @@ mod tests {
             run_repository,
             settings_repository,
             TestRunActivity::none(),
+            Arc::new(Mutex::new(())),
         );
         let result = service
             .apply_run_prune(AgentApplyRunPruneDto {
@@ -966,6 +989,7 @@ mod tests {
             run_repository,
             settings_repository,
             TestRunActivity::none(),
+            Arc::new(Mutex::new(())),
         ));
         let dto = AgentApplyRunPruneDto {
             retention: Some(AgentRunPruneRetentionDto {
@@ -991,16 +1015,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_apply_run_prune_for_automation_skips_when_apply_lock_is_held() {
+    async fn try_apply_run_prune_for_automation_skips_during_run_admission() {
         let run_repository = TestAgentRunRepository::new();
         let settings_repository = TestSettingsRepository::new();
+        let lifecycle_lock = Arc::new(Mutex::new(()));
         let service = AgentRunHistoryService::new(
             run_repository,
             settings_repository,
             TestRunActivity::none(),
+            lifecycle_lock.clone(),
         );
 
-        let _guard = service.run_prune_apply_lock.lock().await;
+        let _guard = lifecycle_lock.lock().await;
         let result = service
             .try_apply_run_prune_for_automation(AgentApplyRunPruneDto {
                 retention: Some(AgentRunPruneRetentionDto {
@@ -1042,6 +1068,7 @@ mod tests {
             run_repository.clone(),
             settings_repository,
             TestRunActivity::none(),
+            Arc::new(Mutex::new(())),
         );
         let result = service
             .apply_run_prune(AgentApplyRunPruneDto {

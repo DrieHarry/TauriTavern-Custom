@@ -7,7 +7,7 @@ import {
     NESTED_TEXT_LIMIT,
     plainObject,
 } from './run-detail-text';
-import { displayToolName } from './run-tool-labels';
+import { displayToolLabel, displayToolName, nativeToolName } from './run-tool-labels';
 import { textMetricsSummary } from './run-text-metrics';
 import type {
     TimelineDetailBlock,
@@ -21,6 +21,7 @@ type WorkspaceFile = Awaited<ReturnType<TauriTavernAgentApi['readWorkspaceFile']
 type RunEventPayload = Record<string, unknown>;
 
 const ARGUMENT_BLOCK_KEYS: ReadonlySet<string> = new Set([
+    'command',
     'content',
     'old_string',
     'new_string',
@@ -40,7 +41,7 @@ export function formatArgumentsSection(
     for (const [key, value] of Object.entries(args)) {
         if (value == null) continue;
         if (ARGUMENT_BLOCK_KEYS.has(key)) {
-            addBlock(blocks, { literal: labelForKey(key) }, value);
+            addBlock(blocks, key === 'command' ? 'timelineShellCommand' : { literal: labelForKey(key) }, value);
         } else if (isPrimitive(value)) {
             fields.push(field(labelForKey(key), primitiveText(value)));
         } else {
@@ -86,10 +87,9 @@ export function formatToolResultSection(
 
 export function renderModelToolCalls(toolCalls: TauriTavernAgentModelTurn['toolCalls']): string {
     return toolCalls.map((call, index) => {
-        const name = displayToolName(call.name);
-        const identity = call.toolId.startsWith('builtin:') ? '' : ` [${call.toolId}]`;
+        const name = displayToolLabel(call.toolId);
         const id = call.callId ? ` ${call.callId}` : '';
-        return `${index + 1}. ${name}${identity}${id}`;
+        return `${index + 1}. ${name}${id}`;
     }).join('\n');
 }
 
@@ -145,19 +145,10 @@ function rangeSummary(structured: RunEventPayload): string {
 
 function toolContentForDisplay(content: string, name: string): string {
     const normalized = content.trim();
-    if ((name === 'workspace.read_file' || name === 'skill.read') && normalized.includes('\n')) {
+    if (name === 'workspace.read_file' && normalized.includes('\n')) {
         return normalized.slice(normalized.indexOf('\n') + 1).trim();
     }
     return normalized;
-}
-
-function nativeToolName(toolId: unknown): string {
-    if (typeof toolId !== 'string') throw new TypeError('tool result requires a canonical toolId');
-    const separator = toolId.indexOf(':');
-    if (separator <= 0 || separator === toolId.length - 1) {
-        throw new TypeError('tool result requires a canonical toolId');
-    }
-    return toolId.slice(separator + 1);
 }
 
 function renderHits(hits: unknown[]): string {

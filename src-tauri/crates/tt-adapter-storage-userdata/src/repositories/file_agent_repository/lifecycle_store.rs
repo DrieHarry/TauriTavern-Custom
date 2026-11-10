@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::fs;
 
 use super::FileAgentRepository;
-use super::fs_tree::should_skip_platform_metadata_file;
+use super::fs_tree::{copy_directory_contents, should_skip_platform_metadata_file};
 use super::paths::validate_segment;
 use tt_domain::errors::DomainError;
 use tt_ports::repositories::agent_workspace_lifecycle_repository::{
@@ -15,6 +15,23 @@ use tt_ports::repositories::agent_workspace_lifecycle_repository::{
 
 #[async_trait]
 impl AgentWorkspaceLifecycleRepository for FileAgentRepository {
+    async fn copy_persistent_states(
+        &self,
+        source_workspace_id: &str,
+        target_workspace_id: &str,
+    ) -> Result<(), DomainError> {
+        let _guard = self.persist_lock.lock().await;
+        copy_directory_contents(
+            &self
+                .chat_dir(source_workspace_id)?
+                .join("persistent-states"),
+            &self
+                .chat_dir(target_workspace_id)?
+                .join("persistent-states"),
+        )
+        .await
+    }
+
     async fn delete_chat_workspace(
         &self,
         workspace_id: &str,
@@ -45,7 +62,7 @@ impl AgentWorkspaceLifecycleRepository for FileAgentRepository {
             )));
         }
 
-        let run_ids = self.run_ids_in_chat_workspace(&chat_dir).await?;
+        let run_ids = self.run_ids_in_workspace(&chat_dir).await?;
         fs::remove_dir_all(&chat_dir).await.map_err(|error| {
             DomainError::InternalError(format!(
                 "Failed to delete agent chat workspace {}: {}",
@@ -80,6 +97,10 @@ impl AgentWorkspaceLifecycleRepository for FileAgentRepository {
                     )));
                 }
             }
+        }
+        let mut sequences = self.event_sequences.lock().await;
+        for run_id in &run_ids {
+            sequences.remove(run_id);
         }
 
         Ok(AgentChatWorkspaceDeletion {
@@ -178,8 +199,11 @@ impl AgentWorkspaceLifecycleRepository for FileAgentRepository {
 }
 
 impl FileAgentRepository {
-    async fn run_ids_in_chat_workspace(&self, chat_dir: &Path) -> Result<Vec<String>, DomainError> {
-        let runs_dir = chat_dir.join("runs");
+    pub(super) async fn run_ids_in_workspace(
+        &self,
+        workspace_dir: &Path,
+    ) -> Result<Vec<String>, DomainError> {
+        let runs_dir = workspace_dir.join("runs");
         let metadata = match fs::symlink_metadata(&runs_dir).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

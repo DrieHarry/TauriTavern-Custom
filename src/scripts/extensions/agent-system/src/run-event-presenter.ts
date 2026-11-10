@@ -23,6 +23,7 @@ type TimelinePresenterOptions = {
     delegationEdges?: readonly TimelineDelegationEdge[];
 };
 type ShowEventOptions = {
+    explicitCommitIds: ReadonlySet<string>;
     invocationId: string | null;
     foregroundInvocationIds: ReadonlySet<string> | null;
     acceptedHandoffInvocationIds: ReadonlySet<string>;
@@ -34,7 +35,6 @@ type TransferControlEdge = {
     targetInvocationId: string;
     targetProfileId: string;
     workspaceKey: string;
-    status: string;
 };
 
 const DISPLAY_EVENT_TYPES: ReadonlySet<string> = new Set([
@@ -65,6 +65,7 @@ const DISPLAY_EVENT_TYPES: ReadonlySet<string> = new Set([
     'user_guidance_applied',
     'user_guidance_discarded',
     'run_completed',
+    'run_resumed',
     'run_partial_success',
     'run_cancelled',
     'run_failed',
@@ -89,10 +90,18 @@ export const TERMINAL_EVENT_TYPES = Object.freeze([
 
 export { buildEventDetailTargets, presentRunEvent };
 
-export function isDisplayableRunEvent(event: TauriTavernAgentRunEvent): boolean {
+export function isDisplayableRunEvent(
+    event: TauriTavernAgentRunEvent,
+    explicitCommitIds?: ReadonlySet<string>,
+): boolean {
     if (!DISPLAY_EVENT_TYPES.has(event.type)) return false;
-    if (event.type !== 'context_assembled') return true;
     const payload = plainObject(event.payload) ? event.payload : {};
+    if (event.type === 'chat_commit_requested' || event.type === 'chat_commit_completed') {
+        // Older completion events only identify their origin through the matching request.
+        return payload.isExplicit === true || (payload.isExplicit === undefined
+            && explicitCommitIds?.has(stringValue(payload.commitId).trim()) === true);
+    }
+    if (event.type !== 'context_assembled') return true;
     return Array.isArray(payload.toolDiagnostics) && payload.toolDiagnostics.length > 0;
 }
 
@@ -106,6 +115,7 @@ export function timelineItemsFromEvents(
 ): TimelineItem[] {
     const completedToolCalls = new Set<string>();
     const resolvedCommits = new Set<string>();
+    const explicitCommitIds = new Set<string>();
     const acceptedHandoffInvocationIds = new Set<string>();
     const invocationId = options.invocationId == null ? null : normalizeInvocationId(options.invocationId);
     const foregroundInvocationIds = normalizeForegroundInvocationIds(options.foregroundInvocationIds);
@@ -117,12 +127,16 @@ export function timelineItemsFromEvents(
     for (const event of events) {
         const payload = plainObject(event.payload) ? event.payload : {};
         if (event.type === 'tool_call_completed' || event.type === 'tool_call_failed') {
-            const callId = stringValue(payload.callId).trim();
-            if (callId) completedToolCalls.add(callId);
+            const key = toolCallKey(payload);
+            if (key) completedToolCalls.add(key);
         }
         if (event.type === 'chat_commit_completed' || event.type === 'chat_commit_failed') {
             const commitId = stringValue(payload.commitId).trim();
             if (commitId) resolvedCommits.add(commitId);
+        }
+        if (event.type === 'chat_commit_requested' && payload.isExplicit === true) {
+            const commitId = stringValue(payload.commitId).trim();
+            if (commitId) explicitCommitIds.add(commitId);
         }
         if (event.type === 'agent_handoff_accepted') {
             const newInvocationId = stringValue(payload.newInvocationId).trim();
@@ -131,6 +145,7 @@ export function timelineItemsFromEvents(
     }
 
     const showOptions: ShowEventOptions = {
+        explicitCommitIds,
         invocationId,
         foregroundInvocationIds,
         acceptedHandoffInvocationIds,
@@ -150,7 +165,7 @@ function shouldShowEvent(
 ): boolean {
     if (event.type === 'model_completed') {
         if (!hasModelTurnNarration(event)) return false;
-    } else if (!isDisplayableRunEvent(event)) {
+    } else if (!isDisplayableRunEvent(event, options.explicitCommitIds)) {
         return false;
     }
 
@@ -176,8 +191,7 @@ function shouldShowEvent(
 
     const payload = plainObject(event.payload) ? event.payload : {};
     if (event.type === 'tool_call_requested') {
-        const callId = stringValue(payload.callId).trim();
-        return !callId || !completedToolCalls.has(callId);
+        return !completedToolCalls.has(toolCallKey(payload));
     }
     if (event.type === 'tool_call_completed') {
         return !SIDE_EFFECT_TOOL_COMPLETIONS.has(stringValue(payload.toolId));
@@ -187,6 +201,11 @@ function shouldShowEvent(
         return !commitId || !resolvedCommits.has(commitId);
     }
     return true;
+}
+
+function toolCallKey(payload: RunEventPayload): string {
+    const callId = stringValue(payload.callId).trim();
+    return callId ? JSON.stringify([normalizeInvocationId(payload.invocationId), payload.round, callId]) : '';
 }
 
 function normalizeForegroundInvocationIds(values?: readonly string[]): ReadonlySet<string> | null {
@@ -205,7 +224,6 @@ function normalizeTransferControlEdges(values?: readonly TimelineDelegationEdge[
             targetInvocationId: normalizeInvocationId(edge.targetInvocationId),
             targetProfileId: edge.targetProfileId.trim(),
             workspaceKey: edge.workspaceKey.trim(),
-            status: edge.status.trim(),
         }))
         .filter(edge => !isRootInvocation(edge.targetInvocationId));
 }
@@ -248,14 +266,10 @@ function projectedHandoffBoundary(edge: TransferControlEdge, anchor: TimelineIte
 
 function handoffDetailTarget(edge: TransferControlEdge): TimelineDetailTarget {
     return {
-        type: 'handoff',
+        type: 'agentTask',
         labelKey: 'timelineHandoff',
         taskId: edge.taskId,
-        sourceInvocationId: edge.sourceInvocationId,
-        newInvocationId: edge.targetInvocationId,
-        targetProfileId: edge.targetProfileId,
-        workspaceKey: edge.workspaceKey,
-        status: edge.status,
+        view: 'brief',
     };
 }
 

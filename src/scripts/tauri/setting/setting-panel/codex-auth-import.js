@@ -1,6 +1,6 @@
 import { callGenericPopup, POPUP_RESULT, POPUP_TYPE } from '../../../popup.js';
 import { translate } from '../../../i18n.js';
-import { isAndroidRuntime } from '../../../util/mobile-runtime.js';
+import { hostPlatform } from '../../../util/host-identity.js';
 import {
     discardCodexAuthImport,
     importCodexAuth,
@@ -70,7 +70,7 @@ function pickAndroidCodexAuthContentUri() {
 }
 
 async function pickCodexAuthFile() {
-    if (!isAndroidRuntime()) {
+    if (hostPlatform() !== 'android') {
         const picked = await openDialog({
             title: translate('Select Codex auth.json'),
             multiple: false,

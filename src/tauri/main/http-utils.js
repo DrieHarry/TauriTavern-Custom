@@ -12,8 +12,37 @@ function isRequestLike(value) {
         && typeof value.clone === 'function';
 }
 
-function isFormDataLike(value) {
-    return getTypeTag(value) === '[object FormData]';
+/**
+ * Rehome FormData from patched same-origin windows into the current realm.
+ * @param {unknown} value
+ * @returns {FormData | null}
+ */
+function toCurrentRealmFormData(value) {
+    if (value instanceof FormData) {
+        return value;
+    }
+
+    if (getTypeTag(value) !== '[object FormData]') {
+        return null;
+    }
+
+    let entries;
+    try {
+        entries = FormData.prototype.entries.call(value);
+    } catch {
+        return null;
+    }
+
+    const formData = new FormData();
+    for (const [name, entry] of entries) {
+        if (typeof entry === 'string') {
+            formData.append(name, entry);
+        } else {
+            formData.append(name, entry, entry.name);
+        }
+    }
+
+    return formData;
 }
 
 function isUrlSearchParamsLike(value) {
@@ -69,7 +98,8 @@ export async function getMethod(input, init) {
     return getMethodHint(input, init);
 }
 
-export async function readRequestBody(input, init) {
+export async function readRequestBody(input, init, mode = 'json') {
+    const decode = text => mode === 'text' ? text : parseMaybeJson(text);
     let rawBody;
 
     if (init && Object.prototype.hasOwnProperty.call(init, 'body')) {
@@ -82,12 +112,13 @@ export async function readRequestBody(input, init) {
         return null;
     }
 
-    if (isFormDataLike(rawBody)) {
-        return rawBody;
+    const formData = toCurrentRealmFormData(rawBody);
+    if (formData) {
+        return formData;
     }
 
     if (typeof rawBody === 'string') {
-        return parseMaybeJson(rawBody);
+        return decode(rawBody);
     }
 
     if (isUrlSearchParamsLike(rawBody)) {
@@ -96,13 +127,15 @@ export async function readRequestBody(input, init) {
 
     if (isBlobLike(rawBody)) {
         const text = await rawBody.text();
-        return parseMaybeJson(text);
+        return decode(text);
     }
 
     if (ArrayBuffer.isView(rawBody) || isArrayBufferLike(rawBody)) {
-        const bytes = isArrayBufferLike(rawBody) ? new Uint8Array(rawBody) : new Uint8Array(rawBody.buffer);
-        const text = new TextDecoder().decode(bytes);
-        return parseMaybeJson(text);
+        const bytes = isArrayBufferLike(rawBody)
+            ? new Uint8Array(rawBody)
+            : new Uint8Array(rawBody.buffer, rawBody.byteOffset, rawBody.byteLength);
+        const text = new TextDecoder('utf-8', { fatal: mode === 'text' }).decode(bytes);
+        return decode(text);
     }
 
     return rawBody;
@@ -121,21 +154,64 @@ export function parseMaybeJson(value) {
     }
 }
 
-export async function safeJson(response) {
-    try {
-        return await response.json();
-    } catch {
-        return {};
-    }
+export function jsonResponse(data, status = 200, statusText) {
+    return new Response(JSON.stringify(data), responseInit(status, 'application/json', statusText));
 }
 
-export function jsonResponse(data, status = 200) {
-    return new Response(JSON.stringify(data), {
-        status,
-        headers: {
-            'Content-Type': 'application/json',
+/**
+ * A response whose body reads fail with the stream's own error, or with the abort reason once `signal` aborts;
+ * Chromium would report either as TypeError('Failed to fetch'). A used or locked body still rejects at once, since
+ * that read never reaches the stream. Piping keeps `signal` attached while a reader holds the body.
+ */
+export function streamResponse(stream, init, signal) {
+    const { readable, writable } = new TransformStream();
+    const failure = stream.pipeTo(writable, { signal }).then(() => null, error => error);
+    const response = new Response(readable, init);
+    for (const method of ['arrayBuffer', 'blob', 'bytes', 'formData', 'json', 'text']) {
+        const read = response[method];
+        if (typeof read !== 'function') continue;
+        Object.defineProperty(response, method, {
+            configurable: true,
+            value: () => response.bodyUsed || response.body.locked
+                ? read.call(response)
+                : read.call(response).catch(async (error) => { throw (await failure) ?? error; }),
+        });
+    }
+    return response;
+}
+
+/**
+ * A JSON response whose `json()` resolves to `data` itself; any other body read serializes it.
+ * `data` must be JSON-compatible and no longer referenced by the handler.
+ */
+export function ownedJsonResponse(data, status = 200, statusText) {
+    let value = data;
+    let cloned = false;
+    const body = new ReadableStream({
+        pull(controller) {
+            controller.enqueue(new TextEncoder().encode(JSON.stringify(value)));
+            controller.close();
         },
-    });
+    }, { highWaterMark: 0 });
+    const response = new Response(body, responseInit(status, 'application/json', statusText));
+    // Clones share the body bytes, so a cloned response parses like any other.
+    response.clone = () => {
+        cloned = true;
+        return Response.prototype.clone.call(response);
+    };
+    response.json = async () => {
+        if (cloned) {
+            return Response.prototype.json.call(response);
+        }
+        if (response.bodyUsed) {
+            throw new TypeError('Body has already been consumed.');
+        }
+        await response.body.cancel();
+        const result = value;
+        value = undefined;
+        return result;
+    };
+    return response;
 }
 
 export function safeResponseStatusText(value) {
@@ -144,10 +220,14 @@ export function safeResponseStatusText(value) {
 }
 
 export function textResponse(text, status = 200, statusText) {
+    return new Response(String(text), responseInit(status, 'text/plain; charset=utf-8', statusText));
+}
+
+function responseInit(status, contentType, statusText) {
     const init = {
         status,
         headers: {
-            'Content-Type': 'text/plain; charset=utf-8',
+            'Content-Type': contentType,
         },
     };
     const safeStatusText = safeResponseStatusText(statusText);
@@ -156,7 +236,5 @@ export function textResponse(text, status = 200, statusText) {
         init.statusText = safeStatusText;
     }
 
-    return new Response(String(text), {
-        ...init,
-    });
+    return init;
 }

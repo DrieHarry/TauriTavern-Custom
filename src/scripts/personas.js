@@ -1,3 +1,5 @@
+import { getPageForItem, initPagination } from './pagination.js';
+import { loadPersonaSnapshot } from './tauri/setting/settings-persistence.js';
 import {
     buildAvatarList,
     characterToEntity,
@@ -19,12 +21,13 @@ import {
     saveChatConditional,
     saveMetadata,
     saveSettingsDebounced,
+    saveSettings,
     setUserName,
     this_chid,
 } from '../script.js';
 import { persona_description_positions, power_user } from './power-user.js';
 import { getTokenCountAsync } from './tokenizers.js';
-import { PAGINATION_TEMPLATE, addLongPressEvent, clearInfoBlock, debounce, delay, download, ensureImageFormatSupported, escapeHtml, flashHighlight, getBase64Async, getCharIndex, isFalseBoolean, isTrueBoolean, onlyUnique, parseJsonFile, setInfoBlock, localizePagination, renderPaginationDropdown, paginationDropdownChangeHandler, findPersona, resolveAvatarData, stringToRange, sortIgnoreCaseAndAccents, equalsIgnoreCaseAndAccents, uuidv4 } from './utils.js';
+import { addLongPressEvent, clearInfoBlock, debounce, delay, download, ensureImageFormatSupported, escapeHtml, flashHighlight, getBase64Async, getCharIndex, isFalseBoolean, isTrueBoolean, onlyUnique, parseJsonFile, setInfoBlock, findPersona, resolveAvatarData, stringToRange, sortIgnoreCaseAndAccents, equalsIgnoreCaseAndAccents, uuidv4 } from './utils.js';
 import { debounce_timeout } from './constants.js';
 import { FILTER_TYPES, FilterHelper } from './filters.js';
 import { groups, selected_group } from './group-chats.js';
@@ -41,6 +44,7 @@ import { commonEnumMatchProviders, commonEnumProviders, enumIcons } from './slas
 import { SlashCommandEnumValue, enumTypes } from './slash-commands/SlashCommandEnumValue.js';
 import { SlashCommandParser } from './slash-commands/SlashCommandParser.js';
 import { slashCommandReturnHelper } from './slash-commands/SlashCommandReturnHelper.js';
+import { keepFocus, setAriaRelation } from './dom-handlers.js';
 
 export { persona_description_positions };
 
@@ -63,7 +67,6 @@ export { persona_description_positions };
 
 const USER_AVATAR_PATH = 'User Avatars/';
 
-let savePersonasPage = 0;
 const GRID_STORAGE_KEY = 'Personas_GridView';
 const DEFAULT_DEPTH = 2;
 const DEFAULT_ROLE = 0;
@@ -72,9 +75,10 @@ const DEFAULT_ROLE = 0;
 export let user_avatar = '';
 
 /** @type {FilterHelper} Filter helper for the persona list */
-export const personasFilter = new FilterHelper(debounce(getUserAvatars, debounce_timeout.quick));
+export const personasFilter = new FilterHelper(debounce(() => renderUserAvatars('', 1), debounce_timeout.quick));
 
 let primedUserAvatars = null;
+let userAvatars = [];
 
 export function primeUserAvatarsSnapshot(snapshot) {
     primedUserAvatars = snapshot;
@@ -134,6 +138,7 @@ export function isPersonaPanelOpen() {
 function switchPersonaGridView() {
     const state = accountStorage.getItem(GRID_STORAGE_KEY) === 'true';
     $('#user_avatar_block').toggleClass('gridView', state);
+    $('#persona_grid_toggle').attr('aria-pressed', String(state));
 }
 
 /**
@@ -147,6 +152,9 @@ export function getUserAvatar(avatarImg) {
 
 export function initUserAvatar(avatar) {
     user_avatar = avatar;
+    if (power_user.persona_descriptions[avatar]) {
+        applyPersonaDescription(createPersonaDescriptor(power_user.persona_descriptions[avatar]));
+    }
     reloadUserAvatar();
     updatePersonaUIStates();
 }
@@ -270,9 +278,10 @@ function getUserAvatarBlock(avatarId) {
     template.find('.ch_name').text(personaName);
     template.find('.ch_description').text(personaDescription || $('#user_avatar_block').attr('no_desc_text')).toggleClass('text_muted', !personaDescription);
     template.find('.ch_additional_info').text(personaTitle || '');
+    setAriaRelation(template[0].querySelector(':scope > .sr-only'), 'labelledby', template.find('.ch_name')[0]);
+    if (personaTitle) setAriaRelation(template[0].querySelector(':scope > .sr-only'), 'describedby', template.find('.ch_additional_info')[0]);
     template.attr('data-avatar-id', avatarId);
     template.find('.avatar').attr('data-avatar-id', avatarId).attr('title', avatarId);
-    template.toggleClass('default_persona', avatarId === power_user.default_persona);
     const avatarUrl = getThumbnailUrl('persona', avatarId);
     template.find('img').attr('src', avatarUrl);
 
@@ -282,32 +291,7 @@ function getUserAvatarBlock(avatarId) {
         template.find('.ch_description').text(currentText + '\n\xa0\n\xa0');
     }
 
-    $('#user_avatar_block').append(template);
     return template;
-}
-
-/**
- * Initialize missing personas in the power user settings.
- * @param {string[]} avatarsList List of avatar file names
- */
-function addMissingPersonas(avatarsList) {
-    let changed = false;
-
-    for (const avatarId of avatarsList) {
-        if (!power_user.personas[avatarId]) {
-            power_user.personas[avatarId] = UNNAMED_PERSONA;
-            changed = true;
-        }
-
-        if (!power_user.persona_descriptions[avatarId]) {
-            ensurePersonaDescriptor(avatarId);
-            changed = true;
-        }
-    }
-
-    if (changed) {
-        saveSettingsDebounced();
-    }
 }
 
 /**
@@ -317,92 +301,58 @@ function addMissingPersonas(avatarsList) {
  * @returns {Promise<string[]>} List of avatar file names
  */
 export async function getUserAvatars(doRender = true, openPageAt = '') {
-    const renderAvatars = (allEntities) => {
-        if (!Array.isArray(allEntities)) {
-            return [];
+    if (primedUserAvatars !== null) {
+        userAvatars = primedUserAvatars;
+        primedUserAvatars = null;
+    } else {
+        userAvatars = await loadPersonaSnapshot(power_user);
+    }
+
+    if (doRender) renderUserAvatars(openPageAt);
+    return userAvatars;
+}
+
+function renderUserAvatars(openPageAt = '', pageNumber = undefined) {
+    // Before printing the personas, we check if we should enable/disable search sorting
+    verifyPersonaSearchSortRule();
+
+    let entities = personasFilter.applyFilters(userAvatars);
+    entities = sortPersonas(entities);
+
+    const paginationSettings = { storageKey: 'Personas_PerPage', defaultPageSize: 5 };
+    const avatarIndex = entities.indexOf(openPageAt);
+    if (avatarIndex >= 0) pageNumber = getPageForItem(avatarIndex, paginationSettings);
+    const listId = '#user_avatar_block';
+    initPagination($('#persona_pagination_container'), {
+        ...paginationSettings,
+        sizeChangerOptions: [5, 10, 25, 50, 100, 250, 500, 1000],
+        dataSource: entities,
+        pageNumber,
+        callback: function (data) {
+            const retained = keepFocus(
+                () => document.querySelectorAll('#user_avatar_block .avatar-container'),
+                item => item.dataset.avatarId,
+                () => {
+                    $(listId).empty();
+                    for (const item of data) $(listId).append(getUserAvatarBlock(item));
+                    updatePersonaUIStates();
+                },
+            );
+            if (!retained) document.getElementById('persona_search_bar').focus();
+        },
+        afterRender: function () {
+            $(listId).scrollTop(0);
+        },
+    });
+
+    navigateToAvatar = (avatarId) => {
+        const avatarIndex = entities.indexOf(avatarId);
+
+        if (avatarIndex !== -1) {
+            $('#persona_pagination_container').pagination('go', getPageForItem(avatarIndex, paginationSettings));
         }
-
-        if (!doRender) {
-            return allEntities;
-        }
-
-        // If any persona is missing from the power user settings, we add it
-        addMissingPersonas(allEntities);
-        // Before printing the personas, we check if we should enable/disable search sorting
-        verifyPersonaSearchSortRule();
-
-        let entities = personasFilter.applyFilters(allEntities);
-        entities = sortPersonas(entities);
-
-        const storageKey = 'Personas_PerPage';
-        const listId = '#user_avatar_block';
-        const perPage = Number(accountStorage.getItem(storageKey)) || 5;
-        const sizeChangerOptions = [5, 10, 25, 50, 100, 250, 500, 1000];
-
-        $('#persona_pagination_container').pagination({
-            dataSource: entities,
-            pageSize: perPage,
-            sizeChangerOptions,
-            pageRange: 1,
-            pageNumber: savePersonasPage || 1,
-            position: 'top',
-            showPageNumbers: false,
-            showSizeChanger: true,
-            formatSizeChanger: renderPaginationDropdown(perPage, sizeChangerOptions),
-            prevText: '<',
-            nextText: '>',
-            formatNavigator: PAGINATION_TEMPLATE,
-            showNavigator: true,
-            callback: function (data) {
-                $(listId).empty();
-                for (const item of data) {
-                    $(listId).append(getUserAvatarBlock(item));
-                }
-                updatePersonaUIStates();
-                localizePagination($('#persona_pagination_container'));
-            },
-            afterSizeSelectorChange: function (e, size) {
-                accountStorage.setItem(storageKey, e.target.value);
-                paginationDropdownChangeHandler(e, size);
-            },
-            afterPaging: function (e) {
-                savePersonasPage = e;
-            },
-            afterRender: function () {
-                $(listId).scrollTop(0);
-            },
-        });
-
-        navigateToAvatar = (avatarId) => {
-            const avatarIndex = entities.indexOf(avatarId);
-            const page = Math.floor(avatarIndex / perPage) + 1;
-
-            if (avatarIndex !== -1) {
-                $('#persona_pagination_container').pagination('go', page);
-            }
-        };
-
-        openPageAt && navigateToAvatar(openPageAt);
-
-        return allEntities;
     };
 
-    if (primedUserAvatars !== null) {
-        const allEntities = primedUserAvatars;
-        primedUserAvatars = null;
-        return renderAvatars(allEntities);
-    }
-
-    const response = await fetch('/api/avatars/get', {
-        method: 'POST',
-        headers: getRequestHeaders({ omitContentType: true }),
-    });
-    if (!response.ok) {
-        return;
-    }
-
-    const allEntities = await response.json();
-    return renderAvatars(allEntities);
 }
 
 /**
@@ -458,7 +408,7 @@ async function changeUserAvatar(e) {
     let url = '/api/avatars/upload';
 
     if (!power_user.never_resize_avatars) {
-        const dlg = new Popup(t`Set the crop position of the avatar image`, POPUP_TYPE.CROP, '', { cropImage: dataUrl });
+        const dlg = new Popup(t`Set the crop position of the avatar image`, POPUP_TYPE.CROP, '', { label: t`Set the crop position of the avatar image`, cropImage: dataUrl });
         const result = await dlg.show();
 
         if (!result) {
@@ -501,7 +451,9 @@ async function changeUserAvatar(e) {
         if (!overwriteName && dataPath) {
             await getUserAvatars();
             await delay(1);
-            await createPersona(dataPath);
+            if (!Object.hasOwn(power_user.personas, dataPath) && !Object.hasOwn(power_user.persona_descriptions, dataPath)) {
+                await createPersona(dataPath);
+            }
         }
 
         await getUserAvatars(true, dataPath || overwriteName);
@@ -517,14 +469,14 @@ async function changeUserAvatar(e) {
  * @returns {Promise} Promise that resolves when the persona is set
  */
 export async function createPersona(avatarId) {
-    const personaName = await Popup.show.input(t`Enter a name for this persona:`, t`Cancel if you're just uploading an avatar.`, '');
+    const personaName = await Popup.show.input(t`Enter a name for this persona:`, t`Cancel if you're just uploading an avatar.`, '', { inputLabel: t`Enter a name for this persona:` });
 
     if (!personaName) {
         console.debug('User cancelled creating a persona');
         return;
     }
 
-    const personaDescription = await Popup.show.input(t`Enter a description for this persona:`, t`You can always add or change it later.`, '', { rows: 4 });
+    const personaDescription = await Popup.show.input(t`Enter a description for this persona:`, t`You can always add or change it later.`, '', { rows: 4, inputLabel: t`Enter a description for this persona:` });
 
     await initPersona(avatarId, personaName, personaDescription, '');
     if (power_user.persona_show_notifications) {
@@ -534,6 +486,8 @@ export async function createPersona(avatarId) {
 
 async function createDummyPersona() {
     const popup = new Popup(t`Enter a name for this persona:`, POPUP_TYPE.INPUT, '', {
+        label: t`Create Persona`,
+        inputLabel: t`Enter a name for this persona:`,
         customInputs: [{
             id: 'persona_title',
             type: 'text',
@@ -551,8 +505,10 @@ async function createDummyPersona() {
 
     // Date + name (only ASCII) to make it unique
     const avatarId = `${Date.now()}-${personaName.replace(/[^a-zA-Z0-9]/g, '')}.png`;
-    await initPersona(avatarId, personaName, '', personaTitle);
     await uploadUserAvatar(default_user_avatar, avatarId);
+    await initPersona(avatarId, personaName, '', personaTitle);
+    await getUserAvatars(true, avatarId);
+    document.querySelector(`#user_avatar_block [data-avatar-id="${CSS.escape(avatarId)}"] > .sr-only`)?.focus();
 }
 
 /**
@@ -810,6 +766,7 @@ export async function askForPersonaSelection(title, text, personas, { okButton =
 
         if (personasToHighlight && personasToHighlight.includes(block.dataset.pid)) {
             block.classList.add('is_active');
+            setAriaRelation(block.querySelector(':scope > .sr-only'), 'describedby', document.getElementById('persona_used_in_chat'));
             block.title = block.title + '\n\n' + t`Was used in current chat.`;
             if (block.classList.contains('is_fav')) block.title = block.title + '\n' + t`Is your default persona.`;
         }
@@ -843,7 +800,7 @@ export async function askForPersonaSelection(title, text, personas, { okButton =
         });
     }
 
-    const popup = new Popup(content, POPUP_TYPE.TEXT, '', { okButton: okButton, customButtons: customButtons });
+    const popup = new Popup(content, POPUP_TYPE.TEXT, '', { label: titleElement, okButton: okButton, customButtons: customButtons });
     const result = await popup.show();
     return Number(result) >= 100 ? personas[Number(result) - 100] : null;
 }
@@ -915,6 +872,7 @@ async function renamePersona(avatarId) {
     const currentName = power_user.personas[avatarId] || '';
     const currentTitle = power_user.persona_descriptions[avatarId]?.title || '';
     const newName = await Popup.show.input(t`Rename Persona`, t`Enter a new name for this persona:`, currentName, {
+        inputLabel: t`Enter a new name for this persona:`,
         customInputs: [{
             id: 'persona_title',
             type: 'text',
@@ -945,6 +903,14 @@ async function renamePersona(avatarId) {
     return true;
 }
 
+function applyPersonaDescription(descriptor) {
+    power_user.persona_description = descriptor.description ?? '';
+    power_user.persona_description_position = descriptor.position ?? persona_description_positions.IN_PROMPT;
+    power_user.persona_description_depth = descriptor.depth ?? DEFAULT_DEPTH;
+    power_user.persona_description_role = descriptor.role ?? DEFAULT_ROLE;
+    power_user.persona_description_lorebook = descriptor.lorebook ?? '';
+}
+
 /**
  * Selects the persona with the currently set avatar ID by updating the user name and persona description, and updating the locked persona if the setting is enabled.
  * @param {object} [options={}] - Optional settings
@@ -961,11 +927,7 @@ async function selectCurrentPersona({ toastPersonaNameChange = true } = {}) {
         setUserName(personaName, { toastPersonaNameChange: !shouldAutoLock && toastPersonaNameChange });
     }
 
-    power_user.persona_description = descriptor.description ?? '';
-    power_user.persona_description_position = descriptor.position ?? persona_description_positions.IN_PROMPT;
-    power_user.persona_description_depth = descriptor.depth ?? DEFAULT_DEPTH;
-    power_user.persona_description_role = descriptor.role ?? DEFAULT_ROLE;
-    power_user.persona_description_lorebook = descriptor.lorebook ?? '';
+    applyPersonaDescription(descriptor);
 
     setPersonaDescription({
         displayName: personaName ? personaName : UNNAMED_PERSONA,
@@ -1188,6 +1150,8 @@ async function deletePersona(avatarId, { silent = false } = {}) {
         }
     }
 
+    // Finish edits already in flight before removing the card they update.
+    await saveSettings();
     const request = await fetch('/api/avatars/delete', {
         method: 'POST',
         headers: getRequestHeaders(),
@@ -1236,7 +1200,7 @@ async function onPersonaDescriptionInput() {
     power_user.persona_description = String($('#persona_description').val());
     countPersonaDescriptionTokens();
 
-    if (power_user.personas[user_avatar]) {
+    if (user_avatar) {
         const object = getOrCreatePersonaDescriptor();
         object.description = power_user.persona_description;
     }
@@ -1246,7 +1210,7 @@ async function onPersonaDescriptionInput() {
         .toggleClass('text_muted', !power_user.persona_description);
     saveSettingsDebounced();
 
-    if (power_user.personas[user_avatar]) {
+    if (user_avatar) {
         await eventSource.emit(event_types.PERSONA_UPDATED, user_avatar);
     }
 }
@@ -1254,14 +1218,14 @@ async function onPersonaDescriptionInput() {
 async function onPersonaDescriptionDepthValueInput() {
     power_user.persona_description_depth = Number($('#persona_depth_value').val());
 
-    if (power_user.personas[user_avatar]) {
+    if (user_avatar) {
         const object = getOrCreatePersonaDescriptor();
         object.depth = power_user.persona_description_depth;
     }
 
     saveSettingsDebounced();
 
-    if (power_user.personas[user_avatar]) {
+    if (user_avatar) {
         await eventSource.emit(event_types.PERSONA_UPDATED, user_avatar);
     }
 }
@@ -1269,14 +1233,14 @@ async function onPersonaDescriptionDepthValueInput() {
 async function onPersonaDescriptionDepthRoleInput() {
     power_user.persona_description_role = Number($('#persona_depth_role').find(':selected').val());
 
-    if (power_user.personas[user_avatar]) {
+    if (user_avatar) {
         const object = getOrCreatePersonaDescriptor();
         object.role = power_user.persona_description_role;
     }
 
     saveSettingsDebounced();
 
-    if (power_user.personas[user_avatar]) {
+    if (user_avatar) {
         await eventSource.emit(event_types.PERSONA_UPDATED, user_avatar);
     }
 }
@@ -1303,6 +1267,8 @@ async function onPersonaLoreButtonClick({ shiftKey, altKey }) {
 
     const worldSelect = template.find('select');
     template.find('.persona_name').text(personaName);
+    setAriaRelation(worldSelect[0], 'labelledby', template.find('h4')[0]);
+    setAriaRelation(worldSelect[0], 'describedby', template.find('[data-i18n="persona_world_template_txt"]')[0]);
 
     for (const worldName of world_names) {
         const option = document.createElement('option');
@@ -1315,7 +1281,7 @@ async function onPersonaLoreButtonClick({ shiftKey, altKey }) {
     worldSelect.on('change', async function () {
         power_user.persona_description_lorebook = String($(this).val());
 
-        if (power_user.personas[user_avatar]) {
+        if (user_avatar) {
             const object = getOrCreatePersonaDescriptor();
             object.lorebook = power_user.persona_description_lorebook;
         }
@@ -1323,12 +1289,12 @@ async function onPersonaLoreButtonClick({ shiftKey, altKey }) {
         $('#persona_lore_button').toggleClass('world_set', !!power_user.persona_description_lorebook);
         saveSettingsDebounced();
 
-        if (power_user.personas[user_avatar]) {
+        if (user_avatar) {
             await eventSource.emit(event_types.PERSONA_UPDATED, user_avatar);
         }
     });
 
-    await callGenericPopup(template, POPUP_TYPE.TEXT);
+    await callGenericPopup(template, POPUP_TYPE.TEXT, '', { label: template.find('h4')[0] });
 }
 
 async function onPersonaDescriptionPositionInput() {
@@ -1336,7 +1302,7 @@ async function onPersonaDescriptionPositionInput() {
         $('#persona_description_position').find(':selected').val(),
     );
 
-    if (power_user.personas[user_avatar]) {
+    if (user_avatar) {
         const object = getOrCreatePersonaDescriptor();
         object.position = power_user.persona_description_position;
     }
@@ -1344,12 +1310,13 @@ async function onPersonaDescriptionPositionInput() {
     saveSettingsDebounced();
     $('#persona_depth_position_settings').toggle(power_user.persona_description_position === persona_description_positions.AT_DEPTH);
 
-    if (power_user.personas[user_avatar]) {
+    if (user_avatar) {
         await eventSource.emit(event_types.PERSONA_UPDATED, user_avatar);
     }
 }
 
 export function getOrCreatePersonaDescriptor() {
+    power_user.personas[user_avatar] ??= name1;
     return ensurePersonaDescriptor(user_avatar, {
         description: power_user.persona_description,
         position: power_user.persona_description_position,
@@ -1473,18 +1440,19 @@ function updatePersonaUIStates({ navigateToCurrent = false } = {}) {
         $(this).toggleClass('locked_to_chat', states.locked.chat);
         $(this).toggleClass('locked_to_character', states.locked.character);
         $(this).toggleClass('selected', avatarId === user_avatar);
+        $(this.querySelector(':scope > .sr-only')).attr('aria-current', avatarId === user_avatar ? 'true' : null);
     });
 
     // Buttons for the persona panel on the right
     const personaStates = getPersonaStates(user_avatar);
 
-    $('#lock_persona_default').toggleClass('locked', personaStates.default);
+    $('#lock_persona_default').toggleClass('locked', personaStates.default).attr('aria-pressed', String(personaStates.default));
 
-    $('#lock_user_name').toggleClass('locked', personaStates.locked.chat);
+    $('#lock_user_name').toggleClass('locked', personaStates.locked.chat).attr('aria-pressed', String(personaStates.locked.chat));
     $('#lock_user_name i.icon').toggleClass('fa-lock', personaStates.locked.chat);
     $('#lock_user_name i.icon').toggleClass('fa-unlock', !personaStates.locked.chat);
 
-    $('#lock_persona_to_char').toggleClass('locked', personaStates.locked.character);
+    $('#lock_persona_to_char').toggleClass('locked', personaStates.locked.character).attr('aria-pressed', String(personaStates.locked.character));
     $('#lock_persona_to_char i.icon').toggleClass('fa-lock', personaStates.locked.character);
     $('#lock_persona_to_char i.icon').toggleClass('fa-unlock', !personaStates.locked.character);
 
@@ -1561,7 +1529,7 @@ async function loadPersonaForCurrentChat({ doRender = false } = {}) {
     const userAvatars = await getUserAvatars(doRender);
 
     // Check if the user avatar is set and exists in the list of user avatars
-    if (userAvatars.length && !userAvatars.includes(user_avatar)) {
+    if (userAvatars.length && !userAvatars.includes(user_avatar) && !chat_metadata.persona) {
         console.log(`User avatar ${user_avatar} not found in user avatars list, pick the first available one`);
         await setUserAvatar(userAvatars[0], { toastPersonaNameChange: false, navigateToCurrent: true });
     }
@@ -1579,10 +1547,8 @@ async function loadPersonaForCurrentChat({ doRender = false } = {}) {
 
         // Verify it exists
         if (!userAvatars.includes(chatPersona)) {
-            console.warn('Chat-locked persona avatar not found, unlocking persona');
-            delete chat_metadata.persona;
-            saveSettingsDebounced();
-            chatPersona = '';
+            console.warn('Chat-locked persona is unavailable on this device');
+            return false;
         }
         if (chatPersona) connectType = 'chat';
     }
@@ -1642,17 +1608,9 @@ async function loadPersonaForCurrentChat({ doRender = false } = {}) {
         if (chatPersona) connectType = 'default';
     }
 
-    // Whatever way we selected a persona, if it doesn't exist, unlock this chat
-    if (chat_metadata.persona && !userAvatars.includes(chat_metadata.persona)) {
-        console.warn('Persona avatar not found, unlocking persona');
-        delete chat_metadata.persona;
-    }
-
-    // Default persona missing
-    if (power_user.default_persona && !userAvatars.includes(power_user.default_persona)) {
-        console.warn('Default persona avatar not found, clearing default persona');
-        power_user.default_persona = null;
-        saveSettingsDebounced();
+    if (chatPersona && !userAvatars.includes(chatPersona)) {
+        console.warn(`Persona ${chatPersona} is unavailable on this device`);
+        return false;
     }
 
     // Persona avatar found, select it
@@ -1800,8 +1758,7 @@ async function onPersonasRestoreInput(e) {
         defaultRole: DEFAULT_ROLE,
     };
 
-    const restoreResult = restorePersonasFromBackup(power_user, data, descriptorDefaults);
-    const warnings = restoreResult.warnings;
+    const warnings = [];
 
     for (const avatarId of Object.keys(data.personas)) {
         if (avatarSet.has(avatarId)) {
@@ -1817,6 +1774,7 @@ async function onPersonasRestoreInput(e) {
         avatarSet.add(avatarId);
     }
 
+    warnings.push(...restorePersonasFromBackup(power_user, data, descriptorDefaults).warnings);
     if (warnings.length) {
         toastr.success(t`Personas restored with warnings. Check console for details.`, t`Persona Management`);
         console.warn(`PERSONA RESTORE REPORT\n====================\n${warnings.join('\n')}`);
@@ -1941,19 +1899,6 @@ async function duplicatePersona(avatarId, { silent = false, select = false } = {
     return newAvatarId;
 }
 
-/**
- * If a current user avatar is not bound to persona, bind it.
- */
-async function migrateNonPersonaUser() {
-    if (user_avatar in power_user.personas) {
-        return;
-    }
-
-    await initPersona(user_avatar, name1, '', '', { silent: true });
-    setPersonaDescription();
-    await getUserAvatars(true, user_avatar);
-}
-
 const ROLE_NAME_MAP = Object.freeze({
     system: 0,
     user: 1,
@@ -2028,7 +1973,7 @@ async function uploadPersonaAvatar(avatarId, base64Data, { resizePrompt = false 
     let finalImageData = base64Data;
 
     if (resizePrompt && !power_user.never_resize_avatars) {
-        const popup = new Popup(t`Set the crop position of the avatar image`, POPUP_TYPE.CROP, '', { cropImage: base64Data });
+        const popup = new Popup(t`Set the crop position of the avatar image`, POPUP_TYPE.CROP, '', { label: t`Set the crop position of the avatar image`, cropImage: base64Data });
         const croppedImage = await popup.show();
         if (!croppedImage) {
             return false;
@@ -2788,7 +2733,6 @@ function registerPersonaSlashCommands() {
  * This is called during the initialization of the page.
  */
 export async function initPersonas() {
-    await migrateNonPersonaUser();
     registerPersonaSlashCommands();
     $('#persona_delete_button').on('click', deleteUserAvatar);
     $('#lock_persona_default').on('click', () => togglePersonaLock('default'));
@@ -2819,7 +2763,7 @@ export async function initPersonas() {
         const value = String($(this).val());
         // Save sort order, but do not save search sorting, as this is a temporary sorting option
         if (value !== 'search') power_user.persona_sort_order = value;
-        getUserAvatars(true, user_avatar);
+        renderUserAvatars(user_avatar);
         saveSettingsDebounced();
     });
     $('#persona_grid_toggle').on('click', () => {
@@ -2847,12 +2791,10 @@ export async function initPersonas() {
 
     $('#persona_rename_button').on('click', () => renamePersona(user_avatar));
 
-    $(document).on('click', '#user_avatar_block .avatar_upload', function () {
-        $('#avatar_upload_overwrite').val('');
-        $('#avatar_upload_file').trigger('click');
+    $('#persona_duplicate_button').on('click', async () => {
+        const avatarId = await duplicatePersona(user_avatar);
+        if (avatarId) document.querySelector(`#user_avatar_block [data-avatar-id="${CSS.escape(avatarId)}"] > .sr-only`)?.focus();
     });
-
-    $('#persona_duplicate_button').on('click', () => duplicatePersona(user_avatar));
 
     $('#persona_set_image_button').on('click', function () {
         if (!user_avatar) {

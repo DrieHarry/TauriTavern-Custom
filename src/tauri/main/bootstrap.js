@@ -1,17 +1,17 @@
-import { invoke, isTauri as isTauriRuntime } from '../../tauri-bridge.js';
+import { installWindowLayout } from '../../scripts/util/window-layout.js';
+import { installWindowBackdrop } from '../../scripts/window-backdrop.js';
+import { installDrawerBar } from '../../scripts/drawer-bar.js';
+import { invoke } from '../../tauri-bridge.js';
+import { eventSource, event_types } from '../../scripts/events.js';
 import { createTauriMainContext } from './context.js';
 import { createDownloadBridge } from './download-bridge.js';
 import { createInterceptors } from './interceptors.js';
 import { createRouteRegistry } from './router.js';
 import { installBackNavigationBridge } from './back-navigation.js';
 import { installNativeShareBridge } from './share-target-bridge.js';
-import { downloadBlobWithRuntime, isNativeMobileDownloadRuntime } from '../../scripts/file-export.js';
+import { deliverBlob, deliverRemoteFile } from '../../scripts/file-export.js';
 import { showExportFailureToast, showExportSuccessToast } from '../../scripts/download-feedback.js';
-import { installAndroidImeLayoutHost } from './compat/mobile/android-ime-layout-host.js';
-import { installMobileGeometryFirewall } from './compat/mobile/mobile-geometry-firewall.js';
-import { installMobileIframeViewportContractBridge } from './compat/mobile/mobile-iframe-viewport-contract-bridge.js';
-import { installMobileImeSurfaceController } from './compat/mobile/mobile-ime-surface-controller.js';
-import { installMobileOverlayCompatController } from './compat/mobile/mobile-overlay-compat-controller.js';
+import { hostPlatform, isDesktopHost, isMobileHost } from '../../scripts/util/host-identity.js';
 import { installMobileRuntimeCompat } from './compat/mobile/mobile-runtime-compat.js';
 import { installMobileWindowOpenCompat } from './compat/mobile/mobile-window-open-compat.js';
 import { installDialogPolyfillCoverage } from './compat/dialog/dialog-polyfill-coverage.js';
@@ -20,6 +20,7 @@ import { extractErrorText, resolveHostErrorResponse } from './kernel/host-error-
 import { isAbortError } from './kernel/abort-error.js';
 import { installMainApiOptionParking } from './adapters/st/main-api-selector-option-parking.js';
 import { installWorldInfoGlobalSelectorSelect2Enforcer } from './adapters/st/world-info-global-selector-select2-enforcer.js';
+import { confirmImageDownload } from './adapters/st/image-download-popup.js';
 import {
     installDesktopFullscreenShortcut,
     leaveDesktopFullscreenForShutdown,
@@ -30,6 +31,7 @@ import { installCharacterCardsApi } from './api/character-cards.js';
 import { installAgentApi } from './api/agent.js';
 import { installDevApi } from './api/dev.js';
 import { installExtensionStoreApi } from './api/extension-store.js';
+import { installDbApi } from './api/db.js';
 import { installLayoutApi } from './api/layout.js';
 import { installLlmConnectionsApi } from './api/llm-connection.js';
 import { installMcpApi } from './api/mcp.js';
@@ -41,8 +43,8 @@ import {
     getMethod,
     getMethodHint,
     jsonResponse,
+    ownedJsonResponse,
     readRequestBody,
-    safeJson,
     textResponse,
     toUrl,
 } from './http-utils.js';
@@ -52,7 +54,7 @@ import { installFrontendLogCapture, setFrontendLogBackendForwardingEnabled } fro
 import { registerLifecycleFlushHandler } from './services/lifecycle/lifecycle-flush-service.js';
 import { preinstallPanelRuntime } from './services/panel-runtime/preinstall.js';
 let bootstrapped = false;
-const HOST_ABI_VERSION = 1;
+const HOST_ABI_VERSION = 2;
 
 function isPerfHudEnabled() {
     try {
@@ -100,34 +102,6 @@ function safePerfMeasure(name, startMark, endMark) {
     }
 }
 
-function isMobileUserAgent() {
-    // NOTE: Intentionally self-contained UA check.
-    // This runs in the Tauri bootstrap composition root; importing a shared helper here risks
-    // pulling in higher-level app modules (and potential side effects / cycles) too early.
-    if (typeof navigator === 'undefined') {
-        return false;
-    }
-
-    const userAgent = typeof navigator.userAgent === 'string' ? navigator.userAgent : '';
-    if (/android|iphone|ipad|ipod/i.test(userAgent)) {
-        return true;
-    }
-
-    return navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
-}
-
-function installTauriMobileCompat() {
-    for (const install of [
-        installMobileRuntimeCompat,
-        installMobileGeometryFirewall,
-        installAndroidImeLayoutHost,
-        installMobileImeSurfaceController,
-        installMobileOverlayCompatController,
-    ]) {
-        install();
-    }
-}
-
 function getWindowOrigin(targetWindow) {
     try {
         const origin = String(targetWindow?.location?.origin || '');
@@ -168,7 +142,7 @@ function installHostAbi(context) {
     };
 }
 
-function installSameOriginWindowPatches(interceptors, downloadBridge, { iframeContractBridge, runtimeCompat } = {}) {
+function installSameOriginWindowPatches(interceptors, downloadBridge, { runtimeCompat } = {}) {
     const trackedIframes = new WeakSet();
 
     const patchWindow = (targetWindow) => {
@@ -196,7 +170,6 @@ function installSameOriginWindowPatches(interceptors, downloadBridge, { iframeCo
             } catch {
                 // Ignore cross-origin access failures.
             }
-            iframeContractBridge?.watchIframe?.(iframeElement);
         };
 
         iframeElement.addEventListener('load', patchFromIframe);
@@ -261,7 +234,7 @@ function installSameOriginWindowPatches(interceptors, downloadBridge, { iframeCo
 }
 
 export function bootstrapTauriMain() {
-    if (!isTauriRuntime() || bootstrapped) {
+    if (bootstrapped) {
         return;
     }
     bootstrapped = true;
@@ -271,11 +244,12 @@ export function bootstrapTauriMain() {
     if (perfEnabled) {
         safePerfMark('tt:tauri:bootstrap:start');
     }
-    const isMobile = isMobileUserAgent(); if (isMobile) installTauriMobileCompat();
+    const isMobile = isMobileHost();
+    if (isMobile) installMobileRuntimeCompat();
 
     installFrontendLogCapture();
     installDialogPolyfillCoverage();
-    if (!isMobile) {
+    if (isDesktopHost()) {
         installDesktopFullscreenShortcut();
         registerLifecycleFlushHandler('desktop-fullscreen', leaveDesktopFullscreenForShutdown);
     }
@@ -284,7 +258,9 @@ export function bootstrapTauriMain() {
     installNativeShareBridge();
 
     const context = createTauriMainContext({ invoke });
-    installHostAbi(context); installLayoutApi(context); installChatApi(context); installChatSurfaceApi(); installCharacterCardsApi(context); installAgentApi(context); installLlmConnectionsApi(context); installMcpApi(context); installNativePluginsApi(context); installSkillApi(context); installDevApi(context); installExtensionStoreApi(context); installWorldInfoApi();
+    installHostAbi(context); installLayoutApi(); installChatApi(context); installChatSurfaceApi(); installCharacterCardsApi(context);
+    const restoreAgentAssemblyBridges = installAgentApi(context);
+    installLlmConnectionsApi(context); installMcpApi(context); installNativePluginsApi(context); installSkillApi(context); installDevApi(context); installExtensionStoreApi(context); installDbApi(context); installWorldInfoApi();
     installMainApiOptionParking();
     installWorldInfoGlobalSelectorSelect2Enforcer();
     if (perfEnabled) {
@@ -297,7 +273,7 @@ export function bootstrapTauriMain() {
         window.__TAURITAVERN_PERF_READY__ = perfReadyPromise;
     }
     const router = createRouteRegistry();
-    registerRoutes(router, context, { jsonResponse, textResponse });
+    registerRoutes(router, context, { jsonResponse, ownedJsonResponse, textResponse });
 
     const nextTraceId = createTraceIdFactory('req');
 
@@ -316,7 +292,7 @@ export function bootstrapTauriMain() {
         let method = 'GET';
         try {
             method = await getMethod(input, init);
-            const body = await readRequestBody(input, init);
+            const body = await readRequestBody(input, init, router.bodyMode(method, url.pathname));
             const response = await router.handle({
                 url,
                 path: url.pathname,
@@ -327,7 +303,8 @@ export function bootstrapTauriMain() {
                 traceId,
             });
 
-            const finalResponse = response || jsonResponse({ error: `Unsupported endpoint: ${url.pathname}` }, 404);
+            const unsupported = `Unsupported endpoint: ${url.pathname}`;
+            const finalResponse = response || jsonResponse({ error: unsupported }, 404, unsupported);
             finalResponse.headers.set(DEFAULT_TRACE_HEADER, traceId);
             const durationMs = (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
             return finalResponse;
@@ -354,19 +331,18 @@ export function bootstrapTauriMain() {
     };
 
     const interceptors = createInterceptors({
-        isTauri: true,
         originalFetch: window.fetch.bind(window),
         canHandleRequest,
         toUrl,
         routeRequest,
-        jsonResponse,
-        safeJson,
     });
     const downloadBridge = createDownloadBridge({
-        isNativeMobileDownloadRuntime,
-        downloadBlobWithRuntime,
+        deliverBlob,
+        deliverRemoteFile,
         notifyDownloadResult: showExportSuccessToast,
         notifyDownloadError: showExportFailureToast,
+        // Android WebView has no image context menu, so the bridge supplies that default action.
+        confirmImageDownload: hostPlatform() === 'android' ? confirmImageDownload : null,
     });
 
     interceptors.patchFetch();
@@ -381,10 +357,10 @@ export function bootstrapTauriMain() {
         }
     };
     installSameOriginWindowPatches(interceptors, downloadBridge, {
-        iframeContractBridge: isMobile ? installMobileIframeViewportContractBridge() : null,
         runtimeCompat,
     });
-    if (isMobile) installMobileWindowOpenCompat(); preinstallPanelRuntime();
+    if (isMobile) installMobileWindowOpenCompat();
+    preinstallPanelRuntime();
     const readyPromise = initializeTauriIntegration(
         context,
         interceptors,
@@ -393,24 +369,29 @@ export function bootstrapTauriMain() {
         perfReadyPromise,
         safePerfMark,
     );
-    void readyPromise.catch((error) => {
-        console.error('Failed to initialize Tauri integration:', error);
-    });
     const runAfterTauriReady = (callback) => {
         void readyPromise.then(callback, () => {});
     };
     window.__TAURITAVERN_MAIN_READY__ = readyPromise;
-    if (window.__TAURITAVERN__) {
-        window.__TAURITAVERN__.ready = readyPromise;
-    }
+    window.__TAURITAVERN__.ready = readyPromise;
 
     runAfterTauriReady(() => setFrontendLogBackendForwardingEnabled(true));
+    runAfterTauriReady(() => {
+        installWindowBackdrop(context);
+        installDrawerBar(context);
+        void installWindowLayout(context).catch(error => console.error('[TauriTavern] Window layout:', error));
+    });
 
     runAfterTauriReady(() => import('../../scripts/tauri/setting/setting-panel.js')
         .then(({ installTauriTavernSettingsPanel }) => installTauriTavernSettingsPanel())
         .catch((error) => { console.warn('TauriTavern: Failed to load settings panels:', error); }));
-    runAfterTauriReady(() => import('../../scripts/tauri/regex/native-regex-settings.js')
-        .then(({ installNativeRegexBackendSetting }) => installNativeRegexBackendSetting()));
+    eventSource.once(event_types.APP_READY, restoreAgentAssemblyBridges);
+    // This panel imports application state as well as rendering it.
+    eventSource.once(event_types.APP_READY, () => {
+        void import('../../scripts/tauri/generation-params/panel.js')
+            .then(({ installGenerationParamsPanel }) => installGenerationParamsPanel())
+            .catch((error) => { console.error('TauriTavern: Failed to install generation parameter panel:', error); });
+    });
     runAfterTauriReady(() => import('./services/dynamic-theme/install.js')
         .then(({ installDynamicTheme }) => installDynamicTheme()));
     if (!isEmbeddedRuntimeTakeoverDisabled()) {

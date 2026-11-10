@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -6,11 +7,14 @@ use serde_json::{Map, Value};
 use crate::errors::ApplicationError;
 use tt_domain::models::llm_connection::{
     LLM_CONNECTION_KIND, LLM_CONNECTION_SCHEMA_VERSION, LlmConnectionDefinition, LlmConnectionId,
-    LlmConnectionSecretRef, LlmConnectionSummary,
+    LlmConnectionReverseProxy, LlmConnectionSummary,
 };
 use tt_domain::models::secret::SecretKeys;
 use tt_ports::repositories::chat_completion_repository::ChatCompletionSource;
 use tt_ports::repositories::llm_connection_repository::LlmConnectionRepository;
+use tt_ports::repositories::settings_repository::SettingsRepository;
+
+use super::chat_completion_service::opencode;
 
 pub(crate) const CONNECTION_PAYLOAD_KEYS: &[&str] = &[
     "chat_completion_source",
@@ -33,6 +37,7 @@ const ALLOWED_CUSTOM_API_FORMATS: &[&str] = &[
     "openai_responses",
     "claude_messages",
     "gemini_interactions",
+    "gemini_generate_content",
 ];
 
 const ADAPTER_HINT_ENABLED: &str = "enabled";
@@ -52,6 +57,16 @@ struct SourceSpecificFieldSpec {
 }
 
 const SOURCE_SPECIFIC_FIELD_SPECS: &[SourceSpecificFieldSpec] = &[
+    SourceSpecificFieldSpec {
+        key: "opencode_endpoint",
+        source: ChatCompletionSource::OpenCode,
+        kind: SourceSpecificValueKind::NonEmptyString,
+    },
+    SourceSpecificFieldSpec {
+        key: "opencode_api_format",
+        source: ChatCompletionSource::OpenCode,
+        kind: SourceSpecificValueKind::NonEmptyString,
+    },
     SourceSpecificFieldSpec {
         key: "vertexai_auth_mode",
         source: ChatCompletionSource::VertexAi,
@@ -85,6 +100,11 @@ const SOURCE_SPECIFIC_FIELD_SPECS: &[SourceSpecificFieldSpec] = &[
     SourceSpecificFieldSpec {
         key: "moonshot_endpoint",
         source: ChatCompletionSource::Moonshot,
+        kind: SourceSpecificValueKind::NonEmptyString,
+    },
+    SourceSpecificFieldSpec {
+        key: "pollinations_endpoint",
+        source: ChatCompletionSource::Pollinations,
         kind: SourceSpecificValueKind::NonEmptyString,
     },
     SourceSpecificFieldSpec {
@@ -147,7 +167,10 @@ pub struct ResolvedLlmModelBinding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_api_format: Option<String>,
     pub model_id: String,
-    pub secret_ref: ResolvedLlmSecretRef,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_specific: BTreeMap<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<ResolvedLlmSecretRef>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,6 +184,7 @@ pub struct ResolvedLlmSecretRef {
 
 pub struct LlmConnectionService {
     repository: Arc<dyn LlmConnectionRepository>,
+    settings_repository: Arc<dyn SettingsRepository>,
 }
 
 struct ResolvedConnectionBinding {
@@ -173,7 +197,6 @@ struct ResolvedConnectionBinding {
 
 impl ResolvedConnectionBinding {
     fn model_binding(&self) -> ResolvedLlmModelBinding {
-        let secret_ref = secret_ref(&self.connection);
         ResolvedLlmModelBinding {
             mode: "connectionRef".to_string(),
             connection_ref: self.connection_ref.clone(),
@@ -181,19 +204,28 @@ impl ResolvedConnectionBinding {
             chat_completion_source: self.source.key().to_string(),
             custom_api_format: self.custom_api_format.clone(),
             model_id: self.model_id.clone(),
-            secret_ref: ResolvedLlmSecretRef {
-                key: secret_ref.key.trim().to_string(),
-                id: secret_ref.id.trim().to_string(),
-                label_snapshot: trimmed_option(secret_ref.label_snapshot.as_deref())
-                    .map(str::to_string),
-            },
+            source_specific: self.connection.endpoint.source_specific.clone(),
+            secret_ref: self.connection.auth.secret_ref.as_ref().map(|secret_ref| {
+                ResolvedLlmSecretRef {
+                    key: secret_ref.key.trim().to_string(),
+                    id: secret_ref.id.trim().to_string(),
+                    label_snapshot: trimmed_option(secret_ref.label_snapshot.as_deref())
+                        .map(str::to_string),
+                }
+            }),
         }
     }
 }
 
 impl LlmConnectionService {
-    pub fn new(repository: Arc<dyn LlmConnectionRepository>) -> Self {
-        Self { repository }
+    pub fn new(
+        repository: Arc<dyn LlmConnectionRepository>,
+        settings_repository: Arc<dyn SettingsRepository>,
+    ) -> Self {
+        Self {
+            repository,
+            settings_repository,
+        }
     }
 
     pub async fn list_connections(&self) -> Result<Vec<LlmConnectionSummary>, ApplicationError> {
@@ -280,16 +312,17 @@ impl LlmConnectionService {
             payload.insert(key.clone(), value.clone());
         }
 
-        payload.insert(
-            "secret_id".to_string(),
-            Value::String(secret_ref(&resolved.connection).id.trim().to_string()),
-        );
+        if let Some(secret_ref) = &resolved.connection.auth.secret_ref {
+            payload.insert(
+                "secret_id".to_string(),
+                Value::String(secret_ref.id.trim().to_string()),
+            );
+        }
 
         if let Some(reverse_proxy) = resolved.connection.routing.reverse_proxy.as_ref() {
-            payload.insert(
-                "reverse_proxy".to_string(),
-                Value::String(reverse_proxy.url.trim().to_string()),
-            );
+            let (url, password) = self.resolve_reverse_proxy(reverse_proxy).await?;
+            payload.insert("reverse_proxy".to_string(), Value::String(url));
+            payload.insert("proxy_password".to_string(), Value::String(password));
         }
 
         if let Some(value) = trimmed_option(
@@ -368,6 +401,52 @@ impl LlmConnectionService {
         }
 
         Ok(resolved.model_binding())
+    }
+
+    async fn resolve_reverse_proxy(
+        &self,
+        proxy: &LlmConnectionReverseProxy,
+    ) -> Result<(String, String), ApplicationError> {
+        let preset = match proxy {
+            LlmConnectionReverseProxy::Url { url } => {
+                return Ok((url.trim().to_string(), String::new()));
+            }
+            LlmConnectionReverseProxy::Preset { preset } => preset.trim(),
+        };
+        let settings = self
+            .settings_repository
+            .load_user_settings()
+            .await?
+            .settings;
+        let saved = settings
+            .data
+            .get("proxies")
+            .and_then(Value::as_array)
+            .and_then(|proxies| {
+                proxies
+                    .iter()
+                    .find(|proxy| proxy.get("name").and_then(Value::as_str) == Some(preset))
+            })
+            .ok_or_else(|| {
+                ApplicationError::ValidationError(format!(
+                    "llm_connection.proxy_preset_missing: proxy preset `{preset}` was not found"
+                ))
+            })?;
+        let url = saved
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| {
+                ApplicationError::ValidationError(format!(
+                    "llm_connection.proxy_preset_url_missing: proxy preset `{preset}` has no URL"
+                ))
+            })?;
+        let password = saved
+            .get("password")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Ok((url.to_string(), password.to_string()))
     }
 
     pub async fn resolve_model_binding(
@@ -586,6 +665,23 @@ fn validate_source_specific(
         }
     }
 
+    if source == ChatCompletionSource::OpenCode {
+        opencode::resolve_format(
+            connection
+                .endpoint
+                .source_specific
+                .get("opencode_endpoint")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            connection
+                .endpoint
+                .source_specific
+                .get("opencode_api_format")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )?;
+    }
+
     if source == ChatCompletionSource::WorkersAi
         && !connection
             .endpoint
@@ -647,7 +743,14 @@ fn validate_auth(
     connection: &LlmConnectionDefinition,
     source: ChatCompletionSource,
 ) -> Result<(), ApplicationError> {
-    let secret_ref = secret_ref(connection);
+    let Some(secret_ref) = &connection.auth.secret_ref else {
+        if connection.routing.reverse_proxy.is_some() {
+            return Ok(());
+        }
+        return Err(ApplicationError::ValidationError(
+            "llm_connection.secret_ref_required: auth.secretRef is required without reverse proxy routing".to_string(),
+        ));
+    };
     if secret_ref.key.trim().is_empty() {
         return Err(ApplicationError::ValidationError(
             "llm_connection.secret_key_required: auth.secretRef.key cannot be empty".to_string(),
@@ -677,9 +780,13 @@ fn validate_routing(
     let Some(reverse_proxy) = connection.routing.reverse_proxy.as_ref() else {
         return Ok(());
     };
-    if reverse_proxy.url.trim().is_empty() {
+    let value = match reverse_proxy {
+        LlmConnectionReverseProxy::Url { url } => url,
+        LlmConnectionReverseProxy::Preset { preset } => preset,
+    };
+    if value.trim().is_empty() {
         return Err(ApplicationError::ValidationError(
-            "llm_connection.reverse_proxy_empty: routing.reverseProxy.url cannot be empty"
+            "llm_connection.reverse_proxy_empty: reverse proxy URL or preset cannot be empty"
                 .to_string(),
         ));
     }
@@ -700,10 +807,6 @@ fn normalized_custom_api_format(connection: &LlmConnectionDefinition) -> Option<
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase)
-}
-
-fn secret_ref(connection: &LlmConnectionDefinition) -> &LlmConnectionSecretRef {
-    &connection.auth.secret_ref
 }
 
 fn expected_secret_key(
@@ -730,6 +833,7 @@ fn expected_secret_key(
 
     match source {
         ChatCompletionSource::OpenAi => Ok(SecretKeys::OPENAI),
+        ChatCompletionSource::OpenCode => Ok(SecretKeys::OPENCODE),
         ChatCompletionSource::OpenRouter => Ok(SecretKeys::OPENROUTER),
         ChatCompletionSource::Custom => Ok(SecretKeys::CUSTOM),
         ChatCompletionSource::Claude => Ok(SecretKeys::CLAUDE),
@@ -745,6 +849,8 @@ fn expected_secret_key(
         ChatCompletionSource::Zai => Ok(SecretKeys::ZAI),
         ChatCompletionSource::MiniMax => Ok(SecretKeys::MINIMAX),
         ChatCompletionSource::AwsBedrock => Ok(SecretKeys::AWS_BEDROCK),
+        ChatCompletionSource::Xai => Ok(SecretKeys::XAI),
+        ChatCompletionSource::Pollinations => Ok(SecretKeys::POLLINATIONS),
         ChatCompletionSource::VertexAi => unreachable!("Vertex AI handled above"),
     }
 }
@@ -759,6 +865,7 @@ fn supports_reverse_proxy(source: ChatCompletionSource) -> bool {
             | ChatCompletionSource::DeepSeek
             | ChatCompletionSource::Moonshot
             | ChatCompletionSource::Zai
+            | ChatCompletionSource::Xai
     )
 }
 
@@ -768,6 +875,7 @@ fn trimmed_option(value: Option<&str>) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use crate::services::agent_run_retention_test_support::TestSettingsRepository;
     use serde_json::{Map, json};
 
     use super::{LlmConnectionService, validate_connection};
@@ -791,11 +899,11 @@ mod tests {
             },
             endpoint: LlmConnectionEndpoint::default(),
             auth: LlmConnectionAuth {
-                secret_ref: LlmConnectionSecretRef {
+                secret_ref: Some(LlmConnectionSecretRef {
                     key: "api_key_openrouter".to_string(),
                     id: "secret-1".to_string(),
                     label_snapshot: Some("Main".to_string()),
-                },
+                }),
             },
             routing: LlmConnectionRouting::default(),
             adapter_hints: LlmConnectionAdapterHints::default(),
@@ -808,7 +916,7 @@ mod tests {
         connection.id = LlmConnectionId::parse("bedrock-main").unwrap();
         connection.display_name = "Bedrock Main".to_string();
         connection.provider.chat_completion_source = "aws_bedrock".to_string();
-        connection.auth.secret_ref.key = "api_key_aws_bedrock".to_string();
+        connection.auth.secret_ref.as_mut().unwrap().key = "api_key_aws_bedrock".to_string();
         connection
             .endpoint
             .source_specific
@@ -823,7 +931,7 @@ mod tests {
         connection.provider.chat_completion_source = "custom".to_string();
         connection.provider.custom_api_format = Some(format.to_string());
         connection.endpoint.base_url = Some("https://example.test/v1".to_string());
-        connection.auth.secret_ref.key = "api_key_custom".to_string();
+        connection.auth.secret_ref.as_mut().unwrap().key = "api_key_custom".to_string();
         connection
     }
 
@@ -867,7 +975,7 @@ mod tests {
     #[test]
     fn validate_rejects_secret_namespace_mismatch() {
         let mut connection = openrouter_connection();
-        connection.auth.secret_ref.key = "api_key_openai".to_string();
+        connection.auth.secret_ref.as_mut().unwrap().key = "api_key_openai".to_string();
 
         let error = validate_connection(&connection).unwrap_err();
         assert!(error.to_string().contains("secret_key_mismatch"));
@@ -887,6 +995,25 @@ mod tests {
                 .to_string()
                 .contains("source_specific_source_mismatch")
         );
+    }
+
+    #[test]
+    fn validate_opencode_source_specific_contract() {
+        let mut connection = openrouter_connection();
+        connection.provider.chat_completion_source = "opencode".to_string();
+        connection.auth.secret_ref.as_mut().unwrap().key = "api_key_opencode".to_string();
+        connection
+            .endpoint
+            .source_specific
+            .insert("opencode_api_format".to_string(), json!("gemini"));
+
+        for endpoint in ["zen", "go"] {
+            connection
+                .endpoint
+                .source_specific
+                .insert("opencode_endpoint".to_string(), json!(endpoint));
+            validate_connection(&connection).expect("every OpenCode service should support Gemini");
+        }
     }
 
     #[test]
@@ -955,7 +1082,10 @@ mod tests {
     async fn apply_responses_connection_materializes_websocket_opt_in() {
         let mut connection = custom_connection("openai_responses");
         connection.adapter_hints.openai_responses_mode = Some("websocket".to_string());
-        let service = LlmConnectionService::new(std::sync::Arc::new(TestRepo { connection }));
+        let service = LlmConnectionService::new(
+            std::sync::Arc::new(TestRepo { connection }),
+            TestSettingsRepository::new(),
+        );
         let mut payload = json!({
             "custom_claude_prompt_caching": true,
             "custom_openai_responses_websocket": false,
@@ -978,9 +1108,12 @@ mod tests {
 
     #[tokio::test]
     async fn apply_connection_overlays_and_clears_stale_payload_fields() {
-        let service = LlmConnectionService::new(std::sync::Arc::new(TestRepo {
-            connection: openrouter_connection(),
-        }));
+        let service = LlmConnectionService::new(
+            std::sync::Arc::new(TestRepo {
+                connection: openrouter_connection(),
+            }),
+            TestSettingsRepository::new(),
+        );
         let mut payload = json!({
             "chat_completion_source": "custom",
             "custom_api_format": "gemini_interactions",
@@ -1018,9 +1151,12 @@ mod tests {
 
     #[tokio::test]
     async fn apply_bedrock_connection_overlays_source_specific_and_clears_stale_fields() {
-        let service = LlmConnectionService::new(std::sync::Arc::new(TestRepo {
-            connection: bedrock_connection(),
-        }));
+        let service = LlmConnectionService::new(
+            std::sync::Arc::new(TestRepo {
+                connection: bedrock_connection(),
+            }),
+            TestSettingsRepository::new(),
+        );
         let mut payload = json!({
             "chat_completion_source": "workers_ai",
             "workers_ai_account_id": "stale-account",

@@ -101,6 +101,7 @@ pub struct CodexAuthManager {
 struct ManagedCodexAuthPaths {
     auth_file: PathBuf,
     import_staging_root: PathBuf,
+    managed_only: bool,
 }
 
 static AUTH_MANAGER: LazyLock<Arc<CodexAuthManager>> =
@@ -113,9 +114,10 @@ pub(crate) fn codex_auth_manager() -> &'static CodexAuthManager {
 pub async fn configure_codex_auth_repository(
     auth_file: PathBuf,
     import_staging_root: PathBuf,
+    managed_only: bool,
 ) -> Arc<dyn CodexAuthRepository> {
     AUTH_MANAGER
-        .configure_managed_storage(auth_file, import_staging_root)
+        .configure_managed_storage(auth_file, import_staging_root, managed_only)
         .await;
     AUTH_MANAGER.clone()
 }
@@ -130,10 +132,16 @@ impl Default for CodexAuthManager {
 }
 
 impl CodexAuthManager {
-    async fn configure_managed_storage(&self, auth_file: PathBuf, import_staging_root: PathBuf) {
+    async fn configure_managed_storage(
+        &self,
+        auth_file: PathBuf,
+        import_staging_root: PathBuf,
+        managed_only: bool,
+    ) {
         *self.managed_paths.write().await = Some(ManagedCodexAuthPaths {
             auth_file,
             import_staging_root,
+            managed_only,
         });
     }
 
@@ -144,6 +152,7 @@ impl CodexAuthManager {
             managed_paths: RwLock::new(Some(ManagedCodexAuthPaths {
                 auth_file,
                 import_staging_root,
+                managed_only: false,
             })),
         }
     }
@@ -208,16 +217,10 @@ impl CodexAuthManager {
     async fn resolve_auth_file_path(&self) -> Result<PathBuf, DomainError> {
         let managed = self.managed_paths.read().await.clone();
 
-        if cfg!(any(target_os = "android", target_os = "ios")) {
-            return managed.map(|paths| paths.auth_file).ok_or_else(|| {
-                DomainError::InternalError(
-                    "TauriTavern managed Codex authentication storage is not configured"
-                        .to_string(),
-                )
-            });
-        }
-
         if let Some(paths) = managed.as_ref() {
+            if paths.managed_only {
+                return Ok(paths.auth_file.clone());
+            }
             match tokio::fs::try_exists(&paths.auth_file).await {
                 Ok(true) => return Ok(paths.auth_file.clone()),
                 Ok(false) => {}
@@ -260,7 +263,7 @@ impl CodexAuthRepository for CodexAuthManager {
         expected_existing: Option<&str>,
     ) -> Result<CodexAuthImportOutcome, DomainError> {
         let paths = self.require_managed_paths().await?;
-        if cfg!(any(target_os = "android", target_os = "ios")) {
+        if paths.managed_only {
             require_import_staging_path(source_path, &paths.import_staging_root)?;
         }
 
@@ -648,7 +651,8 @@ async fn persist_auth_file(
         ))
     })?;
 
-    let temp_path = crate::file_replace::unique_temp_path(auth_file);
+    let temp_path =
+        auth_file.with_file_name(format!(".tauritavern-{}.tmp", Uuid::new_v4().simple()));
     let write_result = async {
         let mut temp = tokio::fs::OpenOptions::new()
             .write(true)

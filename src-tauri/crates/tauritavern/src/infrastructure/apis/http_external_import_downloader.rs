@@ -4,12 +4,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderMap, HeaderName};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use url::Url;
 
-use tt_adapter_http::{HttpClientPool, HttpClientProfile};
+use tt_adapter_http::{HttpClientPool, HttpClientProfile, upstream};
 use tt_domain::errors::DomainError;
-use tt_ports::external_import::{DownloadByteLimit, DownloadedBytes, ExternalImportDownloader};
+use tt_ports::external_import::{
+    DownloadByteLimit, DownloadedBytes, DownloadedFile, ExternalImportDownloader,
+};
 
 pub struct HttpExternalImportDownloader {
     http_clients: Arc<HttpClientPool>,
@@ -29,7 +31,11 @@ impl ExternalImportDownloader for HttpExternalImportDownloader {
         limit: Option<DownloadByteLimit>,
     ) -> Result<DownloadedBytes, DomainError> {
         let client = self.http_clients.client(HttpClientProfile::Download)?;
-        let response = client.get(url).send().await.map_err(internal_error)?;
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(upstream::request_failure)?;
 
         if !response.status().is_success() {
             return Err(DomainError::InternalError(format!(
@@ -49,7 +55,7 @@ impl ExternalImportDownloader for HttpExternalImportDownloader {
         let headers = response.headers().clone();
         let bytes = match limit {
             Some(limit) => read_limited_response(response, limit).await?,
-            None => response.bytes().await.map_err(internal_error)?.to_vec(),
+            None => upstream::read_body(response).await?.to_vec(),
         };
 
         Ok(DownloadedBytes {
@@ -59,9 +65,13 @@ impl ExternalImportDownloader for HttpExternalImportDownloader {
         })
     }
 
-    async fn fetch_to_file(&self, url: Url, path: &Path) -> Result<(), DomainError> {
+    async fn fetch_to_file(&self, url: Url, path: &Path) -> Result<DownloadedFile, DomainError> {
         let client = self.http_clients.client(HttpClientProfile::Download)?;
-        let response = client.get(url).send().await.map_err(internal_error)?;
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(upstream::request_failure)?;
 
         if !response.status().is_success() {
             return Err(DomainError::InternalError(format!(
@@ -70,14 +80,22 @@ impl ExternalImportDownloader for HttpExternalImportDownloader {
             )));
         }
 
-        let mut file = tokio::fs::File::create(path)
+        let content_type = header_string(response.headers(), CONTENT_TYPE);
+        let file = tokio::fs::File::create(path)
             .await
             .map_err(internal_error)?;
+        let endpoint = response.url().clone();
+        let mut writer = BufWriter::with_capacity(64 * 1024, file);
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.try_next().await.map_err(internal_error)? {
-            file.write_all(&chunk).await.map_err(internal_error)?;
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|error| upstream::body_failure(error, &endpoint))?
+        {
+            writer.write_all(&chunk).await.map_err(internal_error)?;
         }
-        file.flush().await.map_err(internal_error)
+        writer.flush().await.map_err(internal_error)?;
+        Ok(DownloadedFile { content_type })
     }
 }
 
@@ -86,8 +104,13 @@ async fn read_limited_response(
     limit: DownloadByteLimit,
 ) -> Result<Vec<u8>, DomainError> {
     let mut bytes = Vec::new();
+    let endpoint = response.url().clone();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.try_next().await.map_err(internal_error)? {
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|error| upstream::body_failure(error, &endpoint))?
+    {
         let next_len = bytes
             .len()
             .checked_add(chunk.len())

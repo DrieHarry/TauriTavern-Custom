@@ -10,7 +10,9 @@ use tt_domain::errors::DomainError;
 use tt_domain::models::agent::{
     AgentRun, AgentRunEvent, AgentRunEventLevel, AgentRunStatus, AgentRunSummaryProjection,
 };
-use tt_domain::models::settings::{SettingsSnapshot, TauriTavernSettings, UserSettings};
+use tt_domain::models::settings::{
+    ChatBackupSettings, SettingsSnapshot, TauriTavernSettings, UserSettings,
+};
 use tt_ports::repositories::agent_run_repository::{
     AgentRunEventReadQuery, AgentRunListCursor, AgentRunListQuery, AgentRunRepository,
     AgentRunStorageEntryStats, AgentRunStorageStats, event_belongs_to_invocation,
@@ -47,15 +49,49 @@ impl SettingsRepository for TestSettingsRepository {
         Ok(self.tauritavern_settings.lock().await.clone())
     }
 
-    async fn save_user_settings(&self, _settings: &UserSettings) -> Result<(), DomainError> {
+    async fn reset_tauritavern_settings(
+        &self,
+        _chat_backups: ChatBackupSettings,
+    ) -> Result<(), DomainError> {
+        Err(unused_settings_method("reset_tauritavern_settings"))
+    }
+
+    async fn reset_user_settings(&self, _disabled: &[String]) -> Result<(), DomainError> {
+        Err(unused_settings_method("reset_user_settings"))
+    }
+
+    async fn save_user_settings(&self, _settings: UserSettings) -> Result<(), DomainError> {
         Err(unused_settings_method("save_user_settings"))
     }
 
-    async fn load_user_settings(&self) -> Result<UserSettings, DomainError> {
+    async fn load_user_settings(
+        &self,
+    ) -> Result<tt_ports::repositories::settings_repository::StoredUserSettings, DomainError> {
         Err(unused_settings_method("load_user_settings"))
     }
 
-    async fn create_snapshot(&self) -> Result<(), DomainError> {
+    async fn begin_commit(
+        &self,
+        _: Option<tt_domain::models::settings::revision::UserSettingsRevision>,
+    ) -> Result<tt_contracts::byte_commit::CommitBegin, DomainError> {
+        unreachable!()
+    }
+    async fn append_commit(&self, _: &str, _: u64, _: &[u8]) -> Result<u64, DomainError> {
+        unreachable!()
+    }
+    async fn finish_commit(
+        &self,
+        _: &str,
+        _: u64,
+    ) -> Result<tt_ports::repositories::settings_repository::SettingsCommitResult, DomainError>
+    {
+        unreachable!()
+    }
+    async fn abort_commit(&self, _: &str) -> Result<(), DomainError> {
+        unreachable!()
+    }
+
+    async fn create_snapshot(&self, _settings: UserSettings) -> Result<String, DomainError> {
         Err(unused_settings_method("create_snapshot"))
     }
 
@@ -65,10 +101,6 @@ impl SettingsRepository for TestSettingsRepository {
 
     async fn load_snapshot(&self, _name: &str) -> Result<UserSettings, DomainError> {
         Err(unused_settings_method("load_snapshot"))
-    }
-
-    async fn restore_snapshot(&self, _name: &str) -> Result<(), DomainError> {
-        Err(unused_settings_method("restore_snapshot"))
     }
 
     async fn get_sillytavern_settings_signature(
@@ -319,6 +351,24 @@ impl AgentRunRepository for TestAgentRunRepository {
         Ok(())
     }
 
+    async fn save_run_checkpoint(&self, _run_id: &str, _data: &[u8]) -> Result<(), DomainError> {
+        Err(DomainError::InternalError(
+            "Unexpected save_run_checkpoint call in retention test".to_string(),
+        ))
+    }
+
+    async fn load_run_checkpoint(&self, _run_id: &str) -> Result<Option<Vec<u8>>, DomainError> {
+        Err(DomainError::InternalError(
+            "Unexpected load_run_checkpoint call in retention test".to_string(),
+        ))
+    }
+
+    async fn reset_event_sequence(&self, _run_id: &str) -> Result<(), DomainError> {
+        Err(DomainError::InternalError(
+            "Unexpected reset_event_sequence call in retention test".to_string(),
+        ))
+    }
+
     async fn append_event(
         &self,
         run_id: &str,
@@ -404,17 +454,20 @@ fn next_event_seq(events: &[AgentRunEvent]) -> u64 {
 }
 
 fn run_matches_list_query(run: &AgentRun, query: &AgentRunListQuery) -> bool {
+    let Ok(chat) = run.chat_target() else {
+        return false;
+    };
     if query
         .chat_ref
         .as_ref()
-        .is_some_and(|chat_ref| &run.chat_ref != chat_ref)
+        .is_some_and(|chat_ref| &chat.chat_ref != chat_ref)
     {
         return false;
     }
     if query
         .stable_chat_id
         .as_ref()
-        .is_some_and(|stable_chat_id| &run.stable_chat_id != stable_chat_id)
+        .is_some_and(|stable_chat_id| &chat.stable_chat_id != stable_chat_id)
     {
         return false;
     }

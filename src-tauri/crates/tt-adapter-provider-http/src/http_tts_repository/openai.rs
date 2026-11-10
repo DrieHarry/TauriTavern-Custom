@@ -2,6 +2,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{Map, Value, json};
 
 use super::{bytes_response, send_with_retry, upstream_error_response};
+use tt_adapter_http::upstream;
 use tt_domain::errors::DomainError;
 use tt_ports::repositories::tts_repository::{
     ElectronHubTtsRequest, OpenAiTtsRequest, TtsRouteResponse,
@@ -45,7 +46,7 @@ pub(super) async fn handle_openai(
                 instructions,
                 is_mistral,
             );
-            let response = send_with_retry("OpenAI-compatible TTS request", || {
+            let response = send_with_retry(|| {
                 client
                     .post(endpoint.clone())
                     .bearer_auth(api_key.as_deref().unwrap_or_default())
@@ -60,6 +61,7 @@ pub(super) async fn handle_openai(
                     .await;
             }
 
+            let fallback_mime = get_audio_content_type(&response_format);
             let content_type = response
                 .headers()
                 .get(CONTENT_TYPE)
@@ -68,20 +70,20 @@ pub(super) async fn handle_openai(
                 .to_string();
 
             if content_type.contains("application/json") {
-                let json_data: Value = response.json().await.map_err(|error| {
+                let body = upstream::read_body(response).await?;
+                let json_data: Value = serde_json::from_slice(&body).map_err(|error| {
                     DomainError::InternalError(format!(
                         "OpenAI-compatible TTS JSON response read failed: {error}"
                     ))
                 })?;
-                let audio_b64 = json_data
-                    .get("audio_data")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        DomainError::InvalidData(
-                            "OpenAI-compatible TTS JSON response contains no audio_data"
-                                .to_string(),
-                        )
-                    })?;
+                let Some(audio_b64) = json_data.get("audio_data").and_then(Value::as_str) else {
+                    return Ok(TtsRouteResponse::text(
+                        502,
+                        format!(
+                            "OpenAI-compatible TTS request: Expected {fallback_mime}, got {content_type}"
+                        ),
+                    ));
+                };
                 let bytes = base64::Engine::decode(
                     &base64::engine::general_purpose::STANDARD,
                     audio_b64.as_bytes(),
@@ -89,23 +91,15 @@ pub(super) async fn handle_openai(
                 .map_err(|error| {
                     DomainError::InvalidData(format!("Failed to decode base64 audio_data: {error}"))
                 })?;
-                Ok(TtsRouteResponse::bytes(
-                    200,
-                    get_audio_content_type(&response_format),
-                    bytes,
-                ))
+                Ok(TtsRouteResponse::bytes(200, fallback_mime, bytes))
             } else {
-                let bytes = response.bytes().await.map_err(|error| {
-                    DomainError::InternalError(format!(
-                        "OpenAI-compatible TTS response read failed: {error}"
-                    ))
-                })?;
-                let mime = if !content_type.is_empty() {
-                    content_type.as_str()
-                } else {
-                    get_audio_content_type(&response_format)
-                };
-                Ok(TtsRouteResponse::bytes(200, mime, bytes.to_vec()))
+                bytes_response(
+                    response,
+                    "OpenAI-compatible TTS request",
+                    fallback_mime,
+                    true,
+                )
+                .await
             }
         }
     }
@@ -178,7 +172,7 @@ async fn generate_openai(
         payload["instructions"] = Value::String(instructions);
     }
 
-    let response = send_with_retry("OpenAI TTS request", || {
+    let response = send_with_retry(|| {
         client
             .post(OPENAI_TTS_URL)
             .bearer_auth(&api_key)
@@ -196,7 +190,7 @@ pub(super) async fn handle_electronhub(
 ) -> Result<TtsRouteResponse, DomainError> {
     match request {
         ElectronHubTtsRequest::Models { api_key } => {
-            let response = send_with_retry("ElectronHub model list request", || {
+            let response = send_with_retry(|| {
                 client
                     .get(ELECTRONHUB_MODELS_URL)
                     .bearer_auth(&api_key)
@@ -207,11 +201,12 @@ pub(super) async fn handle_electronhub(
                 return upstream_error_response(response, "ElectronHub model list request failed")
                     .await;
             }
-            let payload: Value = response.json().await.map_err(|error| {
-                DomainError::InternalError(format!(
-                    "ElectronHub model list response read failed: {error}"
-                ))
-            })?;
+            let payload: Value = serde_json::from_slice(&upstream::read_body(response).await?)
+                .map_err(|error| {
+                    DomainError::InternalError(format!(
+                        "ElectronHub model list response is not valid JSON: {error}"
+                    ))
+                })?;
             let models = payload
                 .get("data")
                 .and_then(Value::as_array)
@@ -237,7 +232,7 @@ pub(super) async fn handle_electronhub(
                 ));
             };
             normalize_electronhub_payload(payload);
-            let response = send_with_retry("ElectronHub TTS request", || {
+            let response = send_with_retry(|| {
                 client
                     .post(ELECTRONHUB_TTS_URL)
                     .bearer_auth(&api_key)
@@ -277,7 +272,7 @@ pub(super) async fn generate_chutes(
         "voice": voice,
         "speed": speed,
     });
-    let response = send_with_retry("Chutes TTS request", || {
+    let response = send_with_retry(|| {
         client
             .post(CHUTES_TTS_URL)
             .bearer_auth(&api_key)

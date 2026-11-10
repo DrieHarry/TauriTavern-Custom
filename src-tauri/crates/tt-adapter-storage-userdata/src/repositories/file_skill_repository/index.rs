@@ -13,7 +13,7 @@ use super::fs_ops::{
 use super::package::validate_skill_root;
 use super::paths::{validate_skill_name, validate_skill_scope};
 use super::{FileSkillRepository, INDEX_VERSION};
-use tt_adapter_storage_core::file_system::{replace_file_with_fallback, unique_temp_path};
+use tt_adapter_storage_core::file_system::{replace_file, unique_temp_path};
 use tt_domain::errors::DomainError;
 use tt_domain::models::skill::{SkillIndexEntry, SkillScope};
 
@@ -122,7 +122,7 @@ impl FileSkillRepository {
                 error
             ))
         })?;
-        replace_file_with_fallback(&temp, &path).await?;
+        replace_file(&temp, &path).await?;
         Ok(())
     }
 

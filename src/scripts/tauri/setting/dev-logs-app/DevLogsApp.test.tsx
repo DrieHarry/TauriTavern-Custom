@@ -15,11 +15,9 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const tr = (key: string) => key;
 const handles: DevLogsHandle[] = [];
-const containers: HTMLElement[] = [];
 
 afterEach(() => {
     for (const handle of handles.splice(0)) act(() => handle.unmount());
-    for (const container of containers.splice(0)) container.remove();
 });
 
 function createActions(overrides: Partial<DevLogsActions> = {}) {
@@ -100,7 +98,6 @@ function createLiveOptions(harness: LiveHarness, overrides: Partial<LiveLogPanel
 function mountApp(options: DevLogsMountOptions) {
     const container = document.createElement('div');
     document.body.append(container);
-    containers.push(container);
     let handle!: DevLogsHandle;
     act(() => {
         handle = mountTauriTavernDevLogsApp(container, options);
@@ -478,9 +475,7 @@ test('llm text viewer carries readable and raw title, text and wrap contracts', 
 
     const details = container.querySelector<HTMLDetailsElement>('details.tt-dev-log-raw');
     if (!details) throw new Error('raw disclosure not found');
-    details.open = true;
-    fireEvent(details, new Event('toggle'));
-    await flushAct();
+    await flushAct(() => { details.open = true; });
 
     const rawSections = details.querySelectorAll<HTMLElement>('.tt-dev-log-text-section');
     fireEvent.click(within(rawSections.item(0)).getByRole('button', { name: 'Raw JSON/SSE - Request body' }));

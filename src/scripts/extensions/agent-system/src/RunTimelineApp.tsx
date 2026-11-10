@@ -19,15 +19,19 @@ import {
 } from './RunTimelineComponents';
 import {
     captureTimelineScrollAnchor,
+    observeTimelineHeight,
+    readTimelineHeightBounds,
     readTimelineViewport,
     restoreTimelineScrollAnchor,
     scrollTimelineToBottom,
     type TimelineScrollAnchor,
 } from './RunTimelineDom';
-import { runTimelineHeightBounds } from './run-timeline-resize';
 import { SubAgentTimelineDialog } from './SubAgentTimelineDialog';
 
-type TimelinePanelStyle = CSSProperties & { '--ttas-run-panel-user-height'?: string };
+type TimelinePanelStyle = CSSProperties & {
+    '--ttas-run-panel-user-height'?: string;
+    '--ttas-run-panel-available-height'?: string;
+};
 
 export function RunTimelineApp(props: { controller: RunTimelineController; tr: AgentSystemTr }) {
     const { controller, tr } = props;
@@ -38,6 +42,15 @@ export function RunTimelineApp(props: { controller: RunTimelineController; tr: A
     const scrollerRef = useRef<HTMLDivElement>(null);
     const anchorRef = useRef<TimelineScrollAnchor | null>(null);
     const [anchorRevision, setAnchorRevision] = useState(0);
+    const [availableHeight, setAvailableHeight] = useState<number | null>(null);
+
+    useLayoutEffect(() => {
+        if (snapshot.mode !== 'active' || !snapshot.visible || snapshot.collapsed) return;
+        const panel = panelRef.current;
+        const header = headerRef.current;
+        if (!panel || !header) throw new Error('Agent run timeline layout elements are unavailable.');
+        return observeTimelineHeight(panel, header, setAvailableHeight);
+    }, [snapshot.mode, snapshot.visible, snapshot.collapsed]);
 
     useLayoutEffect(() => {
         restoreTimelineScrollAnchor(scrollerRef.current, anchorRef.current, controller.setTimelineViewport);
@@ -49,7 +62,7 @@ export function RunTimelineApp(props: { controller: RunTimelineController; tr: A
         if (snapshot.collapsed || snapshot.detailsOpen || !scroller) return;
         if (snapshot.autoStick) scrollTimelineToBottom(scroller, controller.setTimelineViewport);
         else controller.setTimelineViewport(readTimelineViewport(scroller));
-    }, [controller, snapshot.autoStick, snapshot.collapsed, snapshot.detailsOpen, snapshot.displayItems]);
+    }, [controller, snapshot.autoStick, snapshot.collapsed, snapshot.detailsOpen, snapshot.displayItems, snapshot.panelHeightPx, availableHeight]);
 
     useEffect(() => {
         const body = bodyRef.current;
@@ -82,16 +95,7 @@ export function RunTimelineApp(props: { controller: RunTimelineController; tr: A
         if (!panel || !header) {
             throw new Error('Agent run timeline resize elements are unavailable.');
         }
-        const topBar = document.getElementById('top-bar');
-        const viewportTop = window.visualViewport?.offsetTop || 0;
-        return runTimelineHeightBounds({
-            panelBottom: panel.getBoundingClientRect().bottom,
-            topBoundary: Math.max(
-                viewportTop,
-                topBar instanceof HTMLElement ? topBar.getBoundingClientRect().bottom : 0,
-            ),
-            chromeHeight: header.getBoundingClientRect().height,
-        });
+        return readTimelineHeightBounds(panel, header);
     }
 
     function currentPanelHeight(): number {
@@ -114,6 +118,9 @@ export function RunTimelineApp(props: { controller: RunTimelineController; tr: A
     if (!snapshot.visible) panelStyle.display = 'none';
     if (snapshot.mode === 'active' && snapshot.panelHeightPx != null) {
         panelStyle['--ttas-run-panel-user-height'] = `${snapshot.panelHeightPx}px`;
+    }
+    if (snapshot.mode === 'active' && availableHeight != null) {
+        panelStyle['--ttas-run-panel-available-height'] = `${availableHeight}px`;
     }
     const classes = [
         'ttas-root ttas-run-panel',
@@ -160,7 +167,9 @@ export function RunTimelineApp(props: { controller: RunTimelineController; tr: A
                     </span>
                     <div className="ttas-run-heading-copy">
                         <strong>{snapshot.headerTitle}</strong>
-                        <small>{snapshot.headerSubtitle}</small>
+                        <small aria-live={snapshot.displayItems.at(-1)?.live ? 'off' : undefined}>
+                            {snapshot.headerSubtitle}
+                        </small>
                     </div>
                 </div>
                 <div className="ttas-run-actions">
@@ -202,6 +211,15 @@ export function RunTimelineApp(props: { controller: RunTimelineController; tr: A
 
             {!snapshot.collapsed && (
                 <div ref={bodyRef} className="ttas-run-body">
+                    {snapshot.presentationError && (
+                        <div className="ttas-run-detail-error" role="alert">
+                            <span>{tr('timelinePresentationSaveFailed')}: {snapshot.presentationError}</span>
+                            <button type="button" className="menu_button" disabled={snapshot.savingPresentation}
+                                onClick={() => void controller.retryPresentation()}>
+                                {tr('timelineRetryPresentation')}
+                            </button>
+                        </div>
+                    )}
                     <section
                         className="ttas-run-view ttas-run-view-events"
                         style={{ display: snapshot.detailsOpen ? 'none' : undefined }}
@@ -217,6 +235,7 @@ export function RunTimelineApp(props: { controller: RunTimelineController; tr: A
                             emptyText={snapshot.emptyText}
                             items={snapshot.displayItems}
                             virtualItems={snapshot.virtualItems}
+                            live={{ items: snapshot.liveItems, onToggle: controller.toggleLiveItem }}
                             selectedSeq={snapshot.selectedSeq}
                             latestSeq={snapshot.latestSeq}
                             activeSeq={snapshot.activeSeq}
@@ -240,7 +259,10 @@ export function RunTimelineApp(props: { controller: RunTimelineController; tr: A
                             ariaLabel={tr('timelineDetails')}
                             title={snapshot.detailTitle}
                             type={snapshot.selectedItem?.type ?? ''}
-                            navItems={snapshot.navItems}
+                            items={snapshot.displayItems}
+                            hasMoreBefore={snapshot.hasMoreBefore}
+                            loadingOlder={snapshot.loadingOlder}
+                            onLoadOlder={controller.loadOlder}
                             selectedSeq={snapshot.selectedSeq}
                             loading={snapshot.detail.loading}
                             error={snapshot.detail.error}

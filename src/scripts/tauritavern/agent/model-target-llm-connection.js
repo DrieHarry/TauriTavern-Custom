@@ -19,7 +19,7 @@
  *   mode: 'cc';
  *   api: string;
  *   model: string;
- *   secretRef: { key: string; id: string; labelSnapshot?: string };
+ *   secretRef?: { key: string; id: string; labelSnapshot?: string };
  * }} ConvertibleAgentModelTarget
  */
 
@@ -35,6 +35,7 @@ const CUSTOM_API_FORMAT_BY_API = Object.freeze({
     custom_openai_responses: 'openai_responses',
     custom_claude_messages: 'claude_messages',
     custom_gemini_interactions: 'gemini_interactions',
+    custom_gemini_generate_content: 'gemini_generate_content',
 });
 
 /** @type {Readonly<Record<string, string>>} */
@@ -58,6 +59,7 @@ const SOURCE_ALIASES = Object.freeze({
 
 /** @type {Readonly<Record<string, string>>} */
 const SOURCE_SPECIFIC_API_URL_KEYS = Object.freeze({
+    opencode: 'opencode_endpoint',
     zai: 'zai_endpoint',
     siliconflow: 'siliconflow_endpoint',
     minimax: 'minimax_endpoint',
@@ -131,13 +133,21 @@ export function modelBindingFromTarget(target) {
 }
 
 /**
+ * The chat-completion source a target runs on; `api` may hold an alias.
+ * @param {AgentModelTarget} target
+ */
+export function modelTargetSource(target) {
+    return normalizeChatCompletionSource(target.api);
+}
+
+/**
  * @param {AgentModelTarget} target
  * @returns {TauriTavernLlmConnectionDefinition}
  */
 export function buildLlmConnectionFromModelTarget(target) {
     assertModelTargetConvertible(target);
 
-    const source = normalizeChatCompletionSource(target.api);
+    const source = modelTargetSource(target);
     /** @type {{ baseUrl?: string; sourceSpecific: Record<string, string> }} */
     const endpoint = {
         sourceSpecific: {},
@@ -149,11 +159,15 @@ export function buildLlmConnectionFromModelTarget(target) {
         endpoint.sourceSpecific[SOURCE_SPECIFIC_API_URL_KEYS[source]] = apiUrl;
     }
 
-    if (source === 'vertexai' && target.secretRef.key === 'api_key_vertexai_service_account') {
+    if (source === 'vertexai' && target.secretRef?.key === 'vertexai_service_account_json') {
         endpoint.sourceSpecific.vertexai_auth_mode = 'full';
     }
 
     const customApiFormat = normalizeCustomApiFormat(target);
+    const proxy = String(target.proxy || '').trim();
+    if (source === 'opencode') {
+        endpoint.sourceSpecific.opencode_api_format = customApiFormat || 'openai_compat';
+    }
 
     return {
         schemaVersion: LLM_CONNECTION_SCHEMA_VERSION,
@@ -163,10 +177,10 @@ export function buildLlmConnectionFromModelTarget(target) {
         description: `Connection Manager model target: ${String(target.name || target.id).trim()}`,
         provider: {
             chatCompletionSource: source,
-            ...(customApiFormat ? { customApiFormat } : {}),
+            ...(source === 'custom' && customApiFormat ? { customApiFormat } : {}),
         },
         endpoint,
-        auth: {
+        auth: target.secretRef ? {
             secretRef: {
                 key: String(target.secretRef.key).trim(),
                 id: String(target.secretRef.id).trim(),
@@ -174,8 +188,10 @@ export function buildLlmConnectionFromModelTarget(target) {
                     ? { labelSnapshot: String(target.secretRef.labelSnapshot).trim() }
                     : {}),
             },
-        },
-        routing: {},
+        } : {},
+        routing: proxy && proxy !== NO_PROXY_PRESET
+            ? { reverseProxy: { preset: proxy } }
+            : {},
         adapterHints: structuredClone(target.adapterHints || {}),
         capabilities: {},
     };
@@ -287,12 +303,12 @@ function assertModelTargetConvertible(target) {
     if (!String(target.model || '').trim()) {
         throw new Error(`model target "${target.name || target.id}" is missing model`);
     }
+    const proxy = String(target.proxy || '').trim();
+    if (!target.secretRef && proxy && proxy !== NO_PROXY_PRESET) {
+        return;
+    }
     if (!target.secretRef?.key || !target.secretRef?.id) {
         throw new Error(`model target "${target.name || target.id}" is missing secret reference`);
-    }
-    const proxy = String(target.proxy || '').trim();
-    if (proxy && proxy !== NO_PROXY_PRESET) {
-        throw new Error(`model target "${target.name || target.id}" uses proxy preset "${proxy}", which cannot be converted to an Agent LLM connection yet`);
     }
 }
 

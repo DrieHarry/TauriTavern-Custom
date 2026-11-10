@@ -4,7 +4,7 @@
 
 ## 1. 项目定位
 
-TauriTavern 将 SillyTavern 1.18.0 前端移植到 Tauri v2 原生应用中，并用 Rust 后端替代上游 Node/Express 后端。
+TauriTavern 将 SillyTavern 前端移植到 Tauri v2 原生应用中，当前已同步至 1.19.0，并用 Rust 后端替代上游 Node/Express 后端。
 
 核心取舍：
 
@@ -39,7 +39,7 @@ TauriTavern 将 SillyTavern 1.18.0 前端移植到 Tauri v2 原生应用中，�
 | `tt-ports` | repository / gateway / runtime trait |
 | `tt-application` | use case、service、job coordinator、policy 编排 |
 | `tt-adapter-http` | 共享 HTTP client pool/profile/helper |
-| `tt-adapter-mcp` | RMCP Streamable HTTP discovery、响应边界、分页与 schema validation |
+| `tt-adapter-mcp` | RMCP Streamable HTTP discovery、协议版本策略、分页与 schema validation |
 | `tt-adapter-provider-http` | LLM、SD、Translate、TTS、provider metadata 的 HTTP repository |
 | `tt-adapter-tokenization` | tokenizer concrete repository |
 | `tt-adapter-storage-core` | `DataDirectory`、基础文件系统 helper、chat/settings/user/theme/secret 等基础存储 |
@@ -74,7 +74,7 @@ TauriTavern 将 SillyTavern 1.18.0 前端移植到 Tauri v2 原生应用中，�
 
 ## 5. 前端技术栈
 
-前端主体来自 SillyTavern 1.18.0，保留其 HTML/CSS/JavaScript 组织方式和上游依赖生态。
+前端主体来自 SillyTavern，保留其 HTML/CSS/JavaScript 组织方式和上游依赖生态。
 
 常见技术：
 
@@ -146,6 +146,7 @@ pnpm test
 pnpm run check:frontend
 pnpm run check:types
 pnpm run test:contracts
+pnpm run test:dom
 pnpm run check:rust-boundaries
 pnpm run test:rust
 pnpm run check:rust:dev
@@ -160,6 +161,13 @@ pnpm run check:rust:dev
 - `tsconfig.host.json` 为 Host Kernel 提供 TypeScript 检查。
 - `tsconfig.ui.json` 为 Agent、MCP 与 Tauri Settings owned UI 提供 strict TS/TSX 检查。
 
+依赖安全审计：
+
+- `pnpm run check:advisories`（`scripts/check-dependency-advisories.mjs`）用 RustSec 审计 `src-tauri/Cargo.lock`，用 npm 公告库审计随应用发布的前端依赖。本地需先 `cargo install cargo-audit --locked`；前端审计固定使用 npm 官方源，因为镜像源通常不提供审计接口。
+- 审计依赖外部公告库，结果会随时间变化，因此不放进 `pnpm run check`。`.github/workflows/dependency-advisories.yml` 每周四审计 dev：Rust 依赖自动升到兼容的修复版本，其余问题写进同一个提醒 PR；dev 没有已知公告时关闭该 PR。
+- 前端依赖为了保持 SillyTavern 生态兼容由维护者手动升级，不交给 Dependabot。
+- 确认无法触及的公告写明成立条件：Rust 写进 `src-tauri/.cargo/audit.toml`，前端写进 `pnpm-workspace.yaml` 的 `auditConfig.ignoreGhsas`。
+
 ## 9. 平台与分发
 
 桌面：
@@ -170,8 +178,8 @@ pnpm run check:rust:dev
 
 移动端：
 
-- Android：Tauri Android 工程与 WebView/Insets 适配，见 `docs/AndroidDevelopment.md`
-- iOS：WKWebView、safe area、policy 与 native glue，见 `docs/iOSDevelopment.md`
+- Android：Tauri Android 工程与原生内容视口，见 `docs/AndroidDevelopment.md`
+- iOS：WKWebView 内容视口、policy 与 native glue，见 `docs/iOSDevelopment.md`
 
 便携模式通过 `TAURITAVERN_RUNTIME_MODE=portable` 或 `portable.flag` 启用。
 
@@ -186,4 +194,4 @@ pnpm run check:rust:dev
 | First-party UI 工程基线 | `docs/CurrentState/FirstPartyUI.md` |
 | Linux 分发与 Nix | `docs/CurrentState/LinuxRepository.md` |
 | 扩展 API | `docs/API/README.md` |
-| Agent 架构 | `docs/AgentArchitecture.md` |
+| Agent 架构 | [Agent](Agent/README.md) |

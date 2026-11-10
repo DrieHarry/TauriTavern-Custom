@@ -2,27 +2,29 @@ mod agent;
 mod archive;
 mod sync;
 
+use std::path::Path;
 use std::sync::Arc;
 
-use tauri::{AppHandle, Manager};
 use tokio::sync::Semaphore;
 
 use crate::app::{AppServices, StartupProfile};
 use crate::infrastructure::apis::http_external_import_downloader::HttpExternalImportDownloader;
-use tt_adapter_http::{HttpClientPool, ReqwestNativePluginHttpGateway};
+use tt_adapter_http::ReqwestNativePluginHttpGateway;
 use tt_adapter_mcp::RmcpMcpGateway;
-use tt_adapter_quickjs::{QuickJsNativePluginRuntime, QuickJsScriptEngine};
 use tt_adapter_storage_core::file_system::DataDirectory;
+use tt_adapter_triviumdb::TriviumDatabaseBackend;
+use tt_adapter_workspace_shell::{QuickJsNativePluginRuntime, WorkspaceShellEngine};
 use tt_application::services::asset_service::AssetService;
 use tt_application::services::avatar_service::AvatarService;
 use tt_application::services::background_service::BackgroundService;
 use tt_application::services::character_service::CharacterService;
+use tt_application::services::chat_commit_service::ChatCommitService;
 use tt_application::services::chat_completion_service::ChatCompletionService;
 use tt_application::services::chat_history_coordinator::ChatHistoryCoordinator;
-use tt_application::services::chat_payload_commit_service::ChatPayloadCommitService;
 use tt_application::services::chat_service::ChatService;
 use tt_application::services::codex_auth_service::CodexAuthService;
 use tt_application::services::content_service::ContentService;
+use tt_application::services::database_service::DatabaseService;
 use tt_application::services::extension_service::ExtensionService;
 use tt_application::services::extension_store_service::ExtensionStoreService;
 use tt_application::services::external_import_service::ExternalImportDownloader;
@@ -32,7 +34,6 @@ use tt_application::services::image_metadata_service::ImageMetadataService;
 use tt_application::services::llm_connection_service::LlmConnectionService;
 use tt_application::services::mcp_service::McpService;
 use tt_application::services::native_plugin_service::NativePluginService;
-use tt_application::services::native_regex_service::NativeRegexService;
 use tt_application::services::preset_service::PresetService;
 use tt_application::services::provider_metadata_service::ProviderMetadataService;
 use tt_application::services::quick_reply_service::QuickReplyService;
@@ -53,26 +54,27 @@ use tt_application::services::user_service::UserService;
 use tt_application::services::vector_service::VectorService;
 use tt_application::services::world_info_service::WorldInfoService;
 use tt_domain::errors::DomainError;
-use tt_ports::skill_script::SkillScriptEngine;
 use tt_ports::user_endpoint_access::UserEndpointGrantRuntime;
 
-use super::{adapters, repositories};
+use super::{HostEnvironment, adapters, repositories};
 
 pub(super) async fn build(
-    app_handle: &AppHandle,
+    environment: &HostEnvironment,
+    app_root: &Path,
     data_directory: &DataDirectory,
     startup_profile: &StartupProfile,
 ) -> Result<AppServices, DomainError> {
     let tauritavern_settings = &startup_profile.tauritavern_settings;
     let repositories = repositories::build(
-        app_handle,
+        environment,
+        app_root,
         data_directory,
         tauritavern_settings.chat_backups,
     )
     .await?;
     let ios_policy = startup_profile.ios_policy.clone();
 
-    let http_client_pool = app_handle.state::<Arc<HttpClientPool>>().inner().clone();
+    let http_client_pool = environment.http_client_pool.clone();
     let external_import_downloader: Arc<dyn ExternalImportDownloader> =
         Arc::new(HttpExternalImportDownloader::new(http_client_pool.clone()));
     let request_proxy_runtime: Arc<dyn RequestProxyRuntime> = http_client_pool.clone();
@@ -127,6 +129,7 @@ pub(super) async fn build(
     let sprite_service = Arc::new(SpriteService::new(repositories.sprite_repository.clone()));
     let llm_connection_service = Arc::new(LlmConnectionService::new(
         repositories.llm_connection_repository.clone(),
+        repositories.settings_repository.clone(),
     ));
     let user_endpoint_runtime: Arc<dyn UserEndpointGrantRuntime> = http_client_pool.clone();
     let user_endpoint_access_service = Arc::new(
@@ -141,13 +144,12 @@ pub(super) async fn build(
         repositories.mcp_server_repository.clone(),
         mcp_gateway,
     ));
-    let generation_background_runtime = crate::platform::generation_background::runtime(app_handle);
     let chat_completion_service = Arc::new(ChatCompletionService::new(
         repositories.chat_completion_repository.clone(),
         repositories.secret_repository.clone(),
         repositories.settings_repository.clone(),
         repositories.prompt_cache_repository.clone(),
-        generation_background_runtime,
+        environment.generation_background_runtime.clone(),
         ios_policy.clone(),
     ));
     let provider_metadata_service = Arc::new(ProviderMetadataService::new(
@@ -158,7 +160,6 @@ pub(super) async fn build(
     let searxng_search_service = Arc::new(SearxngSearchService::new(
         repositories.searxng_search_repository.clone(),
     ));
-    let skill_script_engine: Arc<dyn SkillScriptEngine> = Arc::new(QuickJsScriptEngine::new());
     let vector_service = Arc::new(VectorService::new(
         repositories.vector_repository.clone(),
         repositories.remote_embedding_repository.clone(),
@@ -166,18 +167,22 @@ pub(super) async fn build(
         repositories.secret_repository.clone(),
         ios_policy.clone(),
     ));
-    let agent_services = agent::build(
-        &repositories,
-        skill_service.clone(),
-        chat_completion_service.clone(),
-        llm_connection_service.clone(),
-        mcp_service.clone(),
-        skill_script_engine,
-    );
     let tokenization_service = Arc::new(TokenizationService::new(
         repositories.tokenizer_repository.clone(),
     ));
-    let native_regex_service = Arc::new(NativeRegexService::new());
+    let agent_services = agent::build(
+        &repositories,
+        agent::AgentDependencies {
+            tool_image_normalizer: Arc::new(tt_adapter_media::MediaToolImageNormalizer),
+            skill_service: skill_service.clone(),
+            chat_completion_service: chat_completion_service.clone(),
+            llm_connection_service: llm_connection_service.clone(),
+            mcp_service: mcp_service.clone(),
+            tokenization_service: tokenization_service.clone(),
+            workspace_shell: Arc::new(WorkspaceShellEngine),
+            extension_tools: environment.agent_extension_tools.clone(),
+        },
+    );
     let stable_diffusion_service = Arc::new(StableDiffusionService::new(
         repositories.stable_diffusion_repository.clone(),
         repositories.secret_repository.clone(),
@@ -203,8 +208,8 @@ pub(super) async fn build(
         repositories.chat_repository.clone(),
         repositories.group_chat_repository.clone(),
     ));
-    let chat_payload_commit_service = Arc::new(ChatPayloadCommitService::new(
-        repositories.chat_payload_commit_repository.clone(),
+    let chat_commit_service = Arc::new(ChatCommitService::new(
+        repositories.chat_commit_repository.clone(),
         chat_history_coordinator.clone(),
     ));
 
@@ -237,6 +242,7 @@ pub(super) async fn build(
     ));
     let user_service = Arc::new(UserService::new(repositories.user_repository.clone()));
     let settings_service = Arc::new(SettingsService::new(
+        repositories.avatar_repository.clone(),
         repositories.settings_repository.clone(),
         request_proxy_runtime,
         repositories.chat_backup_runtime.clone(),
@@ -254,13 +260,21 @@ pub(super) async fn build(
         mcp_service: mcp_service.clone(),
         chat_history_coordinator: chat_history_coordinator.clone(),
     });
-    let data_archive_service = archive::build(app_handle, data_change_reconciler.clone());
+    let database_service = Arc::new(DatabaseService::new(Arc::new(TriviumDatabaseBackend::new(
+        data_directory.root().join("_tauritavern").join("databases"),
+    ))));
+    let data_archive_service = archive::build(
+        environment,
+        data_change_reconciler.clone(),
+        database_service.clone(),
+    );
     let sync_services = sync::build(
-        app_handle,
+        environment,
         data_directory,
         data_change_reconciler,
         &ios_policy,
         local_mutation_gate,
+        database_service.clone(),
     );
 
     Ok(AppServices {
@@ -268,7 +282,7 @@ pub(super) async fn build(
         chat_service,
         group_chat_service,
         chat_history_coordinator,
-        chat_payload_commit_service,
+        chat_commit_service,
         user_service,
         settings_service,
         user_directory_service,
@@ -311,7 +325,7 @@ pub(super) async fn build(
         tt_sync_service: sync_services.tt_sync_service,
         sync_automation_service: sync_services.sync_automation_service,
         data_archive_service,
+        database_service,
         update_service,
-        native_regex_service,
     })
 }

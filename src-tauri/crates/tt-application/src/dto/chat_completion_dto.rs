@@ -9,6 +9,10 @@ pub struct ChatCompletionStatusRequestDto {
     #[serde(default)]
     pub custom_api_format: String,
     #[serde(default)]
+    pub opencode_endpoint: String,
+    #[serde(default)]
+    pub opencode_api_format: String,
+    #[serde(default)]
     pub reverse_proxy: String,
     #[serde(default)]
     pub proxy_password: String,
@@ -22,6 +26,8 @@ pub struct ChatCompletionStatusRequestDto {
     pub minimax_endpoint: String,
     #[serde(default)]
     pub moonshot_endpoint: String,
+    #[serde(default)]
+    pub pollinations_endpoint: String,
     #[serde(default)]
     pub workers_ai_account_id: String,
     #[serde(default)]

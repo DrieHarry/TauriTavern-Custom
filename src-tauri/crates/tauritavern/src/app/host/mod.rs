@@ -5,6 +5,7 @@
 //! in `app::composition`; frontend-visible behavior is still owned by presentation
 //! commands and web resource adapters.
 
+mod environment;
 mod observability;
 mod plugins;
 mod resources;
@@ -13,8 +14,17 @@ mod setup;
 mod shutdown;
 mod window;
 
+use std::sync::Arc;
+
+use tauri::Manager;
+use tt_adapter_storage_core::commit_stage::PageGeneration;
+
+use crate::infrastructure::agent_extension_tools::AgentExtensionTools;
 use crate::presentation::commands::registry::invoke_handler;
 
+pub(crate) use environment::host_environment;
+pub(crate) use setup::apply_startup_profile;
+pub(crate) use shutdown::exit_for_safe_mode;
 #[cfg(target_os = "windows")]
 pub(crate) use shutdown::request_frontend_shutdown;
 
@@ -25,6 +35,22 @@ pub(crate) fn run() {
     plugins::install(tauri::Builder::default())
         .setup(setup::setup)
         .invoke_handler(invoke_handler())
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                if webview.label() == "main" {
+                    webview.state::<Arc<PageGeneration>>().advance();
+                    webview
+                        .state::<Arc<AgentExtensionTools>>()
+                        .clear_page(webview.label());
+                }
+                crate::presentation::commands::byte_reader_commands::close_page_byte_readers(
+                    webview,
+                );
+                crate::presentation::commands::chat_swipe_commands::close_page_chat_resources(
+                    webview,
+                );
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(shutdown::handle_run_event);

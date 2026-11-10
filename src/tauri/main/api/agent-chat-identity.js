@@ -11,5 +11,23 @@ export async function resolveStableChatId(chatRef) {
         throw new Error('api.chat.open(ref).stableId is required to resolve stableChatId');
     }
 
-    return String(await handle.stableId()).trim();
+    return handle.stableId();
+}
+
+export async function assertCurrentChat(expectedRef, expectedStableChatId = null) {
+    const currentRef = window.__TAURITAVERN__?.api?.chat?.current?.ref?.();
+    if (sameChatRef(currentRef, expectedRef)) return;
+
+    if (expectedStableChatId != null && await resolveStableChatId(currentRef) === expectedStableChatId) return;
+
+    throw new Error('agent.commit_chat_mismatch: active chat changed before commit');
+}
+
+function sameChatRef(a, b) {
+    if (!a || !b || a.kind !== b.kind) return false;
+    if (a.kind === 'character') {
+        return String(a.characterId || '') === String(b.characterId || '')
+            && String(a.fileName || '') === String(b.fileName || '');
+    }
+    return String(a.chatId || '') === String(b.chatId || '');
 }

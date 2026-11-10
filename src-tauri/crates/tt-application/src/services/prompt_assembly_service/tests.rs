@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde_json::json;
 
 use super::*;
@@ -15,11 +17,12 @@ fn model_binding(
         chat_completion_source: source.to_string(),
         custom_api_format: custom_api_format.map(str::to_string),
         model_id: model_id.to_string(),
-        secret_ref: ResolvedLlmSecretRef {
+        source_specific: BTreeMap::new(),
+        secret_ref: Some(ResolvedLlmSecretRef {
             key: "api_key_deepseek".to_string(),
             id: "secret-1".to_string(),
             label_snapshot: None,
-        },
+        }),
     }
 }
 
@@ -27,7 +30,7 @@ fn model_binding(
 fn normalizes_frozen_run_input_snapshot() {
     let snapshot = normalize_frozen_run_input_snapshot(
         &json!({
-            "schemaVersion": 1,
+            "schemaVersion": FROZEN_RUN_INPUT_SNAPSHOT_SCHEMA_VERSION,
             "kind": FROZEN_RUN_INPUT_SNAPSHOT_KIND,
             "generationType": "swipe",
             "promptInputs": { "type": "swipe", "messages": [] },
@@ -64,6 +67,62 @@ fn normalizes_frozen_run_input_snapshot() {
         snapshot["currentModelConnection"]["settings"]["secret_id"],
         "opencode-secret"
     );
+}
+
+#[test]
+fn attaches_selected_frozen_input_and_preserves_optional_input() {
+    let prompt = json!({ "messages": [] });
+    assert_eq!(
+        attach_frozen_run_input_snapshot(prompt.clone(), None).unwrap(),
+        prompt
+    );
+
+    let frozen = json!({
+        "schemaVersion": FROZEN_RUN_INPUT_SNAPSHOT_SCHEMA_VERSION,
+        "kind": FROZEN_RUN_INPUT_SNAPSHOT_KIND,
+        "generationType": "normal",
+        "promptInputs": {},
+        "worldInfoActivation": {},
+        "macroContext": { "names": { "char": "Char" } }
+    });
+    let embedded = json!({ "messages": [], "frozenRunInputSnapshot": frozen });
+    assert_eq!(
+        attach_frozen_run_input_snapshot(embedded.clone(), None).unwrap(),
+        embedded
+    );
+    // The explicit input replaces the embedded input; only the selected one is validated.
+    assert_eq!(
+        attach_frozen_run_input_snapshot(
+            json!({ "messages": [], "frozenRunInputSnapshot": 7 }),
+            Some(frozen),
+        )
+        .unwrap(),
+        embedded
+    );
+}
+
+#[test]
+fn rejects_malformed_embedded_frozen_input() {
+    for (frozen, error_code) in [
+        (json!(7), "agent.frozen_run_input_snapshot_required"),
+        (
+            json!({
+                "schemaVersion": FROZEN_RUN_INPUT_SNAPSHOT_SCHEMA_VERSION,
+                "kind": FROZEN_RUN_INPUT_SNAPSHOT_KIND,
+                "generationType": "normal",
+                "promptInputs": {},
+                "worldInfoActivation": {},
+                "macroContext": 7
+            }),
+            "agent.frozen_run_input_macro_context_invalid",
+        ),
+    ] {
+        let error =
+            attach_frozen_run_input_snapshot(json!({ "frozenRunInputSnapshot": frozen }), None)
+                .unwrap_err();
+        assert!(matches!(error, ApplicationError::ValidationError(_)));
+        assert!(error.to_string().contains(error_code), "{error}");
+    }
 }
 
 #[test]
@@ -129,7 +188,26 @@ fn builds_current_model_connection_snapshot_with_backend_owned_fields() {
 }
 
 #[test]
-fn current_model_connection_snapshot_rejects_unmapped_source() {
+fn current_model_connection_snapshot_carries_opencode_model() {
+    let snapshot = build_current_model_connection_snapshot(
+        &json!({
+            "chat_completion_source": "opencode",
+            "opencode_endpoint": "go",
+            "opencode_api_format": "claude_messages"
+        }),
+        "claude-sonnet-4-5",
+        None,
+    )
+    .unwrap();
+    let settings = snapshot["settings"].as_object().unwrap();
+
+    assert_eq!(settings["opencode_model"], "claude-sonnet-4-5");
+    assert_eq!(settings["opencode_endpoint"], "go");
+    assert_eq!(settings["opencode_api_format"], "claude_messages");
+}
+
+#[test]
+fn current_model_connection_snapshot_rejects_unsupported_source() {
     let error = build_current_model_connection_snapshot(
         &json!({
             "chat_completion_source": "unsupported",
@@ -143,7 +221,7 @@ fn current_model_connection_snapshot_rejects_unmapped_source() {
     assert!(
         error
             .to_string()
-            .contains("prompt_assembly.model_source_unmapped")
+            .contains("prompt_assembly.model_source_unsupported")
     );
 }
 
@@ -151,7 +229,7 @@ fn current_model_connection_snapshot_rejects_unmapped_source() {
 fn rejects_frozen_snapshot_generation_type_mismatch() {
     let error = normalize_frozen_run_input_snapshot(
         &json!({
-            "schemaVersion": 1,
+            "schemaVersion": FROZEN_RUN_INPUT_SNAPSHOT_SCHEMA_VERSION,
             "kind": FROZEN_RUN_INPUT_SNAPSHOT_KIND,
             "generationType": "normal",
             "promptInputs": {},
@@ -186,6 +264,25 @@ fn connection_ref_model_overrides_conflicting_preset_source() {
 }
 
 #[test]
+fn connection_ref_overlays_source_specific_endpoint_fields() {
+    let mut settings = json!({
+        "chat_completion_source": "opencode",
+        "opencode_api_format": "openai_compat"
+    });
+    let mut binding = model_binding("opencode", "claude-sonnet-4-5", None);
+    binding.source_specific = BTreeMap::from([
+        ("opencode_endpoint".to_string(), json!("go")),
+        ("opencode_api_format".to_string(), json!("claude_messages")),
+    ]);
+
+    apply_model_binding_to_prompt_settings(&mut settings, &binding).unwrap();
+
+    assert_eq!(settings["opencode_model"], "claude-sonnet-4-5");
+    assert_eq!(settings["opencode_endpoint"], "go");
+    assert_eq!(settings["opencode_api_format"], "claude_messages");
+}
+
+#[test]
 fn current_prompt_snapshot_removes_stale_secret_when_current_connection_is_keyless() {
     let mut settings = json!({
         "chat_completion_source": "custom",
@@ -195,7 +292,7 @@ fn current_prompt_snapshot_removes_stale_secret_when_current_connection_is_keyle
     });
     let frozen_run_input_snapshot = normalize_frozen_run_input_snapshot(
         &json!({
-            "schemaVersion": 1,
+            "schemaVersion": FROZEN_RUN_INPUT_SNAPSHOT_SCHEMA_VERSION,
             "kind": FROZEN_RUN_INPUT_SNAPSHOT_KIND,
             "generationType": "normal",
             "promptInputs": {},
@@ -233,7 +330,7 @@ fn current_prompt_snapshot_requires_frozen_current_model_connection() {
     });
     let frozen_run_input_snapshot = normalize_frozen_run_input_snapshot(
         &json!({
-            "schemaVersion": 1,
+            "schemaVersion": FROZEN_RUN_INPUT_SNAPSHOT_SCHEMA_VERSION,
             "kind": FROZEN_RUN_INPUT_SNAPSHOT_KIND,
             "generationType": "normal",
             "promptInputs": {},

@@ -39,6 +39,8 @@ function requireLot() {
 
     const el = document.createElement('div');
     el.id = LOT_ID;
+    el.setAttribute('aria-hidden', 'true');
+    el.inert = true;
     el.style.position = 'fixed';
     el.style.left = '0';
     el.style.top = '0';
@@ -64,8 +66,7 @@ function evictIfNeeded(maxIframes, ttlMs) {
             if (now - entry.parkedAt <= ttlMs) {
                 continue;
             }
-            entry.iframe.remove();
-            parkedById.delete(id);
+            dropParkedManagedIframe(id);
         }
     }
 
@@ -77,9 +78,8 @@ function evictIfNeeded(maxIframes, ttlMs) {
         .sort((a, b) => a[1].parkedAt - b[1].parkedAt)
         .slice(0, parkedById.size - maxIframes);
 
-    for (const [id, entry] of victims) {
-        entry.iframe.remove();
-        parkedById.delete(id);
+    for (const [id] of victims) {
+        dropParkedManagedIframe(id);
     }
 }
 
@@ -102,7 +102,7 @@ export function parkManagedIframe({ id, iframe, maxIframes, ttlMs }) {
 
     const existing = parkedById.get(id);
     if (existing && existing.iframe !== iframe) {
-        existing.iframe.remove();
+        dropParkedManagedIframe(id);
     }
 
     requireLot().append(iframe);
@@ -127,6 +127,11 @@ export function takeParkedManagedIframe(id) {
     return entry.iframe;
 }
 
+/** @param {string} id @param {HTMLIFrameElement} iframe */
+export function isManagedIframeParked(id, iframe) {
+    return parkedById.get(id)?.iframe === iframe && Boolean(lot?.contains(iframe));
+}
+
 /**
  * Drops a parked iframe (hard-evict).
  * @param {string} id
@@ -136,7 +141,8 @@ export function dropParkedManagedIframe(id) {
     if (!entry) {
         return;
     }
-    entry.iframe.remove();
+    // An upstream renderer may already have moved the element out of the lot.
+    if (lot?.contains(entry.iframe)) entry.iframe.remove();
     parkedById.delete(id);
 }
 

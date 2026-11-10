@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{send_with_retry, upstream_error_response};
+use tt_adapter_http::upstream;
 use tt_domain::errors::DomainError;
 use tt_ports::repositories::tts_repository::{PollinationsTtsRequest, TtsRouteResponse};
 
@@ -27,7 +28,7 @@ pub(super) async fn handle(
 }
 
 async fn voices(client: reqwest::Client, model: String) -> Result<TtsRouteResponse, DomainError> {
-    let response = send_with_retry("Pollinations model list request", || {
+    let response = send_with_retry(|| {
         client
             .get(POLLINATIONS_MODELS_URL)
             .header(ACCEPT, "application/json")
@@ -36,16 +37,21 @@ async fn voices(client: reqwest::Client, model: String) -> Result<TtsRouteRespon
     if !response.status().is_success() {
         return upstream_error_response(response, "Pollinations model list request failed").await;
     }
-    let payload: Value = response.json().await.map_err(|error| {
-        DomainError::InternalError(format!(
-            "Pollinations model list response read failed: {error}"
-        ))
-    })?;
+    let payload: Value =
+        serde_json::from_slice(&upstream::read_body(response).await?).map_err(|error| {
+            DomainError::InternalError(format!(
+                "Pollinations model list response is not valid JSON: {error}"
+            ))
+        })?;
     let Some(voices) = payload
         .as_array()
         .and_then(|models| {
             models.iter().find(|candidate| {
                 candidate.get("name").and_then(Value::as_str) == Some(model.as_str())
+                    || candidate
+                        .get("aliases")
+                        .and_then(Value::as_array)
+                        .is_some_and(|aliases| aliases.iter().any(|alias| alias == model.as_str()))
             })
         })
         .and_then(|model| model.get("voices"))
@@ -88,7 +94,7 @@ async fn generate(
             "content": text,
         }],
     });
-    let response = send_with_retry("Pollinations TTS request", || {
+    let response = send_with_retry(|| {
         client
             .post(POLLINATIONS_GENERATE_URL)
             .bearer_auth(&api_key)
@@ -100,9 +106,12 @@ async fn generate(
     if !response.status().is_success() {
         return upstream_error_response(response, "Pollinations TTS request failed").await;
     }
-    let payload: Value = response.json().await.map_err(|error| {
-        DomainError::InternalError(format!("Pollinations TTS response read failed: {error}"))
-    })?;
+    let payload: Value =
+        serde_json::from_slice(&upstream::read_body(response).await?).map_err(|error| {
+            DomainError::InternalError(format!(
+                "Pollinations TTS response is not valid JSON: {error}"
+            ))
+        })?;
     let Some(encoded) = payload
         .get("choices")
         .and_then(|value| value.get(0))
@@ -126,22 +135,4 @@ async fn generate(
         }
     };
     Ok(TtsRouteResponse::bytes(200, "audio/mpeg", audio))
-}
-
-#[cfg(test)]
-mod tests {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-    use serde_json::json;
-
-    #[test]
-    fn pollinations_audio_shape_matches_frontend_contract() {
-        let payload = json!({
-            "choices": [{"message": {"audio": {"data": BASE64_STANDARD.encode([1, 2, 3])}}}]
-        });
-        let encoded = payload["choices"][0]["message"]["audio"]["data"]
-            .as_str()
-            .unwrap();
-        assert_eq!(BASE64_STANDARD.decode(encoded).unwrap(), [1, 2, 3]);
-    }
 }

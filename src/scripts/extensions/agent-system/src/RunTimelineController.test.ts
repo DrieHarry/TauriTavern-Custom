@@ -134,6 +134,8 @@ function activeHarness(overrides: Partial<ActiveTimelineOptions['deps']> = {}) {
             state.retries += 1;
             return Promise.resolve();
         },
+        retryPresentation: async () => {},
+        resumeRun: () => Promise.resolve(),
         ...overrides,
     };
     return { controller: createRunTimelineController({ mode: 'active', deps }), state };
@@ -237,20 +239,28 @@ test('retry is typed, history is read-only, and resize persistence follows compl
     state.eventListener?.(failure);
     expect(controller.getSnapshot().detailsOpen).toBe(true);
     await flushMicrotasks();
-    const retry = controller.getSnapshot().detail.sections.flatMap(section => section.actions ?? [])[0];
+    state.runStateListener?.({ activeRun: null, lastEvent: failure });
+    await flushMicrotasks();
+    const retry = controller.getSnapshot().detail.sections.flatMap(section => section.actions ?? []).find(action => action.kind === 'retry');
     expect(retry?.kind).toBe('retry');
     if (retry) controller.invokeDetailAction(retry);
     expect(state.retries).toBe(1);
+
 
     controller.startResize(500, 300, { min: 132, max: 600 });
     controller.moveResize(450);
     controller.finishResize(false);
     expect(state.patches).toHaveLength(0);
-    controller.startResize(500, 300, { min: 132, max: 600 });
+    const crampedBounds = { min: 48, max: 48 };
+    controller.startResize(500, 300, crampedBounds);
+    controller.moveResize(440);
     controller.finishResize(true);
-    expect(state.patches).toHaveLength(1);
-    expect(controller.resizeByKey('ArrowUp', 300, { min: 132, max: 600 })).toBe(true);
-    expect(state.patches).toHaveLength(2);
+    expect(state.patches).toEqual([{ runTimelineHeightPx: crampedBounds.max }]);
+    expect(controller.resizeByKey('ArrowUp', 300, crampedBounds)).toBe(true);
+    expect(state.patches).toEqual([
+        { runTimelineHeightPx: crampedBounds.max },
+        { runTimelineHeightPx: crampedBounds.max },
+    ]);
     controller.resetPanelHeight();
     expect(state.patches.at(-1)).toEqual({ runTimelineHeightPx: null });
     controller.dispose();
@@ -271,4 +281,81 @@ test('retry is typed, history is read-only, and resize persistence follows compl
     await flushMicrotasks();
     expect(history.getSnapshot().detail.sections.flatMap(section => section.actions ?? [])).toEqual([]);
     history.dispose();
+});
+
+test('active mode removes transient writes immediately and detaches at terminal', async () => {
+    let liveHandler: ((update: TauriTavernAgentRunLiveUpdate) => void) | null = null;
+    let liveUnsubscribed = 0;
+    const liveCall: TauriTavernAgentRunLiveToolCall = {
+        toolId: 'builtin:workspace.write_file',
+        invocationId: 'inv_root',
+        invocationExitPolicy: 'run_finish_allowed',
+        toolCallIndex: 0,
+        path: 'reply.md',
+        content: '',
+        contentWords: 0,
+    };
+    const { controller, state } = activeHarness({
+        subscribeLiveProjection: (_runId, handler) => {
+            liveHandler = handler;
+            return () => {
+                liveUnsubscribed += 1;
+            };
+        },
+        scheduleFrame: callback => callback(),
+    });
+    await controller.init();
+    expect(liveHandler).not.toBeNull();
+    const emit = (update: TauriTavernAgentRunLiveUpdate) => liveHandler?.(update);
+
+    state.eventListener?.(event(1));
+    emit({ type: 'snapshot', calls: [], responses: [] });
+    emit({ type: 'replace', call: liveCall });
+    emit({ type: 'append', invocationId: 'inv_root', toolCallIndex: 0, field: 'content', text: 'Hello', wordDelta: 1 });
+
+    let items = controller.getSnapshot().displayItems;
+    expect(items.map(item => item.seq)).toEqual([1, 1_000_000_000]);
+    expect(items[1]?.rowSpan).toBe(2);
+    expect(items[1]?.live?.tail).toBe('Hello');
+    expect(controller.getSnapshot().activeSeq).toBe(1_000_000_000);
+    expect(controller.getSnapshot().virtualItems.items.map(item => item.seq)).toEqual([1]);
+    expect(controller.getSnapshot().liveItems).toHaveLength(1);
+    const liveItem = items[1];
+    if (!liveItem) throw new Error('expected live item');
+    controller.toggleLiveItem(liveItem.id);
+    expect(controller.getSnapshot().liveItems[0]?.live?.expanded).toBe(true);
+    expect(controller.getSnapshot().autoStick).toBe(false);
+    emit({ type: 'append', invocationId: 'inv_root', toolCallIndex: 0, field: 'content', text: '\nworld', wordDelta: 1 });
+    expect(controller.getSnapshot().liveItems[0]?.live).toMatchObject({ expanded: true, blocks: [{ text: 'Hello\nworld' }] });
+    expect(controller.getSnapshot().autoStick).toBe(false);
+
+    emit({ type: 'remove', invocationId: 'inv_root', toolCallIndex: 0 });
+    expect(controller.getSnapshot().displayItems.map(item => item.seq)).toEqual([1]);
+    state.eventListener?.(event(2, 'tool_call_requested', {
+        invocationId: 'inv_root',
+        toolId: 'builtin:workspace.write_file',
+        callId: 'call-1',
+    }));
+    items = controller.getSnapshot().displayItems;
+    expect(items.map(item => item.seq)).toEqual([1, 2]);
+
+    emit({ type: 'replace', call: liveCall });
+    emit({ type: 'append', invocationId: 'inv_root', toolCallIndex: 0, field: 'content', text: 'again', wordDelta: 1 });
+    expect(controller.getSnapshot().displayItems.at(-1)?.live?.tail).toBe('again');
+    const stopped = event(3, 'run_cancelled', {}, 'run-1');
+    state.eventListener?.(stopped);
+    expect(controller.getSnapshot().displayItems.every(item => !item.live)).toBe(true);
+    expect(liveUnsubscribed).toBe(1);
+
+    state.runStateListener?.({ activeRun: null, lastEvent: stopped });
+    state.runStateListener?.({ activeRun: { runId: 'run-1' }, lastEvent: null });
+    state.eventListener?.(event(4, 'run_resumed'));
+    emit({ type: 'replace', call: liveCall });
+    emit({ type: 'append', invocationId: 'inv_root', toolCallIndex: 0, field: 'content', text: 'resumed', wordDelta: 1 });
+    expect(controller.getSnapshot().terminalType).toBe('');
+    expect(controller.getSnapshot().displayItems.at(-1)?.live?.tail).toBe('resumed');
+
+    controller.dispose();
+    expect(state.unsubscribed).toBe(3);
+    expect(liveUnsubscribed).toBe(2);
 });

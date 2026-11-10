@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use url::Url;
 
 use crate::workers_ai_models::{fetch_workers_ai_models, workers_ai_model_name};
-use tt_adapter_http::{HttpClientPool, HttpClientProfile};
+use tt_adapter_http::{HttpClientPool, HttpClientProfile, upstream};
 use tt_domain::errors::DomainError;
 use tt_ports::repositories::provider_metadata_repository::{
     NanoGptCredits, NanoGptModelProviders, NanoGptSubscriptionCredits, NanoGptSubscriptionLimits,
@@ -44,10 +44,7 @@ impl HttpProviderMetadataRepository {
         provider_name: &str,
         action: &str,
     ) -> Result<Value, DomainError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|error| DomainError::transient(format!("{action} request failed: {error}")))?;
+        let response = request.send().await.map_err(upstream::request_failure)?;
 
         if !response.status().is_success() {
             return Err(Self::map_error_response(provider_name, response, action).await);
@@ -60,12 +57,12 @@ impl HttpProviderMetadataRepository {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("unknown")
             .to_string();
-        let body = response.text().await.unwrap_or_default();
-        serde_json::from_str::<Value>(&body).map_err(|error| {
+        let body = upstream::read_body(response).await?;
+        serde_json::from_slice::<Value>(&body).map_err(|error| {
             DomainError::InternalError(format!(
                 "{provider_name} {action} returned non-JSON data (HTTP {}, content-type {content_type}): {error}; body: {}",
                 status.as_u16(),
-                response_preview(&body),
+                response_preview(&String::from_utf8_lossy(&body)),
             ))
         })
     }
@@ -75,10 +72,7 @@ impl HttpProviderMetadataRepository {
         provider_name: &str,
         action: &str,
     ) -> Result<Option<Value>, DomainError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|error| DomainError::transient(format!("{action} request failed: {error}")))?;
+        let response = request.send().await.map_err(upstream::request_failure)?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -98,12 +92,12 @@ impl HttpProviderMetadataRepository {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("unknown")
             .to_string();
-        let body = response.text().await.unwrap_or_default();
-        serde_json::from_str::<Value>(&body).map(Some).map_err(|error| {
+        let body = upstream::read_body(response).await?;
+        serde_json::from_slice::<Value>(&body).map(Some).map_err(|error| {
             DomainError::InternalError(format!(
                 "{provider_name} {action} returned non-JSON data (HTTP {}, content-type {content_type}): {error}; body: {}",
                 status.as_u16(),
-                response_preview(&body),
+                response_preview(&String::from_utf8_lossy(&body)),
             ))
         })
     }

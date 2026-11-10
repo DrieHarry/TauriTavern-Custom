@@ -7,25 +7,11 @@ import java.io.File
 
 class AndroidImportArchiveJsBridge(
   private val contentResolver: ContentResolver,
-  private val launchImportArchivePicker: () -> Unit,
   private val launchCodexAuthPicker: () -> Unit,
-  private val launchExportArchivePicker: (String) -> Unit,
 ) {
-  @JavascriptInterface
-  fun requestImportArchivePicker() {
-    launchImportArchivePicker()
-  }
-
   @JavascriptInterface
   fun requestCodexAuthPicker() {
     launchCodexAuthPicker()
-  }
-
-  @JavascriptInterface
-  fun requestExportArchivePicker(suggestedName: String?) {
-    val normalizedName =
-      suggestedName?.trim().orEmpty().ifBlank { DEFAULT_EXPORT_FILE_NAME }
-    launchExportArchivePicker(normalizedName)
   }
 
   @JavascriptInterface
@@ -39,24 +25,7 @@ class AndroidImportArchiveJsBridge(
     return AndroidContentFileTransfer.copyContentUriToFile(contentResolver, uri, targetFile)
   }
 
-  @JavascriptInterface
-  fun copyFileToContentUri(
-    sourcePath: String?,
-    contentUri: String?,
-  ): String {
-    val sourceFile = File(requireNotNull(sourcePath).trim())
-    val targetUri = Uri.parse(requireNotNull(contentUri).trim())
-
-    return AndroidContentFileTransfer.copyFileToContentUri(
-      contentResolver = contentResolver,
-      sourceFile = sourceFile,
-      targetUri = targetUri,
-      failureMessage = "Failed to copy export archive to destination URI",
-    )
-  }
-
   companion object {
-    private const val DEFAULT_EXPORT_FILE_NAME = "tauritavern-data.zip"
     const val INTERFACE_NAME = "TauriTavernAndroidImportArchiveBridge"
   }
 }

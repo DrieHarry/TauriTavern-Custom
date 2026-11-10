@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use tokio::fs;
 use tokio::sync::Mutex;
 
-use tt_adapter_storage_core::file_system::{replace_file_with_fallback, unique_temp_path};
+use tt_adapter_storage_core::file_system::{replace_file, unique_temp_path};
 use tt_contracts::client_asset_paths::validate_path_segment;
 use tt_domain::errors::DomainError;
 use tt_ports::repositories::sprite_repository::{
@@ -101,7 +101,7 @@ impl FileSpriteRepository {
             )));
         }
 
-        if let Err(error) = replace_file_with_fallback(&temp, target).await {
+        if let Err(error) = replace_file(&temp, target).await {
             let _ = fs::remove_file(&temp).await;
             return Err(error);
         }

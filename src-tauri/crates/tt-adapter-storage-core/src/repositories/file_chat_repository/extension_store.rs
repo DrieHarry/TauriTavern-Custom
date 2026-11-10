@@ -3,14 +3,12 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tokio::fs;
 
-use crate::file_system::{
-    move_file_no_replace_with_fallback, replace_file_with_fallback, unique_temp_path,
-};
+use crate::file_system::{move_file_no_replace_with_fallback, persist_json_file};
 use tt_domain::errors::DomainError;
 use tt_domain::json_merge::merge_json_value;
+use tt_domain::models::filename::sanitize_filename;
 
 use super::FileChatRepository;
-use super::windowed_payload_io::read_first_line_and_end_offset;
 
 fn validate_store_component(raw: &str, label: &str) -> Result<String, DomainError> {
     let value = raw.trim();
@@ -32,34 +30,6 @@ fn validate_store_component(raw: &str, label: &str) -> Result<String, DomainErro
     }
 
     Ok(value.to_string())
-}
-
-fn extract_integrity_slug_from_header_value(header: &Value) -> Result<String, DomainError> {
-    let meta = header
-        .get("chat_metadata")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            DomainError::InvalidData("Chat header is missing chat_metadata".to_string())
-        })?;
-
-    let slug = meta
-        .get("integrity")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            DomainError::InvalidData("Chat metadata integrity is missing".to_string())
-        })?;
-
-    Ok(slug.to_string())
-}
-
-async fn read_chat_integrity_slug(path: &Path) -> Result<String, DomainError> {
-    let (header, _) = read_first_line_and_end_offset(path).await?;
-    let header_value = serde_json::from_str::<Value>(&header).map_err(|error| {
-        DomainError::InvalidData(format!("Failed to parse chat header JSON: {}", error))
-    })?;
-    extract_integrity_slug_from_header_value(&header_value)
 }
 
 async fn update_store_json_entry(dir: &Path, key: &str, value: Value) -> Result<(), DomainError> {
@@ -92,20 +62,7 @@ async fn update_store_json_entry(dir: &Path, key: &str, value: Value) -> Result<
 
     merge_json_value(&mut current, value);
 
-    let temp = unique_temp_path(&target);
-    let bytes = serde_json::to_vec_pretty(&current).map_err(|error| {
-        DomainError::InvalidData(format!("Failed to serialize chat store JSON: {}", error))
-    })?;
-
-    fs::write(&temp, &bytes).await.map_err(|error| {
-        DomainError::InternalError(format!(
-            "Failed to write chat store temp file {}: {}",
-            temp.display(),
-            error
-        ))
-    })?;
-
-    replace_file_with_fallback(&temp, &target).await?;
+    persist_json_file(&target, &current).await?;
     Ok(())
 }
 
@@ -149,7 +106,16 @@ impl FileChatRepository {
         let chat_path = self
             .resolve_character_chat_path(character_name, file_name)
             .await?;
-        let integrity = read_chat_integrity_slug(&chat_path).await?;
+        let integrity = self
+            .read_chat_integrity_from_path(&chat_path)
+            .await?
+            .ok_or_else(|| DomainError::InvalidData("Chat metadata integrity is missing".into()))?;
+        // The identity is used verbatim as a directory name; never sanitize it into another identity.
+        if sanitize_filename(&integrity) != integrity {
+            return Err(DomainError::InvalidData(
+                "Chat metadata integrity is not a valid store directory name".into(),
+            ));
+        }
         let character_dir = chat_path.parent().ok_or_else(|| {
             DomainError::InternalError(format!(
                 "Chat payload path has no parent directory: {}",
@@ -261,20 +227,7 @@ impl FileChatRepository {
         })?;
 
         let target = dir.join(format!("{}.json", key));
-        let temp = unique_temp_path(&target);
-        let bytes = serde_json::to_vec_pretty(&value).map_err(|error| {
-            DomainError::InvalidData(format!("Failed to serialize chat store JSON: {}", error))
-        })?;
-
-        fs::write(&temp, &bytes).await.map_err(|error| {
-            DomainError::InternalError(format!(
-                "Failed to write chat store temp file {}: {}",
-                temp.display(),
-                error
-            ))
-        })?;
-
-        replace_file_with_fallback(&temp, &target).await?;
+        persist_json_file(&target, &value).await?;
         Ok(())
     }
 
@@ -313,20 +266,7 @@ impl FileChatRepository {
         })?;
 
         let target = dir.join(format!("{}.json", key));
-        let temp = unique_temp_path(&target);
-        let bytes = serde_json::to_vec_pretty(&value).map_err(|error| {
-            DomainError::InvalidData(format!("Failed to serialize chat store JSON: {}", error))
-        })?;
-
-        fs::write(&temp, &bytes).await.map_err(|error| {
-            DomainError::InternalError(format!(
-                "Failed to write chat store temp file {}: {}",
-                temp.display(),
-                error
-            ))
-        })?;
-
-        replace_file_with_fallback(&temp, &target).await?;
+        persist_json_file(&target, &value).await?;
         Ok(())
     }
 

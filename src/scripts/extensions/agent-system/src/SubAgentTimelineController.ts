@@ -110,7 +110,7 @@ export function createSubAgentTimelineController(deps: {
                 virtualItems: virtualizeTimelineItems(all, viewport.scrollTop, viewport.viewportHeight),
                 selectedItem: selected,
                 selectedSeq: selected?.seq ?? null,
-                navItems: all.slice(-20),
+                hasMoreBefore: session.hasMoreBefore,
                 loading: session.loading,
                 loadingOlder: session.loadingOlder,
                 autoStick: viewport.nearBottom,
@@ -158,6 +158,8 @@ export function createSubAgentTimelineController(deps: {
             void loadDetails();
         },
         setViewport(next: TimelineViewport): void {
+            if (viewport.scrollTop === next.scrollTop && viewport.viewportHeight === next.viewportHeight
+                && viewport.nearBottom === next.nearBottom) return;
             viewport = next;
             deps.onChange();
         },

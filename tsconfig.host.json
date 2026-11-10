@@ -3,7 +3,7 @@
     "target": "ES2020",
     "module": "ES2020",
     "moduleResolution": "Bundler",
-    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
 
     "allowJs": true,
     "checkJs": false,
@@ -21,6 +21,8 @@
   },
   "include": [
     "src/types.d.ts",
+    "src/tauri/web-host/**/*.js",
+    "src/tauri/main/api/db.js",
     "src/tauri/main/context/**/*.js",
     "src/tauri/main/kernel/**/*.js",
     "src/tauri/main/services/**/*.js",

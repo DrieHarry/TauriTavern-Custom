@@ -1,3 +1,4 @@
+import { isMobileHost } from './util/host-identity.js';
 import { DOMPurify, Bowser } from '../lib.js';
 import { ChatInputFocusIntent, focusChatInput } from './chat-input-focus.js';
 import { installChatInputFullscreenEditor } from './chat-input-fullscreen-editor.js';
@@ -18,10 +19,13 @@ import {
     getEntitiesList,
     buildAvatarList,
     selectCharacterById,
+    setCharacterPopupOpen,
+    setChatHistoryOpen,
     eventSource,
     menu_type,
     substituteParams,
     sendTextareaMessage,
+    canSubmitAgentGuidance,
     doNavbarIconClick,
     isSwipingAllowed,
     setChatScrollTop,
@@ -45,7 +49,7 @@ import {
     secret_state,
 } from './secrets.js';
 import { debounce, getStringHash, isValidUrl } from './utils.js';
-import { chat_completion_sources, oai_settings } from './openai.js';
+import { chat_completion_sources, oai_settings, POLLINATIONS_ENDPOINT } from './openai.js';
 import { getTokenCountAsync } from './tokenizers.js';
 import { textgen_types, textgenerationwebui_settings as textgen_settings, getTextGenServer } from './textgen-settings.js';
 import { debounce_timeout, SWIPE_SOURCE } from './constants.js';
@@ -404,6 +408,7 @@ function RA_autoconnect(PrevApi) {
                 break;
             case 'openai':
                 if (((secret_state[SECRET_KEYS.OPENAI] || oai_settings.reverse_proxy) && oai_settings.chat_completion_source == chat_completion_sources.OPENAI)
+                    || (secret_state[SECRET_KEYS.OPENCODE] && oai_settings.chat_completion_source == chat_completion_sources.OPENCODE)
                     || ((secret_state[SECRET_KEYS.CLAUDE] || oai_settings.reverse_proxy) && oai_settings.chat_completion_source == chat_completion_sources.CLAUDE)
                     || (secret_state[SECRET_KEYS.OPENROUTER] && oai_settings.chat_completion_source == chat_completion_sources.OPENROUTER)
                     || (secret_state[SECRET_KEYS.AI21] && oai_settings.chat_completion_source == chat_completion_sources.AI21)
@@ -425,7 +430,7 @@ function RA_autoconnect(PrevApi) {
                     || (secret_state[SECRET_KEYS.FIREWORKS] && oai_settings.chat_completion_source == chat_completion_sources.FIREWORKS)
                     || (secret_state[SECRET_KEYS.COMETAPI] && oai_settings.chat_completion_source == chat_completion_sources.COMETAPI)
                     || (secret_state[SECRET_KEYS.ZAI] && oai_settings.chat_completion_source == chat_completion_sources.ZAI)
-                    || (secret_state[SECRET_KEYS.POLLINATIONS] && oai_settings.chat_completion_source === chat_completion_sources.POLLINATIONS)
+                    || ((secret_state[SECRET_KEYS.POLLINATIONS] || oai_settings.pollinations_endpoint === POLLINATIONS_ENDPOINT.ANONYMOUS) && oai_settings.chat_completion_source === chat_completion_sources.POLLINATIONS)
                     || (secret_state[SECRET_KEYS.WORKERS_AI] && oai_settings.chat_completion_source == chat_completion_sources.WORKERS_AI)
                     || (secret_state[SECRET_KEYS.MINIMAX] && oai_settings.chat_completion_source == chat_completion_sources.MINIMAX)
                     || (secret_state[SECRET_KEYS.AWS_BEDROCK] && oai_settings.chat_completion_source == chat_completion_sources.AWS_BEDROCK)
@@ -913,7 +918,8 @@ export function initRossMods() {
     installChatInputFullscreenEditor({
         sendTextArea,
         sendMessage: sendTextareaMessage,
-        isMobile,
+        canSubmitGuidance: canSubmitAgentGuidance,
+        isMobileHost,
     });
 
     restoreUserInput();
@@ -970,8 +976,10 @@ export function initRossMods() {
 
 
     function isInputElementInFocus() {
-        //return $(document.activeElement).is(":input");
-        var focused = $(':focus');
+        // Editors keep their focused element inside a shadow root.
+        let element = document.activeElement;
+        while (element?.shadowRoot?.activeElement) element = element.shadowRoot.activeElement;
+        const focused = $(element);
         if (focused.is('input') || focused.is('textarea') || focused.prop('contenteditable') == 'true') {
             if (focused.attr('id') === 'send_textarea') {
                 return false;
@@ -1083,7 +1091,6 @@ export function initRossMods() {
                 function doRegenerate() {
                     console.debug('Regenerating with Ctrl+Enter');
                     $('#option_regenerate').trigger('click');
-                    $('#options').hide();
                 }
 
                 // If there is input text, we do not trigger a regenerate - we just send it
@@ -1215,12 +1222,12 @@ export function initRossMods() {
             }
 
             if ($('#select_chat_popup').is(':visible')) {
-                $('#select_chat_cross').trigger('click');
+                setChatHistoryOpen(false);
                 return;
             }
 
             if ($('#character_popup').is(':visible')) {
-                $('#character_cross').trigger('click');
+                setCharacterPopupOpen(false);
                 return;
             }
 

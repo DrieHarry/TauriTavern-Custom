@@ -20,6 +20,10 @@ pub struct SyncHttpClient {
 }
 
 impl SyncHttpClient {
+    pub(crate) fn into_sync_client(self) -> SyncClient {
+        self.inner
+    }
+
     pub fn new(
         base_url: String,
         spki_sha256: String,
@@ -192,6 +196,10 @@ pub(crate) fn domain_error_to_sync(error: DomainError) -> SyncError {
         DomainError::Conflict(message) => SyncError::InvalidData(message),
         DomainError::AuthenticationError(message) => SyncError::Unauthorized(message),
         DomainError::Cancelled(message) => SyncError::Internal(message),
+        error @ DomainError::WorkspaceAccessDenied { .. } => {
+            SyncError::Unauthorized(error.to_string())
+        }
+        error @ DomainError::FileIo { .. } => SyncError::Io(error.to_string()),
         DomainError::InternalError(message) => SyncError::Internal(message),
         DomainError::RateLimited { message } => SyncError::Internal(message),
         DomainError::Transient(message) => SyncError::Io(message),

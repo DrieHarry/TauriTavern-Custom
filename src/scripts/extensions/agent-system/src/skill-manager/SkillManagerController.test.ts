@@ -26,24 +26,30 @@ function preview(name: string): TauriTavernSkillImportPreview {
     return { skill: skill(name), files: [], conflict: { kind: 'new' }, warnings: [], source: null };
 }
 
-function createSkillApi(overrides: Partial<TauriTavernSkillApi> = {}): TauriTavernSkillApi {
-    const read: TauriTavernSkillReadResult = {
-        name: 'SKILL.md', path: 'SKILL.md', content: 'body', chars: 4, words: 1,
-        totalChars: 4, totalWords: 1, totalLines: 1, startLine: 1, endLine: 1,
-        lineTruncated: false, bytes: 4, sha256: 'sha', truncated: false, resourceRef: 'skill://file',
-    };
+function readResult(path: string, sha256: string, content = path): TauriTavernSkillReadResult {
     return {
+        name: path, path, content, chars: content.length, words: 1, totalChars: content.length,
+        totalWords: 1, totalLines: 1, startLine: 1, endLine: 1, lineTruncated: false,
+        bytes: content.length, sha256, truncated: false, resourceRef: `skill://${path}`,
+    };
+}
+
+function createSkillApi(overrides: Partial<TauriTavernSkillApi> = {}): TauriTavernSkillApi {
+    return {
+        acquireImport: () => () => Promise.resolve(),
         list: () => Promise.resolve([]),
         listFiles: () => Promise.resolve([]),
         pickImportArchive: () => Promise.resolve(null),
         pickImportArchives: () => Promise.resolve(null),
         pickImportDirectories: () => Promise.resolve(null),
+        isDirectoryImportAvailable: () => true,
         discardPickedImport: () => Promise.resolve(),
+        discoverImports: ({ input }) => Promise.resolve([input]),
         downloadImport: () => Promise.reject(new Error('not configured')),
         previewImport: () => Promise.reject(new Error('not configured')),
         installImport: () => Promise.reject(new Error('not configured')),
-        readFile: () => Promise.resolve(read),
-        writeFile: () => Promise.resolve(read),
+        readFile: () => Promise.resolve(readResult('SKILL.md', 'sha', 'body')),
+        writeFile: () => Promise.resolve(readResult('SKILL.md', 'sha', 'body')),
         export: () => Promise.resolve({ fileName: 'skill.zip', contentBase64: '', sha256: 'sha' }),
         delete: () => Promise.resolve(),
         move: request => Promise.resolve({ scope: request.toScope, name: request.name, action: 'installed' }),
@@ -103,9 +109,9 @@ function createWorld(api: TauriTavernSkillApi, profiles: TauriTavernAgentProfile
                 },
             };
         },
-        getSkillApi: () => ({ ...api, discardPickedImport: async (input) => { state.discards += 1; await api.discardPickedImport(input); } }),
+        getSkillApi: () => ({ ...api, acquireImport: () => async () => { state.discards += 1; await api.discardPickedImport(); } }),
         confirmAction: () => Promise.resolve(true),
-        downloadExport: () => Promise.resolve({ mode: 'browser' }),
+        downloadExport: () => Promise.resolve({ delivered: true }),
         syncInstallPortability: () => Promise.resolve(),
         syncMovePortability: () => Promise.resolve(),
         syncWritePortability: () => Promise.resolve(),
@@ -204,11 +210,13 @@ test('a failed final scope sync leaves initialization retryable and subscription
 });
 
 test('supports archive, directory, manual, and download imports with staged-input cleanup', async () => {
+    const cleanup = deferred<void>();
     const archive = { kind: 'archiveFile' as const, path: '/tmp/archive.zip' };
     const directory = { kind: 'directory' as const, path: '/tmp/directory' };
     const seen: TauriTavernSkillImportInput[] = [];
     const downloads: string[] = [];
     const api = createSkillApi({
+        discardPickedImport: () => cleanup.promise,
         pickImportArchives: () => Promise.resolve([archive]),
         pickImportDirectories: () => Promise.resolve([directory]),
         downloadImport: ({ url }) => { downloads.push(url); return Promise.resolve({ kind: 'inlineFiles', files: [{ path: 'SKILL.md', content: 'downloaded' }], source: { kind: 'url' } }); },
@@ -223,6 +231,10 @@ test('supports archive, directory, manual, and download imports with staged-inpu
     await waitFor(() => expect(seen).toHaveLength(1));
     controller.clearImportDraft();
     await waitFor(() => expect(state.discards).toBe(1));
+    controller.openImportScopeDialog('archive');
+    expect(controller.getSnapshot().scopeDialog.mode).toBe('');
+    cleanup.resolve();
+    await waitFor(() => expect(controller.getSnapshot().importBusy).toBe(false));
 
     controller.openImportScopeDialog('archive');
     controller.setScopeImportKind('directory');
@@ -254,15 +266,17 @@ test('supports archive, directory, manual, and download imports with staged-inpu
 });
 
 test('installs a batch in order without letting one item failure stop later items', async () => {
-    const inputs = ['one', 'bad', 'install-fail', 'last']
+    const inputs = ['one', 'bad', 'preview-fail', 'install-fail', 'last']
         .map(name => ({ kind: 'archiveFile' as const, path: `/tmp/${name}.zip` }));
     const installs: Parameters<TauriTavernSkillApi['installImport']>[0][] = [];
     const api = createSkillApi({
         pickImportArchives: () => Promise.resolve(inputs),
+        discoverImports: ({ input }) => 'path' in input && input.path === '/tmp/bad.zip'
+            ? Promise.reject(new Error('invalid archive')) : Promise.resolve([input]),
         previewImport: ({ input }) => {
             const name = 'path' in input ? input.path.split('/').at(-1)?.replace('.zip', '') ?? '' : '';
-            return name === 'bad'
-                ? Promise.reject(new Error('invalid archive'))
+            return name === 'preview-fail'
+                ? Promise.reject(new Error('invalid skill'))
                 : Promise.resolve({ ...preview(name), conflict: { kind: name === 'last' ? 'different' : 'new' } });
         },
         installImport: (request) => {
@@ -278,9 +292,12 @@ test('installs a batch in order without letting one item failure stop later item
     await controller.init();
     controller.openImportScopeDialog('archive');
     controller.confirmScopeDialog();
-    await waitFor(() => expect(controller.getSnapshot().importDraft.items.every(item => item.preview || item.error)).toBe(true));
-    expect(controller.getSnapshot().importDraft.items[1]?.error).toBe('invalid archive');
-    controller.setImportConflict(3, 'replace');
+    await waitFor(() => {
+        expect(controller.getSnapshot().importDraft.items).toHaveLength(5);
+        expect(controller.getSnapshot().importBusy).toBe(false);
+    });
+    expect(controller.getSnapshot().importDraft.items.filter(item => item.error).map(item => item.error)).toEqual(['invalid archive', 'invalid skill']);
+    controller.setImportConflict(4, 'replace');
     await controller.installImports();
 
     expect(installs.map(request => 'path' in request.input ? request.input.path : '')).toEqual([
@@ -292,7 +309,7 @@ test('installs a batch in order without letting one item failure stop later item
     expect(state.toastErrors).toEqual(['skillImportItemFailed', 'skillBatchInstallFailed']);
 });
 
-test('the install commit boundary keeps retries honest and reconciles committed Host state', async () => {
+test('failed installs finish the batch and committed installs remain visible after portability failure', async () => {
     let installAttempts = 0;
     let installed = false;
     const api = createSkillApi({
@@ -316,8 +333,12 @@ test('the install commit boundary keeps retries honest and reconciles committed 
 
     await expect(controller.installImports()).rejects.toThrow('install unavailable');
     expect(controller.getSnapshot().importDraft).toMatchObject({ installing: false });
-    expect(controller.getSnapshot().importDraft.items).toHaveLength(1);
+    expect(controller.getSnapshot().importDraft.items).toHaveLength(0);
+    expect(state.discards).toBe(1);
 
+    controller.openImportScopeDialog('archive');
+    controller.confirmScopeDialog();
+    await waitFor(() => expect(controller.getSnapshot().importDraft.items[0]?.preview?.skill.name).toBe('retry'));
     await expect(controller.installImports()).rejects.toThrow('portable sync failed');
     expect(controller.getSnapshot().importDraft.items).toHaveLength(0);
     expect(controller.getSnapshot().sections.find(section => section.id === 'global')?.skills[0]?.name).toBe('retry');
@@ -327,29 +348,34 @@ test('the install commit boundary keeps retries honest and reconciles committed 
     ]);
 });
 
-test('an obsolete preview cannot repopulate a draft cleared by a scope change', async () => {
-    const pending = deferred<TauriTavernSkillImportPreview>();
+test('a scope change during discovery discards late results and waits for IO before cleanup', async () => {
+    const started = deferred<void>();
+    const pending = deferred<TauriTavernSkillImportInput[]>();
+    const input: TauriTavernSkillImportInput = { kind: 'archiveFile', path: '/tmp/collection.zip' };
     const api = createSkillApi({
-        pickImportArchives: () => Promise.resolve([{ kind: 'archiveFile', path: '/tmp/pending.zip' }]),
-        previewImport: () => pending.promise,
+        pickImportArchives: () => Promise.resolve([input]),
+        discoverImports: () => { started.resolve(); return pending.promise; },
+        previewImport: () => Promise.resolve(preview('late')),
     });
-    const profiles = [
+    const { deps, state } = createWorld(api, [
         { id: 'default-writer', displayName: 'Writer', directRunnable: true },
         { id: 'second', displayName: 'Second', directRunnable: true },
-    ];
-    const { deps, state } = createWorld(api, profiles);
+    ]);
     const controller = createSkillManagerController(deps);
     await controller.init();
     controller.openImportScopeDialog('archive');
     controller.setScopeDialogTarget('profile');
     controller.confirmScopeDialog();
-    await waitFor(() => expect(controller.getSnapshot().importDraft.items).toHaveLength(1));
+    await started.promise;
     state.emitSettings({ editingProfileId: 'second' });
-    await waitFor(() => expect(controller.getSnapshot().importDraft.items).toHaveLength(0));
-    pending.resolve(preview('late'));
-    await Promise.resolve();
+    await waitFor(() => expect(controller.getSnapshot().importDraft.sectionId).toBe(''));
+    expect(state.discards).toBe(0);
+    expect(controller.getSnapshot().importBusy).toBe(true);
+    pending.resolve([input]);
+    await waitFor(() => expect(controller.getSnapshot().importBusy).toBe(false));
     expect(controller.getSnapshot().importDraft.items).toHaveLength(0);
     expect(state.discards).toBe(1);
+    controller.dispose();
 });
 
 test('rejects stale preview/file loads and saves with optimistic sha before portable sync', async () => {
@@ -362,11 +388,6 @@ test('rejects stale preview/file loads and saves with optimistic sha before port
     const writes: Parameters<TauriTavernSkillApi['writeFile']>[0][] = [];
     const events: string[] = [];
     let writeFailure = '';
-    const readResult = (path: string, sha256: string, content = path): TauriTavernSkillReadResult => ({
-        name: path, path, content, chars: content.length, words: 1, totalChars: content.length,
-        totalWords: 1, totalLines: 1, startLine: 1, endLine: 1, lineTruncated: false,
-        bytes: content.length, sha256, truncated: false, resourceRef: `skill://${path}`,
-    });
     const api = createSkillApi({
         list: ({ scope } = {}) => Promise.resolve(scope?.kind === 'global' ? [skill('alpha'), skill('beta')] : []),
         listFiles: () => {

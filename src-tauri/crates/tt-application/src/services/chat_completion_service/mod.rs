@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{RwLock, watch};
@@ -19,7 +20,7 @@ use tt_ports::generation_background::{GenerationBackgroundOutcome, GenerationBac
 use tt_ports::repositories::chat_completion_repository::{
     CHAT_COMPLETION_PROVIDER_STATE_FIELD, ChatCompletionApiConfig, ChatCompletionCancelReceiver,
     ChatCompletionNormalizationReport, ChatCompletionRepository, ChatCompletionSource,
-    ChatCompletionStreamSender,
+    ChatCompletionStreamDelta, ChatCompletionStreamSender,
 };
 use tt_ports::repositories::prompt_cache_repository::{PromptCacheKey, PromptCacheRepository};
 use tt_ports::repositories::secret_repository::SecretRepository;
@@ -32,6 +33,7 @@ mod custom_parameters;
 pub(crate) mod exchange;
 mod generation_background;
 mod model_capabilities;
+pub(super) mod opencode;
 mod payload;
 mod prompt_caching;
 mod prompt_caching_plan;
@@ -45,6 +47,8 @@ use self::generation_background::GenerationBackgroundLease;
 use self::stream_session::{StreamAppendOutcome, StreamSessionRegistry};
 
 const OPENAI_SOURCE: &str = ChatCompletionSource::OpenAi.key();
+pub(crate) const OPENCODE_STABLE_CHAT_ID_FIELD: &str = "_tauritavern_stable_chat_id";
+const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 const VERTEXAI_PROMPT_CACHE_SESSION_HEADER: &str = "X-Vertex-Ai-Session-Id";
 const AGENT_STRUCTURAL_BODY_OVERRIDE_KEYS: &[&str] = &[
     "messages",
@@ -426,6 +430,7 @@ impl ChatCompletionService {
     async fn execute_generate(
         &self,
         dto: ChatCompletionGenerateRequestDto,
+        on_delta: Option<&mut (dyn FnMut(ChatCompletionStreamDelta) + Send)>,
     ) -> Result<ChatCompletionExecution, ApplicationError> {
         let source = self.resolve_generate_source(&dto)?;
         let additional_parameters = AdditionalParameters::from_payload(&dto.payload)?;
@@ -435,16 +440,30 @@ impl ChatCompletionService {
             .prepare_generate_request(dto, source, additional_parameters)
             .await?;
 
-        let response = self
-            .chat_completion_repository
-            .generate(
-                prepared.source,
-                &prepared.config,
-                &prepared.endpoint_path,
-                &prepared.upstream_payload,
-            )
-            .await
-            .map_err(ApplicationError::from)?;
+        let response = match on_delta {
+            Some(on_delta) => {
+                self.chat_completion_repository
+                    .generate_with_deltas(
+                        prepared.source,
+                        &prepared.config,
+                        &prepared.endpoint_path,
+                        &prepared.upstream_payload,
+                        on_delta,
+                    )
+                    .await
+            }
+            None => {
+                self.chat_completion_repository
+                    .generate(
+                        prepared.source,
+                        &prepared.config,
+                        &prepared.endpoint_path,
+                        &prepared.upstream_payload,
+                    )
+                    .await
+            }
+        }
+        .map_err(ApplicationError::from)?;
 
         Ok(ChatCompletionExecution {
             source: prepared.source,
@@ -470,6 +489,7 @@ impl ChatCompletionService {
             &self.secret_repository,
         )
         .await?;
+        apply_opencode_session_header(source, &dto.payload, &mut config)?;
         let (endpoint_path, mut upstream_payload) = payload::build_payload(source, dto.payload)?;
         additional_parameters.apply_body_overrides(&mut upstream_payload)?;
         self.apply_tauritavern_prompt_caching(
@@ -481,8 +501,6 @@ impl ChatCompletionService {
             prompt_caching_hints,
         )
         .await?;
-        payload::validate_upstream_tool_transcript(&endpoint_path, &upstream_payload)?;
-
         Ok(PreparedChatCompletionRequest {
             source,
             config,
@@ -494,8 +512,9 @@ impl ChatCompletionService {
     pub(crate) async fn generate_exchange(
         &self,
         dto: ChatCompletionGenerateRequestDto,
+        on_delta: Option<&mut (dyn FnMut(ChatCompletionStreamDelta) + Send)>,
     ) -> Result<ChatCompletionExchange, ApplicationError> {
-        let execution = self.execute_generate(dto).await?;
+        let execution = self.execute_generate(dto, on_delta).await?;
         let normalized_response = NormalizedChatCompletionResponse::from_value(execution.body)?;
 
         Ok(ChatCompletionExchange {
@@ -529,7 +548,7 @@ impl ChatCompletionService {
         dto: ChatCompletionGenerateRequestDto,
         mut cancel: ChatCompletionCancelReceiver,
     ) -> Result<Value, ApplicationError> {
-        let generation = self.execute_generate(dto);
+        let generation = self.execute_generate(dto, None);
         tokio::pin!(generation);
 
         let execution = tokio::select! {
@@ -549,9 +568,10 @@ impl ChatCompletionService {
     pub(crate) async fn generate_exchange_with_cancel(
         &self,
         dto: ChatCompletionGenerateRequestDto,
+        on_delta: Option<&mut (dyn FnMut(ChatCompletionStreamDelta) + Send)>,
         mut cancel: ChatCompletionCancelReceiver,
     ) -> Result<ChatCompletionExchange, ApplicationError> {
-        let generation = self.generate_exchange(dto);
+        let generation = self.generate_exchange(dto, on_delta);
         tokio::pin!(generation);
 
         tokio::select! {
@@ -923,6 +943,38 @@ fn has_configured_header(config: &ChatCompletionApiConfig, header_name: &str) ->
         .any(|key| key.eq_ignore_ascii_case(header_name))
 }
 
+fn apply_opencode_session_header(
+    source: ChatCompletionSource,
+    payload: &Map<String, Value>,
+    config: &mut ChatCompletionApiConfig,
+) -> Result<(), ApplicationError> {
+    if source != ChatCompletionSource::OpenCode
+        || has_configured_header(config, OPENCODE_SESSION_HEADER)
+    {
+        return Ok(());
+    }
+
+    let stable_chat_id = payload
+        .get(OPENCODE_STABLE_CHAT_ID_FIELD)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApplicationError::ValidationError(
+                "OpenCode requires a stable chat id for x-opencode-session".to_string(),
+            )
+        })?;
+    const ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    config.extra_headers.insert(
+        OPENCODE_SESSION_HEADER.to_string(),
+        utf8_percent_encode(stable_chat_id, ENCODE_SET).to_string(),
+    );
+    Ok(())
+}
+
 fn resolve_status_model_list_source(
     source: ChatCompletionSource,
     custom_api_format: &str,
@@ -969,8 +1021,8 @@ mod tests {
 
     use super::{
         AdditionalParameters, ChatCompletionService, apply_nanogpt_claude_cache_control,
-        apply_vertexai_prompt_cache_session_header, ensure_vertexai_claude_prompt_cache_ttl,
-        resolve_status_model_list_source,
+        apply_opencode_session_header, apply_vertexai_prompt_cache_session_header,
+        ensure_vertexai_claude_prompt_cache_ttl, resolve_status_model_list_source,
     };
     use crate::errors::ApplicationError;
     use tokio::sync::watch;
@@ -1039,6 +1091,42 @@ mod tests {
         apply_vertexai_prompt_cache_session_header(&mut config, &key);
 
         assert!(config.extra_headers.contains_key("X-Vertex-Ai-Session-Id"));
+    }
+
+    #[test]
+    fn opencode_uses_stable_chat_id_as_session_header() {
+        let mut config = ChatCompletionApiConfig {
+            base_url: "https://opencode.ai/inference/v1".to_string(),
+            user_configured_endpoint: false,
+            api_key: "secret".to_string(),
+            authorization_header: None,
+            vertexai_service_account_json: None,
+            extra_headers: Default::default(),
+            additional_headers: Default::default(),
+            anthropic_beta_header_mode: AnthropicBetaHeaderMode::None,
+            aws_bedrock_custom_response_path: None,
+            aws_bedrock_custom_stream_path: None,
+        };
+        let missing_id = json!({});
+        assert!(
+            apply_opencode_session_header(
+                ChatCompletionSource::OpenCode,
+                missing_id.as_object().unwrap(),
+                &mut config,
+            )
+            .is_err()
+        );
+        let payload = json!({ "_tauritavern_stable_chat_id": " stable-空% \n" });
+        apply_opencode_session_header(
+            ChatCompletionSource::OpenCode,
+            payload.as_object().unwrap(),
+            &mut config,
+        )
+        .unwrap();
+        assert_eq!(
+            config.extra_headers["x-opencode-session"],
+            "%20stable-%E7%A9%BA%25%20%0A"
+        );
     }
 
     #[test]

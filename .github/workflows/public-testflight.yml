@@ -57,7 +57,7 @@ jobs:
   notes:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
@@ -120,7 +120,7 @@ jobs:
       - name: Draft policy-visible What to Test notes
         id: codex
         continue-on-error: true
-        uses: openai/codex-action@v1
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
         with:
           openai-api-key: ${{ secrets.CODEX_API_KEY }}
           responses-api-endpoint: ${{ secrets.CODEX_RESPONSES_ENDPOINT }}
@@ -148,7 +148,7 @@ jobs:
             cp .testflight-notes/fallback.txt what-to-test.txt
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: testflight-${{ inputs.channel }}-notes
           path: what-to-test.txt
@@ -162,17 +162,17 @@ jobs:
       actions: read
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source_ref }}
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ inputs.ipa_artifact }}
           path: package
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: testflight-${{ inputs.channel }}-notes
           path: notes

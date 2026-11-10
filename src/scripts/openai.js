@@ -12,7 +12,7 @@ import {
     event_types,
     eventSource,
     Generate,
-    getExtensionPromptMaxDepth,
+    getInChatInjectionDepths,
     getMediaDisplay,
     getMediaIndex,
     getRequestHeaders,
@@ -32,8 +32,10 @@ import {
 import { getGroupNames, selected_group } from './group-chats.js';
 import { extension_prompt_roles, extension_prompt_types } from './extension-prompts.js';
 import { allowlistSettingAllows, getActiveIosPolicyCapabilities } from './tauritavern/ios-policy.js';
-import { materializeInitialChatHistoryMessages } from './tauritavern/agent/agent-context-policy.js';
+import { toAgentModelMessage } from './tauritavern/agent/agent-model-messages.js';
 import { projectToolTurns } from './tauritavern/tool-turn-projection.js';
+import { canReplayProviderMetadata, getChatCompletionRequestContext } from './tauritavern/provider-replay.js';
+import { applyParamOmissions, getEffectiveGenerationSettings } from './tauri/generation-params/omission.js';
 
 import {
     chatCompletionDefaultPrompts,
@@ -51,9 +53,10 @@ import {
 } from './prompt-injections.js';
 
 import { forceCharacterEditorTokenize, getCustomStoppingStrings, persona_description_positions, power_user } from './power-user.js';
-import { resolveSecretKey, SECRET_KEYS, secret_state, writeSecret } from './secrets.js';
+import { readSecretState, resolveSecretKey, SECRET_KEYS, secret_state, writeSecret } from './secrets.js';
 
 import { getEventSourceStream } from './sse-stream.js';
+import { getCustomEndpointPreview } from './tauritavern/custom-endpoint.js';
 import { appendClaudeRefusalWarning, ClaudeNativeStreamAccumulator, getClaudeStopStatus, hasClaudeToolUse } from './tauritavern/claude-native-stream.js';
 import {
     createThumbnail,
@@ -86,9 +89,11 @@ import { renderTemplateAsync } from './templates.js';
 import { SlashCommandEnumValue } from './slash-commands/SlashCommandEnumValue.js';
 import { callGenericPopup, Popup, POPUP_RESULT, POPUP_TYPE } from './popup.js';
 import { t } from './i18n.js';
+import { toUserFacingErrorText } from './util/user-facing-error.js';
 import { ToolManager } from './tool-calling.js';
 import { accountStorage } from './util/AccountStorage.js';
-import { COMETAPI_IGNORE_PATTERNS, IGNORE_SYMBOL, MEDIA_DISPLAY, MEDIA_TYPE, inject_ids } from './constants.js';
+import { COMETAPI_IGNORE_PATTERNS, IGNORE_SYMBOL, MEDIA_DISPLAY, MEDIA_TYPE } from './constants.js';
+import { macros } from './macros/macro-system.js';
 import { syncNanoGptProvidersForModel, syncOpenRouterProvidersForModel, updateNanoGptProvidersWarning, updateOpenRouterProvidersWarning } from './textgen-models.js';
 
 export {
@@ -145,7 +150,9 @@ const max_128k = 128 * 1000;
 const max_200k = 200 * 1000;
 const max_256k = 256 * 1000;
 const max_400k = 400 * 1000;
+const max_500k = 500 * 1000;
 const max_1mil = 1000 * 1000;
+const max_1050k = 1050 * 1000;
 const max_2mil = 2000 * 1000;
 const unlocked_max = max_2mil;
 const oai_max_temp = 2.0;
@@ -189,6 +196,7 @@ export let model_list = [];
 
 export const chat_completion_sources = {
     OPENAI: 'openai',
+    OPENCODE: 'opencode',
     CLAUDE: 'claude',
     OPENROUTER: 'openrouter',
     AI21: 'ai21',
@@ -224,6 +232,7 @@ const custom_model_option_values = new Set([
 
 const chatCompletionModelControls = {
     [chat_completion_sources.OPENAI]: { selector: '#model_openai_select', settingKey: 'openai_model', label: 'OpenAI', supportsCustomModels: true },
+    [chat_completion_sources.OPENCODE]: { selector: '#model_opencode_select', settingKey: 'opencode_model', label: 'OpenCode', supportsCustomModels: true },
     [chat_completion_sources.CLAUDE]: { selector: '#model_claude_select', settingKey: 'claude_model', label: 'Claude', supportsCustomModels: true },
     [chat_completion_sources.OPENROUTER]: { selector: '#model_openrouter_select', settingKey: 'openrouter_model', label: 'OpenRouter', supportsCustomModels: true },
     [chat_completion_sources.AI21]: { selector: '#model_ai21_select', settingKey: 'ai21_model', label: 'AI21', supportsCustomModels: true },
@@ -277,12 +286,26 @@ const custom_api_formats = {
     OPENAI_RESPONSES: 'openai_responses',
     CLAUDE_MESSAGES: 'claude_messages',
     GEMINI_INTERACTIONS: 'gemini_interactions',
+    GEMINI_GENERATE_CONTENT: 'gemini_generate_content',
+};
+
+export const OPENCODE_API_FORMAT = {
+    OPENAI_COMPAT: 'openai_compat',
+    OPENAI_RESPONSES: 'openai_responses',
+    CLAUDE_MESSAGES: 'claude_messages',
+    GEMINI: 'gemini',
+};
+
+export const OPENCODE_ENDPOINT = {
+    ZEN: 'zen',
+    GO: 'go',
 };
 
 const custom_source_variants = {
     OPENAI_RESPONSES: 'custom_openai_responses',
     CLAUDE_MESSAGES: 'custom_claude_messages',
     GEMINI_INTERACTIONS: 'custom_gemini_interactions',
+    GEMINI_GENERATE_CONTENT: 'custom_gemini_generate_content',
 };
 
 const character_names_behavior = {
@@ -339,8 +362,6 @@ export function codexModelSupportsMaximumReasoning(model) {
     return /^gpt-5\.6(?:$|-(?:luna|terra|sol)(?:$|-))/i.test(String(model || ''));
 }
 
-const OPENAI_GPT56_MODEL_PATTERN = /^gpt-5\.6(?:-(?:sol|terra|luna))?$/;
-
 export const verbosity_levels = {
     auto: 'auto',
     low: 'low',
@@ -380,6 +401,11 @@ export const MOONSHOT_ENDPOINT = {
     CN: 'cn',
 };
 
+export const POLLINATIONS_ENDPOINT = {
+    AUTHENTICATED: 'authenticated',
+    ANONYMOUS: 'anonymous',
+};
+
 export const AWS_BEDROCK_REGION_DEFAULT = 'us-east-1';
 
 export function getAwsBedrockModelMetadata(modelId = null) {
@@ -399,6 +425,8 @@ function usesClaudeMessagesSemantics(settings, model = getChatCompletionModel(se
     switch (settings.chat_completion_source) {
         case chat_completion_sources.CLAUDE:
             return true;
+        case chat_completion_sources.OPENCODE:
+            return settings.opencode_api_format === OPENCODE_API_FORMAT.CLAUDE_MESSAGES;
         case chat_completion_sources.CUSTOM:
             return settings.custom_api_format === custom_api_formats.CLAUDE_MESSAGES;
         case chat_completion_sources.VERTEXAI:
@@ -409,6 +437,16 @@ function usesClaudeMessagesSemantics(settings, model = getChatCompletionModel(se
         default:
             return false;
     }
+}
+
+/**
+ * Sources whose request is built by the Claude Messages path below
+ * (top_k, use_sysprompt, stop, assistant_prefill). Bedrock speaks the same
+ * dialect but keeps its own branch with per-model capabilities.
+ */
+function buildsClaudeMessagesRequest(settings, model = getChatCompletionModel(settings)) {
+    return settings.chat_completion_source !== chat_completion_sources.AWS_BEDROCK
+        && usesClaudeMessagesSemantics(settings, model);
 }
 
 function getAwsBedrockEntryMetadata(model) {
@@ -443,6 +481,9 @@ const sensitiveFields = [
 export const settingsToUpdate = {
     chat_completion_source: ['#chat_completion_source', 'chat_completion_source', false, true],
     custom_api_format: ['', 'custom_api_format', false, true],
+    opencode_model: ['#model_opencode_select', 'opencode_model', false, true],
+    opencode_endpoint: ['#opencode_endpoint', 'opencode_endpoint', false, true],
+    opencode_api_format: ['#opencode_api_format', 'opencode_api_format', false, true],
     temperature: ['#temp_openai', 'temp_openai', false, false],
     frequency_penalty: ['#freq_pen_openai', 'freq_pen_openai', false, false],
     presence_penalty: ['#pres_pen_openai', 'pres_pen_openai', false, false],
@@ -490,6 +531,7 @@ export const settingsToUpdate = {
     aimlapi_model: ['#model_aimlapi_select', 'aimlapi_model', false, true],
     xai_model: ['#model_xai_select', 'xai_model', false, true],
     pollinations_model: ['#model_pollinations_select', 'pollinations_model', false, true],
+    pollinations_endpoint: ['#pollinations_endpoint', 'pollinations_endpoint', false, true],
     moonshot_model: ['#model_moonshot_select', 'moonshot_model', false, true],
     moonshot_endpoint: ['#moonshot_endpoint', 'moonshot_endpoint', false, true],
     fireworks_model: ['#model_fireworks_select', 'fireworks_model', false, true],
@@ -530,10 +572,11 @@ export const settingsToUpdate = {
     prompts: ['', 'prompts', false, false],
     prompt_order: ['', 'prompt_order', false, false],
     show_external_models: ['#openai_show_external_models', 'show_external_models', true, true],
-    proxy_password: ['#openai_proxy_password', 'proxy_password', false, true],
+    proxy_password: ['#openai_proxy_access_key', 'proxy_password', false, true],
     assistant_prefill: ['#claude_assistant_prefill', 'assistant_prefill', false, false],
     assistant_impersonation: ['#claude_assistant_impersonation', 'assistant_impersonation', false, false],
     use_sysprompt: ['#use_sysprompt', 'use_sysprompt', true, false],
+    claude_fast_mode: ['#claude_fast_mode', 'claude_fast_mode', true, false],
     vertexai_auth_mode: ['#vertexai_auth_mode', 'vertexai_auth_mode', false, true],
     vertexai_region: ['#vertexai_region', 'vertexai_region', false, true],
     vertexai_express_project_id: ['#vertexai_express_project_id', 'vertexai_express_project_id', false, true],
@@ -589,10 +632,13 @@ const default_settings = {
     group_nudge_prompt: default_group_nudge_prompt,
     scenario_format: default_scenario_format,
     personality_format: default_personality_format,
-    openai_model: 'gpt-4-turbo',
-    claude_model: 'claude-sonnet-4-5',
-    google_model: 'gemini-2.5-pro',
-    vertexai_model: 'gemini-2.5-pro',
+    openai_model: 'gpt-5.6-terra',
+    opencode_model: '',
+    opencode_endpoint: OPENCODE_ENDPOINT.ZEN,
+    opencode_api_format: OPENCODE_API_FORMAT.OPENAI_COMPAT,
+    claude_model: 'claude-sonnet-5',
+    google_model: 'gemini-3.7-flash',
+    vertexai_model: 'gemini-3.7-flash',
     ai21_model: 'jamba-large',
     mistralai_model: 'mistral-large-latest',
     cohere_model: 'command-r-plus',
@@ -616,10 +662,11 @@ const default_settings = {
     nanogpt_model: 'gpt-4o-mini',
     nanogpt_provider: '',
     nanogpt_payg_override: false,
-    deepseek_model: 'deepseek-v4-flash',
+    deepseek_model: 'deepseek-flash',
     aimlapi_model: 'chatgpt-4o-latest',
-    xai_model: 'grok-3-beta',
+    xai_model: 'grok-4.7',
     pollinations_model: 'openai',
+    pollinations_endpoint: POLLINATIONS_ENDPOINT.AUTHENTICATED,
     cometapi_model: 'gpt-4o',
     moonshot_model: 'kimi-k3',
     moonshot_endpoint: MOONSHOT_ENDPOINT.GLOBAL,
@@ -660,6 +707,7 @@ const default_settings = {
     assistant_prefill: '',
     assistant_impersonation: '',
     use_sysprompt: false,
+    claude_fast_mode: false,
     vertexai_auth_mode: 'express',
     vertexai_region: 'us-central1',
     vertexai_express_project_id: '',
@@ -860,6 +908,8 @@ function getAdditionalParametersSourceKey(settings = oai_settings) {
             return custom_source_variants.CLAUDE_MESSAGES;
         case custom_api_formats.GEMINI_INTERACTIONS:
             return custom_source_variants.GEMINI_INTERACTIONS;
+        case custom_api_formats.GEMINI_GENERATE_CONTENT:
+            return custom_source_variants.GEMINI_GENERATE_CONTENT;
         case custom_api_formats.OPENAI_COMPAT:
         default:
             return chat_completion_sources.CUSTOM;
@@ -895,19 +945,24 @@ function getLegacyAdditionalParameters(settings) {
     };
 }
 
-function applyAdditionalParametersToRequest(request, settings = oai_settings, { includeBody = true } = {}) {
+export function applyAdditionalParametersToRequest(request, settings = oai_settings, {
+    includeBody = true,
+    sourceKey = getAdditionalParametersSourceKey(settings),
+    macroContext = null,
+} = {}) {
     const parameters = getAdditionalParametersForSource(
         settings,
-        getAdditionalParametersSourceKey(settings),
+        sourceKey,
         { create: false },
     );
+    const runtime = { macroContext, model: request.model ?? getChatCompletionModel(settings) };
 
     if (includeBody) {
-        request.custom_include_body = parameters.include_body;
-        request.custom_exclude_body = parameters.exclude_body;
+        request.custom_include_body = substitutePromptParams(parameters.include_body, {}, runtime);
+        request.custom_exclude_body = substitutePromptParams(parameters.exclude_body, {}, runtime);
     }
 
-    request.custom_include_headers = parameters.include_headers;
+    request.custom_include_headers = substitutePromptParams(parameters.include_headers, {}, runtime);
 }
 
 function hasSensitiveFieldValue(value) {
@@ -970,10 +1025,13 @@ function setOpenAIMessages(chat, stripOldToolCalls = false) {
     // Get current API and model for thought signature validation
     const currentApi = oai_settings.chat_completion_source;
     const currentModel = getChatCompletionModel();
+    const requestContext = getChatCompletionRequestContext(oai_settings, currentModel);
+    const includeReasoningContent = oai_settings.show_thoughts
+        && usesDeepSeekReasoningContent(oai_settings, currentModel);
     const includeClaudeNative = usesClaudeMessagesSemantics(oai_settings, currentModel);
     const includeNative = includeClaudeNative
         || (currentApi === chat_completion_sources.CUSTOM
-            && oai_settings.custom_api_format === custom_api_formats.GEMINI_INTERACTIONS);
+            && [custom_api_formats.GEMINI_INTERACTIONS, custom_api_formats.GEMINI_GENERATE_CONTENT].includes(oai_settings.custom_api_format));
 
     for (let i = projectedChat.length - 1; i >= 0; i--) {
         const entry = projectedChat[j];
@@ -1031,18 +1089,17 @@ function setOpenAIMessages(chat, stripOldToolCalls = false) {
         const originModel = metadataMessage?.extra?.model;
         const isSameModel = originApi === currentApi && originModel === currentModel;
         const isOtherGroupMember = selected_group && sourceMessage.name !== name2 && !Array.isArray(invocations);
-        const canReplayProviderTurnMetadata = isSameModel && !isOtherGroupMember;
+        const canReplayProviderTurnMetadata = !isOtherGroupMember
+            && canReplayProviderMetadata(metadataMessage, contentMessage?.mes ?? '', requestContext);
         const signature = canReplayProviderTurnMetadata ? contentMessage?.extra?.reasoning_signature : null;
-        const reasoning = canReplayProviderTurnMetadata ? String(contentMessage?.extra?.reasoning ?? '') : '';
+        const reasoning = isSameModel && !isOtherGroupMember ? String(contentMessage?.extra?.reasoning ?? '') : '';
         const native = includeNative
             && canReplayProviderTurnMetadata
             && (!includeClaudeNative || hasClaudeToolUse(metadataMessage?.extra?.native))
             ? metadataMessage?.extra?.native
             : null;
-        const shouldReplayReasoningContent = currentApi === chat_completion_sources.DEEPSEEK
-            && oai_settings.show_thoughts
-            && canReplayProviderTurnMetadata;
-        const reasoningContent = shouldReplayReasoningContent ? metadataMessage?.extra?.tool_reasoning_content : null;
+        const reasoningContent = includeReasoningContent && isSameModel && !isOtherGroupMember
+            ? metadataMessage?.extra?.tool_reasoning_content : null;
         // Remove provider metadata from invocations if the API/model/speaker don't match.
         if (Array.isArray(invocations) && invocations.length > 0) {
             invocations.forEach((invocation, index) => {
@@ -1152,6 +1209,7 @@ function createPromptAssemblyRuntime({
     updatePromptManager = true,
     renderPromptManager = true,
     showToasts = true,
+    contextKind = 'chat',
 } = {}) {
     if (!assemblyPromptManager) {
         throw new Error('prompt_assembly.prompt_manager_required: Prompt assembly requires a PromptManager instance');
@@ -1169,15 +1227,16 @@ function createPromptAssemblyRuntime({
 
     return {
         promptManager: assemblyPromptManager,
-        settings: serviceSettings,
+        settings: getEffectiveGenerationSettings(serviceSettings),
         tokenHandler: serviceTokenHandler,
-        macroContext: normalizePromptAssemblyMacroContext(macroContext),
+        macroContext,
         extensionPrompts: normalizePromptAssemblyExtensionPrompts(extensionPrompts),
         model: normalizePromptAssemblyString(model),
         emitPromptReady: Boolean(emitPromptReady),
         updatePromptManager: Boolean(updatePromptManager),
         renderPromptManager: Boolean(renderPromptManager),
         showToasts: Boolean(showToasts),
+        contextKind,
     };
 }
 
@@ -1194,9 +1253,8 @@ function getPromptAssemblyRuntime(runtime = null) {
 }
 
 function createHeadlessChatCompletionPromptManager(settings, {
-    macroContext = null,
-    extensionPrompts = null,
-    model = null,
+    macroContext,
+    contextKind,
 } = {}) {
     if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
         throw new Error('prompt_assembly.settings_required: Headless prompt assembly requires chat-completion settings');
@@ -1211,25 +1269,15 @@ function createHeadlessChatCompletionPromptManager(settings, {
     assemblyPromptManager.activeCharacter = { id: configuration.promptOrder.dummyId };
     assemblyPromptManager.saveServiceSettings = () => Promise.resolve();
     assemblyPromptManager.tryGenerate = () => Promise.resolve();
-    assemblyPromptManager.tokenHandler = new TokenHandler((messages, full) => countTokensOpenAIAsync(messages, full, serviceSettings));
-    assemblyPromptManager.substituteParams = (content, options = {}) => substitutePromptParams(content, options, {
+    assemblyPromptManager.tokenHandler = new TokenHandler(contextKind === 'session'
+        ? async () => 0
+        : (messages, full) => countTokensOpenAIAsync(messages, full, serviceSettings));
+    assemblyPromptManager.substituteParams = (content, options = {}) => substitutePromptParams(content ?? '', options, {
         macroContext,
-        extensionPrompts,
-        model,
     });
     assemblyPromptManager.sanitizeServiceSettings();
 
     return assemblyPromptManager;
-}
-
-function normalizePromptAssemblyMacroContext(value) {
-    if (value == null) {
-        return null;
-    }
-    if (typeof value !== 'object' || Array.isArray(value)) {
-        throw new Error('prompt_assembly.macro_context_invalid: macroContext must be an object');
-    }
-    return value;
 }
 
 function normalizePromptAssemblyExtensionPrompts(value) {
@@ -1248,114 +1296,41 @@ function normalizePromptAssemblyString(value) {
 }
 
 function substitutePromptParams(content, options = {}, runtime = null) {
-    const macroContext = normalizePromptAssemblyMacroContext(runtime?.macroContext ?? null);
-    const extensionPrompts = normalizePromptAssemblyExtensionPrompts(runtime?.extensionPrompts ?? null);
-    const model = normalizePromptAssemblyString(runtime?.model ?? null);
-
-    if (!macroContext && !extensionPrompts && !model) {
-        return substituteParams(content, options);
+    if (runtime?.macroContext) {
+        return macros.evaluateWithContext(content, runtime.macroContext, options);
     }
-
-    const preparedContent = replaceFrozenOutletMacros(content, extensionPrompts);
-    const macroOptions = macroContext
-        ? withPromptAssemblyMacroContext(options, macroContext, { model })
-        : options;
-
-    return substituteParams(preparedContent, macroOptions);
-}
-
-function withPromptAssemblyMacroContext(options, macroContext, { model = null } = {}) {
-    const names = macroContext.names && typeof macroContext.names === 'object' ? macroContext.names : {};
-    const character = macroContext.character && typeof macroContext.character === 'object' ? macroContext.character : {};
-    const system = macroContext.system && typeof macroContext.system === 'object' ? macroContext.system : {};
-    const dynamicMacros = {
-        user: stringOrEmpty(names.user),
-        char: stringOrEmpty(names.char),
-        group: stringOrEmpty(names.group),
-        charIfNotGroup: stringOrEmpty(names.group ?? names.char),
-        groupNotMuted: stringOrEmpty(names.groupNotMuted),
-        notChar: stringOrEmpty(names.notChar),
-        charPrompt: stringOrEmpty(character.charPrompt),
-        charInstruction: stringOrEmpty(character.charInstruction ?? character.charJailbreak),
-        charJailbreak: stringOrEmpty(character.charJailbreak ?? character.charInstruction),
-        charDescription: stringOrEmpty(character.description),
-        description: stringOrEmpty(character.description),
-        charPersonality: stringOrEmpty(character.personality),
-        personality: stringOrEmpty(character.personality),
-        charScenario: stringOrEmpty(character.scenario),
-        scenario: stringOrEmpty(character.scenario),
-        persona: stringOrEmpty(character.persona),
-        personaPosition: stringOrEmpty(character.personaPosition),
-        mesExamplesRaw: stringOrEmpty(character.mesExamplesRaw),
-        mesExamples: stringOrEmpty(character.mesExamples),
-        charDepthPrompt: stringOrEmpty(character.charDepthPrompt),
-        charCreatorNotes: stringOrEmpty(character.creatorNotes),
-        creatorNotes: stringOrEmpty(character.creatorNotes),
-        charVersion: stringOrEmpty(character.version),
-        version: stringOrEmpty(character.version),
-        char_version: stringOrEmpty(character.version),
-        greeting: stringOrEmpty(character.firstMessage),
-        charFirstMessage: stringOrEmpty(character.firstMessage),
-        model: stringOrEmpty(model ?? system.model),
-        ...(options?.dynamicMacros ?? {}),
-    };
-
-    return {
+    return substituteParams(content, runtime?.model ? {
         ...options,
-        name1Override: options?.name1Override ?? stringOrEmpty(names.user),
-        name2Override: options?.name2Override ?? stringOrEmpty(names.char),
-        groupOverride: options?.groupOverride ?? stringOrEmpty(names.group),
-        dynamicMacros,
-    };
-}
-
-function replaceFrozenOutletMacros(content, extensionPrompts) {
-    if (!extensionPrompts || typeof content !== 'string' || !content.includes('{{outlet::')) {
-        return content;
-    }
-
-    return content.replace(/{{outlet::(.+?)}}/gi, (_, key) => {
-        return getOutletPromptFromExtensionPrompts(extensionPrompts, String(key ?? '').trim());
-    });
-}
-
-function getOutletPromptFromExtensionPrompts(extensionPrompts, key) {
-    if (!key) {
-        return '';
-    }
-
-    const outletPrompt = extensionPrompts[inject_ids.CUSTOM_WI_OUTLET(key)];
-
-    return stringOrEmpty(outletPrompt?.value);
+        dynamicMacros: { model: runtime.model, ...options.dynamicMacros },
+    } : options);
 }
 
 function stringOrEmpty(value) {
     return value == null ? '' : String(value);
 }
 
-function splitPromptAssemblyGroupNames(value) {
-    const text = stringOrEmpty(value).trim();
-    if (!text) {
-        return [];
-    }
-    return text.split(',').map(name => name.trim()).filter(Boolean);
-}
-
 /**
  * Parses the example messages into individual messages.
  * @param {string} messageExampleString - The string containing the example messages
  * @param {boolean} appendNamesForGroup - Whether to append the character name for group chats
+ * @param {{ name1: string, name2: string, isGroup: boolean, groupNames: string[] }} [context] Explicit names for independent macro evaluation
  * @returns {Message[]} Array of message objects
  */
-export function parseExampleIntoIndividual(messageExampleString, appendNamesForGroup = true) {
-    const groupBotNames = getGroupNames().map(name => `${name}:`);
+export function parseExampleIntoIndividual(messageExampleString, appendNamesForGroup = true, context = {
+    name1,
+    name2,
+    isGroup: Boolean(selected_group),
+    groupNames: getGroupNames(),
+}) {
+    const { name1: userName, name2: charName, isGroup, groupNames } = context;
+    const groupBotNames = groupNames.map(name => `${name}:`);
 
     let result = []; // array of msgs
     let tmp = messageExampleString.split('\n');
     let cur_msg_lines = [];
     let in_user = false;
     let in_bot = false;
-    let botName = name2;
+    let botName = charName;
 
     // DRY my cock and balls :)
     function add_msg(name, role, system_name) {
@@ -1364,7 +1339,7 @@ export function parseExampleIntoIndividual(messageExampleString, appendNamesForG
         // strip to remove extra spaces
         let parsed_msg = cur_msg_lines.join('\n').replace(name + ':', '').trim();
 
-        if (appendNamesForGroup && selected_group && ['example_user', 'example_assistant'].includes(system_name)) {
+        if (appendNamesForGroup && isGroup && ['example_user', 'example_assistant'].includes(system_name)) {
             parsed_msg = `${name}: ${parsed_msg}`;
         }
 
@@ -1376,22 +1351,22 @@ export function parseExampleIntoIndividual(messageExampleString, appendNamesForG
         let cur_str = tmp[i];
         // if it's the user message, switch into user mode and out of bot mode
         // yes, repeated code, but I don't care
-        if (cur_str.startsWith(name1 + ':')) {
+        if (cur_str.startsWith(userName + ':')) {
             in_user = true;
             // we were in the bot mode previously, add the message
             if (in_bot) {
                 add_msg(botName, 'system', 'example_assistant');
             }
             in_bot = false;
-        } else if (cur_str.startsWith(name2 + ':') || groupBotNames.some(n => cur_str.startsWith(n))) {
-            if (!cur_str.startsWith(name2 + ':') && groupBotNames.length) {
+        } else if (cur_str.startsWith(charName + ':') || groupBotNames.some(n => cur_str.startsWith(n))) {
+            if (!cur_str.startsWith(charName + ':') && groupBotNames.length) {
                 botName = cur_str.split(':')[0];
             }
 
             in_bot = true;
             // we were in the user mode previously, add the message
             if (in_user) {
-                add_msg(name1, 'system', 'example_user');
+                add_msg(userName, 'system', 'example_user');
             }
             in_user = false;
         }
@@ -1400,7 +1375,7 @@ export function parseExampleIntoIndividual(messageExampleString, appendNamesForG
     }
     // Special case for last message in a block because we don't have a new message to trigger the switch
     if (in_user) {
-        add_msg(name1, 'system', 'example_user');
+        add_msg(userName, 'system', 'example_user');
     } else if (in_bot) {
         add_msg(botName, 'system', 'example_assistant');
     }
@@ -1438,8 +1413,8 @@ async function populationInjectionPrompts(prompts, messages, extensionPrompts = 
         'assistant': extension_prompt_roles.ASSISTANT,
     };
 
-    const maxDepth = getExtensionPromptMaxDepth();
-    for (let i = 0; i <= maxDepth; i++) {
+    const injectedDepths = prompts.filter(prompt => prompt.content).map(prompt => prompt.injection_depth);
+    for (const i of getInChatInjectionDepths(normalizePromptAssemblyExtensionPrompts(extensionPrompts), injectedDepths)) {
         // Get prompts for current depth
         const depthPrompts = prompts.filter(prompt => prompt.injection_depth === i && prompt.content);
 
@@ -1543,8 +1518,14 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
     const activePromptManager = assemblyRuntime.promptManager;
     const settings = assemblyRuntime.settings;
     const assemblyTokenHandler = assemblyRuntime.tokenHandler;
+    const isGroup = assemblyRuntime.contextKind === 'chat' && (assemblyRuntime.macroContext
+        ? assemblyRuntime.macroContext.settings.isGroup
+        : Boolean(selected_group));
 
     if (!prompts.has('chatHistory')) {
+        if (assemblyRuntime.contextKind === 'session') {
+            throw new Error('agent.session_history_prompt_missing: the Session preset must include chatHistory');
+        }
         return 0;
     }
 
@@ -1553,7 +1534,7 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
     chatCompletion.add(new MessageCollection('chatHistory'), prompts.index('chatHistory'));
 
     // Reserve budget for new chat message
-    const newChat = selected_group ? settings.new_group_chat_prompt : settings.new_chat_prompt;
+    const newChat = isGroup ? settings.new_group_chat_prompt : settings.new_chat_prompt;
     const newChatMessage = await Message.createAsync('system', substitutePromptParams(newChat, {}, assemblyRuntime), 'newMainChat', assemblyTokenHandler);
     chatCompletion.reserveBudget(newChatMessage);
 
@@ -1561,7 +1542,7 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
     let groupNudgeMessage = null;
     const noGroupNudgeTypes = ['impersonate'];
     const groupNudgePrompt = getRelativePromptById(prompts, 'groupNudge');
-    if (selected_group && groupNudgePrompt && !noGroupNudgeTypes.includes(type)) {
+    if (isGroup && groupNudgePrompt && !noGroupNudgeTypes.includes(type)) {
         groupNudgeMessage = await Message.fromPromptAsync(groupNudgePrompt, assemblyTokenHandler);
         chatCompletion.reserveBudget(groupNudgeMessage);
     }
@@ -1605,10 +1586,12 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
     const includeClaudeNative = usesClaudeMessagesSemantics(settings);
     const includeNative = includeClaudeNative
         || (settings.chat_completion_source === chat_completion_sources.CUSTOM
-            && settings.custom_api_format === custom_api_formats.GEMINI_INTERACTIONS);
+            && [custom_api_formats.GEMINI_INTERACTIONS, custom_api_formats.GEMINI_GENERATE_CONTENT].includes(settings.custom_api_format));
     const canIncludeNative = native => includeNative
         && (!includeClaudeNative || hasClaudeToolUse(native));
-    const isToolReasoningProvider = interleaved_reasoning_providers.includes(settings.chat_completion_source);
+    // DeepSeek tool turns use reasoning_content instead of reasoning.
+    const isToolReasoningProvider = interleaved_reasoning_providers.includes(settings.chat_completion_source)
+        && !usesDeepSeekReasoningContent(settings);
     const toolReasoningMode = isToolReasoningProvider
         ? getEffectiveToolReasoningMode(settings)
         : tool_reasoning_modes.DISABLED;
@@ -1620,6 +1603,15 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
     const tokenPrefetchChunkSize = 12;
     for (let index = 0; index < chatPool.length;) {
         const chatPrompt = chatPool[index];
+
+        if (Array.isArray(chatPrompt.agentMessages)) {
+            const group = chatPrompt.agentMessages.map((message, partIndex) =>
+                Message.fromAgentMessage(message, `agentHistory-${index}-${partIndex}`));
+            for (const message of group.reverse()) chatCompletion.insertAtStart(message, 'chatHistory');
+            sourceCount += chatPrompt.sourceCount;
+            index += 1;
+            continue;
+        }
 
         if (Array.isArray(chatPrompt.invocations)) {
             // We do not want to mutate the prompt
@@ -1706,15 +1698,13 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
                 return clone;
             });
             const toolResultMessages = await Promise.all(invocations.slice().reverse().map((invocation) => Message.createAsync('tool', invocation.result, invocation.id, assemblyTokenHandler)));
+            chatMessage.reasoningContent = chatPrompt.reasoningContent ?? null;
             await chatMessage.setToolCalls(invocations, includeSignature, includeToolReasoning, assemblyTokenHandler);
             if (includeSignature && chatPrompt.signature) {
                 chatMessage.signature = chatPrompt.signature;
             }
             if (canIncludeNative(chatPrompt.native)) {
                 chatMessage.native = chatPrompt.native;
-            }
-            if (chatPrompt.reasoningContent) {
-                chatMessage.reasoningContent = chatPrompt.reasoningContent;
             }
             if (Array.isArray(chatPrompt.media) && chatPrompt.media.length) {
                 if (chatPrompt.mediaDisplay === MEDIA_DISPLAY.LIST) {
@@ -1744,7 +1734,7 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
         const batch = [];
         for (; index < chatPool.length && batch.length < tokenPrefetchChunkSize; index += 1) {
             const candidate = chatPool[index];
-            if (Array.isArray(candidate.invocations)) {
+            if (Array.isArray(candidate.invocations) || Array.isArray(candidate.agentMessages)) {
                 break;
             }
 
@@ -1835,7 +1825,7 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
     chatCompletion.insertAtStart(newChatMessage, 'chatHistory');
 
     // Reserve budget for group nudge
-    if (selected_group && groupNudgeMessage) {
+    if (isGroup && groupNudgeMessage) {
         chatCompletion.freeBudget(groupNudgeMessage);
         chatCompletion.insertAtEnd(groupNudgeMessage, 'chatHistory');
     }
@@ -2020,27 +2010,22 @@ export function getPromptRole(role) {
  * @param {object} options.extensionPrompts - Frozen/materialized extension prompt snapshot.
  * @param {(message: string) => void} options.attachWarning - Warning sink for attach-existing prompt issues.
  * @param {boolean} [options.agentMode] Skip legacy frontend tool registration for Agent-owned tool loops.
- * @param {object|null} [options.agentContextPolicy] Agent initial prompt context policy.
  * @param {string|null} [options.agentSystemPrompt] Resolved Agent system prompt content.
  * @param {string|null} [options.agentTaskPrompt] Invocation task prompt content.
  * @param {boolean} [options.allowToolCalls] Whether this request can register legacy frontend tools.
  * @param {object|null} [options.legacyMcpToolRound] Private MCP tools for this Legacy generation round.
+ * @param {import('../script.js').QuietToolRequest|null} [options.quietToolRequest] One-shot tools and a literal control message.
  * @returns {Promise<[number, object|null]>} Raw chat record count and evaluated legacy tool data.
  */
-async function populateChatCompletion(prompts, chatCompletion, { bias, quietPrompt, quietImage, type, cyclePrompt, messages, messageExamples, extensionPrompts, attachWarning, agentMode = false, agentContextPolicy = null, agentSystemPrompt = null, agentTaskPrompt = null, allowToolCalls = true, legacyMcpToolRound = null }, runtime = null) {
+async function populateChatCompletion(prompts, chatCompletion, { bias, quietPrompt, quietImage, type, cyclePrompt, messages, messageExamples, extensionPrompts, attachWarning, agentMode = false, agentSystemPrompt = null, agentTaskPrompt = null, allowToolCalls = true, legacyMcpToolRound = null, quietToolRequest = null }, runtime = null) {
     const assemblyRuntime = getPromptAssemblyRuntime(runtime);
     const activePromptManager = assemblyRuntime.promptManager;
     const settings = assemblyRuntime.settings;
     const assemblyTokenHandler = assemblyRuntime.tokenHandler;
-    let toolData = null;
+    let toolData = quietToolRequest?.toolData ?? null;
 
     if (!agentMode) {
         removeAgentOnlyPrompts(prompts);
-    } else {
-        // Agent frozen input keeps PromptManager's latest-first raw history.
-        // Work on a materialized copy because downstream assembly splices,
-        // attaches, and reverses messages into provider chronological order.
-        messages = materializeInitialChatHistoryMessages(messages, agentContextPolicy);
     }
 
     // Helper function for preparing a prompt, that already exists within the prompt collection, for completion
@@ -2100,6 +2085,10 @@ async function populateChatCompletion(prompts, chatCompletion, { bias, quietProm
         controlPrompts.add(quietPromptMessage);
     }
 
+    if (quietToolRequest) {
+        // Exact edits need the saved text, without prompt regex or macro expansion.
+        controlPrompts.add(await Message.createAsync('user', quietToolRequest.prompt, 'quietToolRequest', assemblyTokenHandler));
+    }
     chatCompletion.reserveBudget(controlPrompts);
 
     // Add ordered system and user prompts
@@ -2165,10 +2154,12 @@ async function populateChatCompletion(prompts, chatCompletion, { bias, quietProm
     }
 
     // Pre-allocation of tokens for tool data
-    if (!agentMode && allowToolCalls && ToolManager.canAdvertiseToolCalls(type, settings)) {
+    if (!toolData && !agentMode && allowToolCalls && ToolManager.canAdvertiseToolCalls(type, settings)) {
         toolData = {};
         await ToolManager.registerFunctionToolsOpenAI(toolData);
         legacyMcpToolRound?.mergeIntoToolData(toolData);
+    }
+    if (toolData) {
         const toolMessage = [{ role: 'user', content: JSON.stringify(toolData) }];
         const toolTokens = await assemblyTokenHandler.countAsync(toolMessage);
         chatCompletion.reserveBudget(toolTokens);
@@ -2185,8 +2176,7 @@ async function populateChatCompletion(prompts, chatCompletion, { bias, quietProm
     if (type === 'continue' && settings.continue_prefill && messages.length) {
         const chatMessage = messages.shift();
         const isAssistantRole = chatMessage.role === 'assistant';
-        const supportsAssistantPrefill = settings.chat_completion_source === chat_completion_sources.CLAUDE
-            || (settings.chat_completion_source === chat_completion_sources.VERTEXAI && isVertexAiClaudeModelId(settings.vertexai_model));
+        const supportsAssistantPrefill = buildsClaudeMessagesRequest(settings);
         const namesInCompletion = settings.names_behavior === character_names_behavior.COMPLETION;
         const assistantPrefill = isAssistantRole && supportsAssistantPrefill ? substitutePromptParams(settings.assistant_prefill, {}, assemblyRuntime) : '';
         const messageContent = [assistantPrefill, chatMessage.content].filter(x => x).join('\n\n');
@@ -2201,7 +2191,10 @@ async function populateChatCompletion(prompts, chatCompletion, { bias, quietProm
 
     // Decide whether dialogue examples should always be added
     let chatSourceCount;
-    if (power_user.pin_examples) {
+    const pinExamples = assemblyRuntime.macroContext
+        ? assemblyRuntime.macroContext.settings.pin_examples
+        : power_user.pin_examples;
+    if (pinExamples) {
         await populateDialogueExamples(prompts, chatCompletion, messageExamples, assemblyRuntime);
         chatSourceCount = await populateChatHistory(messages, prompts, chatCompletion, type, cyclePrompt, assemblyRuntime);
     } else {
@@ -2407,10 +2400,10 @@ async function preparePromptsForChatCompletion({ scenario, charPersonality, name
  * @param {string[]} content.messageExamples - An array of messages to be used as dialogue examples.
  * @param {boolean} [content.allowToolCalls] Whether this request can register legacy frontend tools.
  * @param {boolean} [content.agentMode] Skip legacy frontend tool state for Agent-owned tool loops.
- * @param {object|null} [content.agentContextPolicy] Agent initial prompt context policy.
  * @param {string|null} [content.agentSystemPrompt] Resolved Agent system prompt content.
  * @param {string|null} [content.agentTaskPrompt] Invocation task prompt content.
  * @param {object|null} [content.legacyMcpToolRound] Private MCP tools for this Legacy generation round.
+ * @param {import('../script.js').QuietToolRequest|null} [content.quietToolRequest] One-shot tools and a literal control message.
  * @param dryRun - Whether this is a live call or not.
  * @returns {Promise<[ChatCompletionMessage[]|null, object|boolean, object|null|undefined]>} Prepared chat, token counts, and evaluated legacy tool data.
  */
@@ -2432,11 +2425,11 @@ export async function prepareOpenAIMessages({
     messages,
     messageExamples,
     agentMode = false,
-    agentContextPolicy = null,
     agentSystemPrompt = null,
     agentTaskPrompt = null,
     allowToolCalls = true,
     legacyMcpToolRound = null,
+    quietToolRequest = null,
 }, dryRun, runtime = null) {
     const assemblyRuntime = runtime
         ? getPromptAssemblyRuntime({
@@ -2453,11 +2446,18 @@ export async function prepareOpenAIMessages({
     // Without a character selected, there is no way to accurately calculate tokens
     if (!activePromptManager.activeCharacter && dryRun) return [null, false];
 
+    // Errors belong to the current assembly, not to its UI refresh.
+    activePromptManager.error = null;
+
     const chatCompletion = new ChatCompletion();
     if (power_user.console_log_prompts) chatCompletion.enableLogging();
 
     const userSettings = activePromptManager.serviceSettings;
-    chatCompletion.setTokenBudget(userSettings.openai_max_context, userSettings.openai_max_tokens);
+    // Runtime compaction owns the budget for the entire Session prompt.
+    chatCompletion.setTokenBudget(
+        assemblyRuntime.contextKind === 'session' ? Number.POSITIVE_INFINITY : userSettings.openai_max_context,
+        assemblyRuntime.contextKind === 'session' ? 0 : userSettings.openai_max_tokens,
+    );
     let chatSourceCount = 0;
     let toolData = null;
 
@@ -2486,7 +2486,7 @@ export async function prepareOpenAIMessages({
         };
 
         // Fill the chat completion with as much context as the budget allows
-        [chatSourceCount, toolData] = await populateChatCompletion(prompts, chatCompletion, { bias, quietPrompt, quietImage, type, cyclePrompt, messages, messageExamples, extensionPrompts, attachWarning, agentMode, agentContextPolicy, agentSystemPrompt, agentTaskPrompt, allowToolCalls, legacyMcpToolRound }, assemblyRuntime);
+        [chatSourceCount, toolData] = await populateChatCompletion(prompts, chatCompletion, { bias, quietPrompt, quietImage, type, cyclePrompt, messages, messageExamples, extensionPrompts, attachWarning, agentMode, agentSystemPrompt, agentTaskPrompt, allowToolCalls, legacyMcpToolRound, quietToolRequest }, assemblyRuntime);
     } catch (error) {
         if (error instanceof TokenBudgetExceededError) {
             assemblyRuntime.showToasts && toastr.error(t`Mandatory prompts exceed the context size.`);
@@ -2503,7 +2503,7 @@ export async function prepareOpenAIMessages({
             chatCompletion.log(error.stack);
             chatCompletion.log('----------------------------------------------------');
         }
-        if (agentMode) {
+        if (agentMode || quietToolRequest) {
             throw error;
         }
     } finally {
@@ -2534,6 +2534,39 @@ export async function prepareOpenAIMessages({
     return [chat, activePromptManager.tokenHandler.counts, toolData];
 }
 
+export function createAgentPromptSnapshot(payload, { settings, contextPolicy, worldInfoActivation }) {
+    if (!Array.isArray(payload?.messages)) {
+        throw new Error('agent.prompt_snapshot_messages_required: prompt assembly must produce messages');
+    }
+    const { messages, prompt: _prompt, ...generationParameters } = payload;
+    return {
+        acceptsImages: isImageInliningSupported(settings) === true,
+        contextLimits: {
+            context: settings.openai_max_context,
+            response: settings.openai_max_tokens,
+            tokenizerModel: getTokenizerModel(settings),
+        },
+        contextPolicy,
+        ...(worldInfoActivation ? { worldInfoActivation } : {}),
+        messages: messages.map(toAgentModelMessage),
+        generationParameters,
+    };
+}
+
+/**
+ * @param {{
+ *   settings?: Record<string, unknown>;
+ *   model?: string | null;
+ *   generationType?: string;
+ *   promptInputs?: Record<string, unknown>;
+ *   macroContext?: Record<string, unknown> | null;
+ *   jsonSchema?: unknown;
+ *   agentMode?: boolean;
+ *   agentSystemPrompt?: string | null;
+ *   agentTaskPrompt?: string | null;
+ *   contextKind?: 'chat' | 'session';
+ * }} [options]
+ */
 export async function assembleOpenAIChatCompletionPrompt({
     settings,
     model = null,
@@ -2542,9 +2575,9 @@ export async function assembleOpenAIChatCompletionPrompt({
     macroContext = null,
     jsonSchema = null,
     agentMode = true,
-    agentContextPolicy = null,
     agentSystemPrompt = null,
     agentTaskPrompt = null,
+    contextKind = 'chat',
 } = {}) {
     if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
         throw new Error('prompt_assembly.settings_required: Prompt assembly requires chat-completion settings');
@@ -2558,11 +2591,11 @@ export async function assembleOpenAIChatCompletionPrompt({
     if (!resolvedModel) {
         throw new Error('prompt_assembly.model_required: chat-completion settings did not resolve a model');
     }
+    macroContext = createChatCompletionMacroContext(macroContext, settings, resolvedModel);
     const extensionPrompts = normalizePromptAssemblyExtensionPrompts(promptInputs.extensionPrompts);
     const assemblyPromptManager = createHeadlessChatCompletionPromptManager(settings, {
         macroContext,
-        extensionPrompts,
-        model: resolvedModel,
+        contextKind,
     });
     const runtime = createPromptAssemblyRuntime({
         promptManager: assemblyPromptManager,
@@ -2575,13 +2608,13 @@ export async function assembleOpenAIChatCompletionPrompt({
         updatePromptManager: true,
         renderPromptManager: false,
         showToasts: false,
+        contextKind,
     });
 
     const [messages, tokenCounts, toolData] = await prepareOpenAIMessages({
         ...promptInputs,
         type: normalizedGenerationType,
         agentMode,
-        agentContextPolicy,
         agentSystemPrompt,
         agentTaskPrompt,
     }, true, runtime);
@@ -2599,7 +2632,6 @@ export async function assembleOpenAIChatCompletionPrompt({
             jsonSchema,
             agentMode,
             macroContext,
-            extensionPrompts,
             toolData,
         },
     );
@@ -2607,15 +2639,26 @@ export async function assembleOpenAIChatCompletionPrompt({
     return {
         messages,
         chatCompletionPayload,
-        tokenCounts,
+        ...(contextKind === 'chat' ? { tokenCounts } : {}),
     };
+}
+
+/** Create the one variable workspace shared by this assembly's prompts and parameters. */
+export function createChatCompletionMacroContext(context, settings, model) {
+    const macroContext = structuredClone(context);
+    Object.assign(macroContext.system, {
+        model,
+        api: 'openai',
+        maxContext: Number(settings.openai_max_context),
+        maxResponse: Number(settings.openai_max_tokens),
+        maxPrompt: Number(settings.openai_max_context) - Number(settings.openai_max_tokens),
+    });
+    return macroContext;
 }
 
 /**
  * Builds deterministic chat-completion settings for headless Agent prompt assembly.
- * Saved OpenAI presets are deltas over SillyTavern's full settings object; Agent
- * assembly cannot read the current UI state, so missing fields are filled from the
- * canonical defaults before normal migration is applied.
+ * `settingsToUpdate` only renames preset keys; resolved keys outside it, such as `secret_id`, must pass through.
  *
  * @param {Record<string, any>} settings Preset/effective chat-completion settings
  * @returns {Record<string, any>} Normalized settings
@@ -2627,8 +2670,20 @@ export function normalizeChatCompletionSettingsForPromptAssembly(settings) {
 
     const normalized = structuredClone(default_settings);
     Object.assign(normalized, structuredClone(settings));
+    for (const [presetKey, [, settingsKey]] of Object.entries(settingsToUpdate)) {
+        if (presetKey !== settingsKey && normalized[presetKey] !== undefined) {
+            normalized[settingsKey] = normalized[presetKey];
+            delete normalized[presetKey];
+        }
+    }
     migrateChatCompletionSettings(normalized);
     return normalized;
+}
+
+function getChatCompletionErrorMessage(data, response) {
+    const error = data?.error ?? data?.detail?.error;
+    const message = typeof error === 'string' ? error : (error?.message || error?.code || error?.type);
+    return String(message || (!response.ok && response.statusText) || t`Unknown error`);
 }
 
 /**
@@ -2639,36 +2694,22 @@ export function normalizeChatCompletionSettingsForPromptAssembly(settings) {
  * @param {boolean?} [options.quiet=false] Suppress toast messages
  */
 export function tryParseStreamingError(response, decoded, { quiet = false } = {}) {
+    let data;
     try {
-        const data = JSON.parse(decoded);
-
-        if (!data) {
-            return;
-        }
-
-        checkQuotaError(data, { quiet });
-        checkModerationError(data, { quiet });
-
-        // these do not throw correctly (equiv to Error("[object Object]"))
-        // if trying to fix "[object Object]" displayed to users, start here
-
-        if (data.error) {
-            !quiet && toastr.error(data.error.message || response.statusText, 'Chat Completion API');
-            throw new Error(data);
-        }
-
-        if (data.message) {
-            !quiet && toastr.error(data.message, 'Chat Completion API');
-            throw new Error(data);
-        }
-
-        if (data.detail) {
-            !quiet && toastr.error(data.detail?.error?.message || response.statusText, 'Chat Completion API');
-            throw new Error(data);
-        }
+        data = JSON.parse(decoded);
+    } catch {
+        return;
     }
-    catch {
-        // No JSON. Do nothing.
+    if (!data) {
+        return;
+    }
+
+    checkQuotaError(data, { quiet });
+    checkModerationError(data, { quiet });
+    if (data.error || typeof data.message === 'string' || data.detail) {
+        const message = typeof data.message === 'string' ? data.message : getChatCompletionErrorMessage(data, response);
+        !quiet && toastr.error(message, 'Chat Completion API');
+        throw new Error(message);
     }
 }
 
@@ -2710,7 +2751,7 @@ function checkModerationError(data, { quiet = false } = {}) {
 
 /**
  * Gets the API model for the selected chat completion source.
- * @param {ChatCompletionSettings} settings Chat completion settings
+ * @param {Partial<ChatCompletionSettings> | null} settings Chat completion settings
  * @returns {string} API model
  */
 export function getChatCompletionModel(settings = null) {
@@ -2721,6 +2762,8 @@ export function getChatCompletionModel(settings = null) {
             return settings.claude_model;
         case chat_completion_sources.OPENAI:
             return settings.openai_model;
+        case chat_completion_sources.OPENCODE:
+            return settings.opencode_model;
         case chat_completion_sources.MAKERSUITE:
             return settings.google_model;
         case chat_completion_sources.VERTEXAI:
@@ -3088,6 +3131,11 @@ function applyCustomModelOptionsForSource(source) {
     actionGroup.dataset.tauritavernCustomModels = 'true';
     appendOption(actionGroup, t`Manage custom models...`, manage_custom_chat_completion_models_option);
     element.append(actionGroup);
+
+    // Restore the configured model after rebuilding options without triggering change.
+    if (currentModel && element.value !== currentModel) {
+        element.value = currentModel;
+    }
 }
 
 function removeCustomModelOptionsForSource(source) {
@@ -3338,6 +3386,18 @@ function saveModelList(data) {
             );
             setModelSelectValue(chat_completion_sources.OPENAI, model);
         }
+    }
+
+    if (oai_settings.chat_completion_source === chat_completion_sources.OPENCODE) {
+        $('#model_opencode_select').empty().append(new Option('-- Select a model --', ''));
+        model_list.forEach(model => $('#model_opencode_select').append(new Option(model.id, model.id)));
+        oai_settings.opencode_model = chooseModelOrCurrentCustom(
+            chat_completion_sources.OPENCODE,
+            model_list.map(model => model.id),
+            oai_settings.opencode_model,
+            '',
+        );
+        setModelSelectValue(chat_completion_sources.OPENCODE, oai_settings.opencode_model);
     }
 
     if (oai_settings.chat_completion_source == chat_completion_sources.CUSTOM) {
@@ -3980,7 +4040,7 @@ function isClaudeOneMillionContextModel(modelId) {
         .trim()
         .toLowerCase()
         .replace(/^(?:(?:us|eu|jp|au|apac|global|us-gov)\.)?anthropic\./, '');
-    return /^claude-(?:fable-5|mythos-5|opus-5|sonnet-5|sonnet-4-(?:5|6)|opus-4-(?:6|7|8))(?:\b|-)/.test(value);
+    return /^claude-(?:fable-5|mythos-5|opus-5|sonnet-5|haiku-5|sonnet-4-(?:5|6)|opus-4-(?:6|7|8))(?:\b|-)/.test(value);
 }
 
 function getVertexAiClaudeMaxContext(modelId, unlocked = false) {
@@ -3989,15 +4049,7 @@ function getVertexAiClaudeMaxContext(modelId, unlocked = false) {
     }
 
     const value = String(modelId ?? '').trim().toLowerCase();
-    if (isClaudeOneMillionContextModel(value)) {
-        return max_1mil;
-    }
-
-    if (/^claude-/.test(value)) {
-        return max_200k;
-    }
-
-    return null;
+    return isClaudeOneMillionContextModel(value) ? max_1mil : max_200k;
 }
 
 /**
@@ -4006,7 +4058,7 @@ function getVertexAiClaudeMaxContext(modelId, unlocked = false) {
  * @returns {boolean}
  */
 function isZaiReasoningEffortModel(model) {
-    return String(model ?? '').trim().toLowerCase() === 'glm-5.2';
+    return ['glm-5.2', 'glm-5.3', 'glm-5.3-flash'].includes(String(model ?? '').trim().toLowerCase());
 }
 
 /**
@@ -4031,7 +4083,10 @@ function getZaiReasoningEffort(settings, model) {
 }
 
 function supportsOpenAiMaxReasoningEffort(model) {
-    return OPENAI_GPT56_MODEL_PATTERN.test(String(model ?? '').trim().toLowerCase());
+    const normalizedModel = String(model ?? '').trim().toLowerCase();
+    return /^gpt-5\.6(?:-(?:sol|terra|luna))?$/.test(normalizedModel)
+        || normalizedModel.startsWith('gpt-6-')
+        || normalizedModel.startsWith('gpt-6.');
 }
 
 function supportsOpenAiXHighReasoningEffort(model) {
@@ -4105,7 +4160,7 @@ function getReasoningEffort(settings = null, model = null) {
         return settings.reasoning_effort;
     }
 
-    if (settings.chat_completion_source === chat_completion_sources.CUSTOM) {
+    if ([chat_completion_sources.CUSTOM, chat_completion_sources.OPENCODE].includes(settings.chat_completion_source)) {
         return settings.reasoning_effort === reasoning_effort_types.auto
             ? undefined
             : settings.reasoning_effort;
@@ -4133,13 +4188,13 @@ function getReasoningEffort(settings = null, model = null) {
     }
 
     function resolveReasoningEffort() {
-        if ([chat_completion_sources.OPENROUTER, chat_completion_sources.MOONSHOT].includes(settings.chat_completion_source)) {
+        if ([chat_completion_sources.OPENAI, chat_completion_sources.OPENROUTER, chat_completion_sources.MOONSHOT, chat_completion_sources.XAI].includes(settings.chat_completion_source)) {
             return settings.reasoning_effort === reasoning_effort_types.auto
                 ? undefined
                 : settings.reasoning_effort;
         }
 
-        if ([chat_completion_sources.OPENAI, chat_completion_sources.AZURE_OPENAI].includes(settings.chat_completion_source)) {
+        if (settings.chat_completion_source === chat_completion_sources.AZURE_OPENAI) {
             return normalizeOpenAiReasoningEffort(settings.reasoning_effort, model);
         }
 
@@ -4219,10 +4274,11 @@ function getVerbosity(settings = null) {
  * @param {string} model Model name
  * @param {string} type Request type (impersonate, quiet, continue, etc)
  * @param {ChatCompletionMessage[]} messages Array of chat completion messages
- * @param {import('../script.js').AdditionalRequestOptions & { agentMode?: boolean; macroContext?: object|null; extensionPrompts?: object|null }} options Additional request options
+ * @param {import('../script.js').AdditionalRequestOptions & { agentMode?: boolean; macroContext?: object|null }} options Additional request options
  * @returns {Promise<object>} Final generation parameters object appropriate for the chat completion source
  */
-export async function createGenerationParameters(settings, model, type, messages, { jsonSchema = null, agentMode = false, allowToolCalls = true, macroContext = null, extensionPrompts = null, toolData = undefined } = {}) {
+export async function createGenerationParameters(settings, model, type, messages, { jsonSchema = null, agentMode = false, allowToolCalls = true, macroContext = null, toolData = undefined } = {}) {
+    settings = getEffectiveGenerationSettings(settings);
     // HACK: Filter out null and non-object messages
     if (!Array.isArray(messages)) {
         throw new Error('messages must be an array');
@@ -4271,6 +4327,7 @@ export async function createGenerationParameters(settings, model, type, messages
     // Sources that support logprobs
     const logprobsSupportedSources = [
         chat_completion_sources.OPENAI,
+        chat_completion_sources.OPENROUTER,
         chat_completion_sources.AZURE_OPENAI,
         chat_completion_sources.CUSTOM,
         chat_completion_sources.DEEPSEEK,
@@ -4294,8 +4351,11 @@ export async function createGenerationParameters(settings, model, type, messages
     const stream = !agentMode && settings.stream_openai && type !== 'quiet' && !isO1 && !isWorkersAIJsonMode;
 
     const canMultiSwipe = !agentMode && ToolManager.canPerformMultiSwipe(type, settings);
-    const macroNames = macroContext?.names && typeof macroContext.names === 'object' ? macroContext.names : null;
     const isVertexAiClaude = settings.chat_completion_source === chat_completion_sources.VERTEXAI && isVertexAiClaudeModelId(model);
+    const isOpenCodeClaude = settings.chat_completion_source === chat_completion_sources.OPENCODE
+        && settings.opencode_api_format === OPENCODE_API_FORMAT.CLAUDE_MESSAGES;
+    const isOpenCodeGemini = settings.chat_completion_source === chat_completion_sources.OPENCODE
+        && settings.opencode_api_format === OPENCODE_API_FORMAT.GEMINI;
 
     let logit_bias = {};
     if (settings.bias_preset_selected
@@ -4310,6 +4370,10 @@ export async function createGenerationParameters(settings, model, type, messages
         logit_bias = undefined;
     }
 
+    const stoppingStrings = getCustomStoppingStrings(undefined, {
+        ...(macroContext ? { settings: macroContext.settings, ephemeral: macroContext.state.ephemeralStoppingStrings } : {}),
+        substitute: text => substitutePromptParams(text, {}, { macroContext, model }),
+    });
     const generate_data = {
         'type': type,
         'messages': messages,
@@ -4321,12 +4385,12 @@ export async function createGenerationParameters(settings, model, type, messages
         'max_tokens': settings.openai_max_tokens,
         'stream': stream,
         'logit_bias': logit_bias,
-        'stop': getCustomStoppingStrings(openai_max_stop_strings),
+        'stop': stoppingStrings.slice(0, openai_max_stop_strings),
         'chat_completion_source': settings.chat_completion_source,
         'n': canMultiSwipe ? settings.n : undefined,
-        'user_name': macroNames ? stringOrEmpty(macroNames.user) : name1,
-        'char_name': macroNames ? stringOrEmpty(macroNames.char) : name2,
-        'group_names': macroNames ? splitPromptAssemblyGroupNames(macroNames.group) : getGroupNames(),
+        'user_name': macroContext ? macroContext.names.user : name1,
+        'char_name': macroContext ? macroContext.names.char : name2,
+        'group_names': macroContext ? macroContext.settings.groupNames : getGroupNames(),
         'include_reasoning': Boolean(settings.show_thoughts),
         'reasoning_effort': getReasoningEffort(settings, model),
         'enable_web_search': Boolean(settings.enable_web_search),
@@ -4351,12 +4415,10 @@ export async function createGenerationParameters(settings, model, type, messages
         }
     }
 
-    if (!agentMode && allowToolCalls && ToolManager.canAdvertiseToolCalls(type, settings, model)) {
-        if (toolData === undefined) {
-            await ToolManager.registerFunctionToolsOpenAI(generate_data);
-        } else if (toolData) {
-            Object.assign(generate_data, toolData);
-        }
+    if (toolData) {
+        Object.assign(generate_data, toolData);
+    } else if (toolData === undefined && !agentMode && allowToolCalls && ToolManager.canAdvertiseToolCalls(type, settings, model)) {
+        await ToolManager.registerFunctionToolsOpenAI(generate_data);
     }
 
     // Empty array will produce a validation error
@@ -4387,15 +4449,19 @@ export async function createGenerationParameters(settings, model, type, messages
         delete generate_data.logprobs;
     }
 
-    if (settings.chat_completion_source === chat_completion_sources.CLAUDE || isVertexAiClaude) {
+    if (buildsClaudeMessagesRequest(settings, model)) {
         generate_data.top_k = Number(settings.top_k_openai);
         generate_data.use_sysprompt = settings.use_sysprompt;
-        generate_data.stop = getCustomStoppingStrings(); // Claude shouldn't have limits on stop strings.
+        generate_data.stop = stoppingStrings; // Claude shouldn't have limits on stop strings.
+        // Anthropic fast-mode beta: first-party endpoint or a Messages-compatible proxy (custom).
+        if (settings.claude_fast_mode && !isVertexAiClaude && !isOpenCodeClaude) {
+            generate_data.speed = 'fast';
+        }
         // Don't add a prefill on quiet gens (summarization) and when using continue prefill.
         if (type !== 'quiet' && !(type === 'continue' && settings.continue_prefill)) {
             generate_data.assistant_prefill = type === 'impersonate'
-                ? substitutePromptParams(settings.assistant_impersonation, {}, { macroContext, extensionPrompts, model })
-                : substitutePromptParams(settings.assistant_prefill, {}, { macroContext, extensionPrompts, model });
+                ? substitutePromptParams(settings.assistant_impersonation, {}, { macroContext, model })
+                : substitutePromptParams(settings.assistant_prefill, {}, { macroContext, model });
         }
     }
 
@@ -4411,11 +4477,11 @@ export async function createGenerationParameters(settings, model, type, messages
         generate_data.middleout = settings.openrouter_middleout;
     }
 
-    if ([chat_completion_sources.MAKERSUITE, chat_completion_sources.VERTEXAI].includes(settings.chat_completion_source)) {
+    if ([chat_completion_sources.MAKERSUITE, chat_completion_sources.VERTEXAI].includes(settings.chat_completion_source) || isOpenCodeGemini || isCustomGeminiGenerateContent(settings)) {
         const stopStringsLimit = 5;
         generate_data.top_k = Number(settings.top_k_openai);
         if (!isVertexAiClaude) {
-            generate_data.stop = getCustomStoppingStrings(stopStringsLimit).slice(0, stopStringsLimit).filter(x => x.length >= 1 && x.length <= 16);
+            generate_data.stop = stoppingStrings.slice(0, stopStringsLimit).filter(x => x.length >= 1 && x.length <= 16);
         }
         generate_data.use_sysprompt = settings.use_sysprompt;
         if (settings.chat_completion_source === chat_completion_sources.VERTEXAI) {
@@ -4427,10 +4493,10 @@ export async function createGenerationParameters(settings, model, type, messages
 
     if (settings.chat_completion_source === chat_completion_sources.MISTRALAI) {
         generate_data.safe_prompt = false; // already defaults to false, but just incase they change that in the future.
-        generate_data.stop = getCustomStoppingStrings(); // Mistral shouldn't have limits on stop strings.
+        generate_data.stop = stoppingStrings; // Mistral shouldn't have limits on stop strings.
     }
 
-    applyAdditionalParametersToRequest(generate_data, settings);
+    applyAdditionalParametersToRequest(generate_data, settings, { macroContext });
 
     if (settings.chat_completion_source === chat_completion_sources.CUSTOM) {
         generate_data.custom_url = settings.custom_url;
@@ -4443,6 +4509,11 @@ export async function createGenerationParameters(settings, model, type, messages
             && Boolean(settings.custom_openai_responses_websocket);
     }
 
+    if (settings.chat_completion_source === chat_completion_sources.OPENCODE) {
+        generate_data.opencode_endpoint = settings.opencode_endpoint;
+        generate_data.opencode_api_format = settings.opencode_api_format;
+    }
+
     if (settings.chat_completion_source === chat_completion_sources.COHERE) {
         // Clamp to 0.01 -> 0.99
         generate_data.top_p = Math.min(Math.max(Number(settings.top_p_openai), 0.01), 0.99);
@@ -4450,7 +4521,7 @@ export async function createGenerationParameters(settings, model, type, messages
         // Clamp to 0 -> 1
         generate_data.frequency_penalty = Math.min(Math.max(Number(settings.freq_pen_openai), 0), 1);
         generate_data.presence_penalty = Math.min(Math.max(Number(settings.pres_pen_openai), 0), 1);
-        generate_data.stop = getCustomStoppingStrings(5);
+        generate_data.stop = stoppingStrings.slice(0, 5);
     }
 
     if (settings.chat_completion_source === chat_completion_sources.PERPLEXITY) {
@@ -4474,23 +4545,18 @@ export async function createGenerationParameters(settings, model, type, messages
     }
 
     if (settings.chat_completion_source === chat_completion_sources.XAI) {
-        if (model.includes('grok-3-mini')) {
-            delete generate_data.presence_penalty;
-            delete generate_data.frequency_penalty;
+        // As of 2026-09-10, no Grok model accepts penalties, only the
+        // non-reasoning variants accept stop, and only Grok 4.3 and newer
+        // accept reasoning_effort.
+        delete generate_data.presence_penalty;
+        delete generate_data.frequency_penalty;
+
+        if (!model.includes('non-reasoning')) {
             delete generate_data.stop;
-        } else {
-            // As of 2025/09/21, only grok-3-mini accepts reasoning_effort
-            delete generate_data.reasoning_effort;
         }
 
-        if (model.includes('grok-4') || model.includes('grok-code')) {
-            delete generate_data.presence_penalty;
-            delete generate_data.frequency_penalty;
-
-            // grok-4-fast-non-reasoning accepts stop
-            if (!model.includes('grok-4-fast-non-reasoning')) {
-                delete generate_data.stop;
-            }
+        if (!['grok-4.3', 'grok-4.5', 'grok-4.6', 'grok-4.7'].some(x => model.includes(x))) {
+            delete generate_data.reasoning_effort;
         }
     }
 
@@ -4503,13 +4569,13 @@ export async function createGenerationParameters(settings, model, type, messages
         generate_data.min_p = Number(settings.min_p_openai);
         generate_data.top_k = settings.top_k_openai > 0 ? Number(settings.top_k_openai) : undefined;
         generate_data.repetition_penalty = Number(settings.repetition_penalty_openai);
-        generate_data.stop = getCustomStoppingStrings();
+        generate_data.stop = stoppingStrings;
     }
 
     // https://docs.z.ai/api-reference/llm/chat-completion
     if (settings.chat_completion_source === chat_completion_sources.ZAI) {
         generate_data.top_p = generate_data.top_p || 0.01;
-        generate_data.stop = getCustomStoppingStrings(1);
+        generate_data.stop = stoppingStrings.slice(0, 1);
         generate_data.zai_endpoint = settings.zai_endpoint || ZAI_ENDPOINT.COMMON;
         delete generate_data.presence_penalty;
         delete generate_data.frequency_penalty;
@@ -4519,12 +4585,16 @@ export async function createGenerationParameters(settings, model, type, messages
         generate_data.siliconflow_endpoint = settings.siliconflow_endpoint || SILICONFLOW_ENDPOINT.GLOBAL;
     }
 
+    if (settings.chat_completion_source === chat_completion_sources.POLLINATIONS) {
+        generate_data.pollinations_endpoint = settings.pollinations_endpoint || POLLINATIONS_ENDPOINT.AUTHENTICATED;
+    }
+
     if (settings.chat_completion_source === chat_completion_sources.AWS_BEDROCK) {
         const capabilities = getAwsBedrockModelCapabilities(settings.aws_bedrock_model);
         generate_data.aws_bedrock_region = (settings.aws_bedrock_region || AWS_BEDROCK_REGION_DEFAULT).trim();
         generate_data.top_k = Number(settings.top_k_openai);
         generate_data.use_sysprompt = settings.use_sysprompt;
-        generate_data.stop = getCustomStoppingStrings();
+        generate_data.stop = stoppingStrings;
         if (!capabilities?.webSearch) {
             generate_data.enable_web_search = false;
         }
@@ -4630,6 +4700,10 @@ export async function createGenerationParameters(settings, model, type, messages
         generate_data.json_schema = jsonSchema;
     }
 
+    // User-removed optional parameters (see tauri/generation-params) are dropped
+    // last so the omission survives every per-source shaping branch above.
+    applyParamOmissions(generate_data, settings);
+
     return { generate_data, stream, canMultiSwipe };
 }
 
@@ -4652,6 +4726,8 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, al
     const { generate_data, stream, canMultiSwipe } = await createGenerationParameters(oai_settings, model, type, messages, { jsonSchema, allowToolCalls, toolData });
     await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, generate_data);
     legacyMcpToolRound?.finalizeAdvertisedTools(generate_data);
+    const requestContext = getChatCompletionRequestContext(generate_data);
+    const isClaudeMessagesRequest = usesClaudeMessagesSemantics(generate_data, requestContext.model);
 
     const generate_url = '/api/backends/chat-completions/generate';
     const response = await fetch(generate_url, {
@@ -4665,8 +4741,6 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, al
         tryParseStreamingError(response, await response.text());
         throw new Error(`Got response status ${response.status}`);
     }
-    const requestModel = generate_data.model ?? model;
-    const isClaudeMessagesRequest = usesClaudeMessagesSemantics(generate_data, requestModel);
     if (stream) {
         const eventStream = getEventSourceStream();
         response.body.pipeThrough(eventStream);
@@ -4675,8 +4749,7 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, al
             let text = '';
             const swipes = [];
             const toolCalls = [];
-            const state = { reasoning: '', images: [], signature: '', toolSignatures: {}, native: null };
-            const requestSource = generate_data.chat_completion_source ?? oai_settings.chat_completion_source;
+            const state = { reasoning: '', images: [], signature: '', toolSignatures: {}, native: null, usage: {}, requestContext };
             const claudeNative = isClaudeMessagesRequest
                 ? new ClaudeNativeStreamAccumulator()
                 : null;
@@ -4694,6 +4767,9 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, al
                 tryParseStreamingError(response, rawData);
                 const parsed = JSON.parse(rawData);
 
+                // Usage updates are cumulative snapshots, including metadata-only terminal chunks.
+                Object.assign(state.usage, parsed.message?.usage, parsed.usageMetadata, parsed.usage);
+
                 const nativeDelta = claudeNative?.consume(parsed)
                     ?? parsed?.choices?.[0]?.delta?.native;
                 const stopStatus = claudeNative && nativeDelta
@@ -4706,9 +4782,9 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, al
                 if (canMultiSwipe && Array.isArray(parsed?.choices) && parsed?.choices?.[0]?.index > 0) {
                     const swipeIndex = parsed.choices[0].index - 1;
                     // FIXME: state.reasoning should be an array to support multi-swipe
-                    swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(parsed, state, { chatCompletionSource: requestSource, model: requestModel, overrideShowThoughts: false });
+                    swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(parsed, state, { ...requestContext, overrideShowThoughts: false });
                 } else {
-                    text += getStreamingReply(parsed, state, { chatCompletionSource: requestSource, model: requestModel });
+                    text += getStreamingReply(parsed, state, requestContext);
                 }
 
                 ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
@@ -4721,7 +4797,7 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, al
                     if (type !== 'impersonate' && !jsonSchema) {
                         text = appendClaudeRefusalWarning(text, stopStatus.message);
                     }
-                } else if (stopStatus?.code === 'model.output_truncated') {
+                } else if (stopStatus) {
                     toastr.error(stopStatus.message, t`Claude response truncated`);
                 }
 
@@ -4731,12 +4807,13 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, al
     }
     else {
         const data = await response.json();
+        data.requestContext = requestContext;
 
         checkQuotaError(data);
         checkModerationError(data);
 
         if (data.error) {
-            const message = data.error.message || response.statusText || t`Unknown error`;
+            const message = getChatCompletionErrorMessage(data, response);
             toastr.error(message, t`API returned an error`);
             throw new Error(message);
         }
@@ -4764,7 +4841,7 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, al
                 message.content = appendClaudeRefusalWarning(message.content, stopStatus.message);
                 data.content?.push({ type: 'text', text: warning });
             }
-        } else if (stopStatus?.code === 'model.output_truncated') {
+        } else if (stopStatus) {
             toastr.error(stopStatus.message, t`Claude response truncated`);
         }
 
@@ -4786,27 +4863,38 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, al
  * @param {object} [options] Additional options
  * @param {string?} [options.chatCompletionSource] Chat completion source
  * @param {string?} [options.model] Chat completion model
+ * @param {string?} [options.opencodeApiFormat] OpenCode API format
+ * @param {string?} [options.customApiFormat] Custom API format
  * @param {boolean?} [options.overrideShowThoughts] Override show thoughts
  * @returns {string} The reply extracted from the response data
  */
-export function getStreamingReply(data, state, { chatCompletionSource = null, model = null, overrideShowThoughts = null } = {}) {
+export function getStreamingReply(data, state, { chatCompletionSource = null, model = null, opencodeApiFormat = null, customApiFormat = null, overrideShowThoughts = null } = {}) {
     const chat_completion_source = chatCompletionSource ?? oai_settings.chat_completion_source;
     const show_thoughts = overrideShowThoughts ?? oai_settings.show_thoughts;
 
     const isCustomClaudeMessages = chat_completion_source === chat_completion_sources.CUSTOM
-        && oai_settings.custom_api_format === custom_api_formats.CLAUDE_MESSAGES;
+        && (customApiFormat ?? oai_settings.custom_api_format) === custom_api_formats.CLAUDE_MESSAGES;
+    const isCustomGemini = isCustomGeminiGenerateContent({
+        chat_completion_source,
+        custom_api_format: customApiFormat ?? oai_settings.custom_api_format,
+    });
+    const isOpenCodeClaudeMessages = chat_completion_source === chat_completion_sources.OPENCODE
+        && (opencodeApiFormat ?? oai_settings.opencode_api_format) === OPENCODE_API_FORMAT.CLAUDE_MESSAGES;
+    const isOpenCodeGemini = chat_completion_source === chat_completion_sources.OPENCODE
+        && (opencodeApiFormat ?? oai_settings.opencode_api_format) === OPENCODE_API_FORMAT.GEMINI;
     const isVertexAiClaude = chat_completion_source === chat_completion_sources.VERTEXAI
         && isVertexAiClaudeModelId(model);
 
     if (chat_completion_source === chat_completion_sources.CLAUDE
         || chat_completion_source === chat_completion_sources.AWS_BEDROCK
         || isCustomClaudeMessages
+        || isOpenCodeClaudeMessages
         || isVertexAiClaude) {
         if (show_thoughts) {
             state.reasoning += data?.delta?.thinking || '';
         }
         return data?.delta?.text || '';
-    } else if ([chat_completion_sources.MAKERSUITE, chat_completion_sources.VERTEXAI].includes(chat_completion_source)) {
+    } else if ([chat_completion_sources.MAKERSUITE, chat_completion_sources.VERTEXAI].includes(chat_completion_source) || isOpenCodeGemini || isCustomGemini) {
         const parts = data?.candidates?.[0]?.content?.parts || [];
         const inlineData = parts.filter(x => x.inlineData && !x.thought).map(x => x.inlineData);
         if (inlineData.length > 0) {
@@ -4854,9 +4942,9 @@ export function getStreamingReply(data, state, { chatCompletionSource = null, mo
             }
         });
         return data.choices?.[0]?.delta?.content ?? data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text ?? '';
-    } else if ([chat_completion_sources.CUSTOM, chat_completion_sources.POLLINATIONS, chat_completion_sources.AIMLAPI, chat_completion_sources.MOONSHOT, chat_completion_sources.COMETAPI, chat_completion_sources.ELECTRONHUB, chat_completion_sources.NANOGPT, chat_completion_sources.ZAI, chat_completion_sources.SILICONFLOW, chat_completion_sources.CHUTES, chat_completion_sources.WORKERS_AI].includes(chat_completion_source)) {
+    } else if ([chat_completion_sources.OPENAI, chat_completion_sources.OPENCODE, chat_completion_sources.CUSTOM, chat_completion_sources.POLLINATIONS, chat_completion_sources.AIMLAPI, chat_completion_sources.MOONSHOT, chat_completion_sources.COMETAPI, chat_completion_sources.ELECTRONHUB, chat_completion_sources.NANOGPT, chat_completion_sources.ZAI, chat_completion_sources.SILICONFLOW, chat_completion_sources.CHUTES, chat_completion_sources.WORKERS_AI].includes(chat_completion_source)) {
         const imageUrls = data?.choices?.[0]?.delta?.images?.filter(x => x.type === 'image_url')?.map(x => x?.image_url?.url)
-            || data?.choices?.[0]?.message?.images?.filter(x => x.type === 'image_url')?.map(x => x?.image_url?.url)
+            || data?.choices?.[0]?.message?.images?.filter(x => x?.type === 'image_url')?.map(x => x?.image_url?.url)
             || [];
         if (Array.isArray(imageUrls) && imageUrls.length > 0) {
             state.images.push(...imageUrls.filter(isDataURL));
@@ -4896,6 +4984,7 @@ function parseChatCompletionLogprobs(data) {
                 ? parseOpenAIChatLogprobs(data.choices[0]?.logprobs)
                 : parseOpenAITextLogprobs(data.choices[0]?.logprobs);
         case chat_completion_sources.OPENAI:
+        case chat_completion_sources.OPENROUTER:
         case chat_completion_sources.AZURE_OPENAI:
         case chat_completion_sources.DEEPSEEK:
         case chat_completion_sources.XAI:
@@ -5105,6 +5194,8 @@ class Message {
     native = null;
     /** @type {string?} */
     reasoningContent = null;
+    /** Canonical history is carried through layout without a provider-format round trip. */
+    agentMessage = null;
 
     /**
      * @constructor
@@ -5143,6 +5234,12 @@ class Message {
         return message;
     }
 
+    static fromAgentMessage(agentMessage, identifier) {
+        const message = new Message(agentMessage.role, '', identifier);
+        message.agentMessage = agentMessage;
+        return message;
+    }
+
     /**
      * Reconstruct the message from a tool invocation.
      * @param {import('./tool-calling.js').ToolInvocation[]} invocations - The tool invocations to reconstruct the message from.
@@ -5170,6 +5267,7 @@ class Message {
             ...(this.name ? { name: this.name } : {}),
             tool_calls: JSON.stringify(this.tool_calls),
             ...(this.reasoning ? { reasoning: this.reasoning } : {}),
+            ...(this.reasoningContent ? { reasoning_content: this.reasoningContent } : {}),
         });
     }
 
@@ -5413,10 +5511,13 @@ class MessageCollection {
      */
     getChat() {
         return this.collection.reduce((acc, message) => {
-            if (message.content || message.tool_calls || message.role === 'tool') {
+            if (message.agentMessage) {
+                acc.push(message.agentMessage);
+            } else if (message.content || message.tool_calls || message.role === 'tool') {
                 acc.push({
                     role: message.role,
                     content: message.content,
+                    ...(message.identifier === AGENT_SYSTEM_PROMPT_IDENTIFIER && { _tauritavern_prompt_component: AGENT_SYSTEM_PROMPT_IDENTIFIER }),
                     ...(message.name && { name: message.name }),
                     ...(message.tool_calls && { tool_calls: message.tool_calls }),
                     ...(message.role === 'tool' && { tool_call_id: message.identifier }),
@@ -5512,12 +5613,12 @@ export class ChatCompletion {
 
         for (let message of this.messages.collection) {
             // Force exclude empty messages
-            if (message.role === 'system' && !message.content) {
+            if (!message.agentMessage && message.role === 'system' && !message.content) {
                 continue;
             }
 
             const shouldSquash = (message) => {
-                return !excludeList.includes(message.identifier) && message.role === 'system' && !message.name;
+                return !message.agentMessage && !excludeList.includes(message.identifier) && message.role === 'system' && !message.name;
             };
 
             if (shouldSquash(message)) {
@@ -5630,7 +5731,7 @@ export class ChatCompletion {
         this.checkTokenBudget(message, message.identifier);
 
         const index = this.findMessageIndex(identifier);
-        if (message.content || message.tool_calls || message.role === 'tool') {
+        if (message.agentMessage || message.content || message.tool_calls || message.role === 'tool') {
             if ('start' === position) this.messages.collection[index].collection.unshift(message);
             else if ('end' === position) this.messages.collection[index].collection.push(message);
             else if (typeof position === 'number') this.messages.collection[index].collection.splice(position, 0, message);
@@ -5708,10 +5809,13 @@ export class ChatCompletion {
         for (let item of this.messages.collection) {
             if (item instanceof MessageCollection) {
                 chat.push(...item.getChat());
+            } else if (item instanceof Message && item.agentMessage) {
+                chat.push(item.agentMessage);
             } else if (item instanceof Message && (item.content || item.tool_calls || item.role === 'tool')) {
                 const message = {
                     role: item.role,
                     content: item.content,
+                    ...(item.identifier === AGENT_SYSTEM_PROMPT_IDENTIFIER && { _tauritavern_prompt_component: AGENT_SYSTEM_PROMPT_IDENTIFIER }),
                     ...(item.name ? { name: item.name } : {}),
                     ...(item.tool_calls ? { tool_calls: item.tool_calls } : {}),
                     ...(item.role === 'tool' ? { tool_call_id: item.identifier } : {}),
@@ -5862,15 +5966,23 @@ export class ChatCompletion {
  */
 function migrateChatCompletionSettings(settings) {
     let changed = false;
-    if (settings.strip_old_tool_calls === undefined) {
-        settings.strip_old_tool_calls = false;
-        changed = true;
+    for (const key of ['strip_old_tool_calls', 'claude_fast_mode']) {
+        if (settings[key] === undefined) {
+            settings[key] = false;
+            changed = true;
+        }
     }
     const migrateMap = [
         { oldKey: 'names_in_completion', oldValue: true, newKey: 'names_behavior', newValue: character_names_behavior.COMPLETION },
         { oldKey: 'chat_completion_source', oldValue: 'palm', newKey: 'chat_completion_source', newValue: chat_completion_sources.MAKERSUITE },
         { oldKey: 'custom_prompt_post_processing', oldValue: custom_prompt_post_processing_types.CLAUDE, newKey: 'custom_prompt_post_processing', newValue: custom_prompt_post_processing_types.MERGE },
         { oldKey: 'ai21_model', oldValue: /^j2-/, newKey: 'ai21_model', newValue: 'jamba-large' },
+        { oldKey: 'google_model', oldValue: 'gemini-3.1-flash-lite-preview', newKey: 'google_model', newValue: 'gemini-3.1-flash-lite' },
+        { oldKey: 'vertexai_model', oldValue: 'gemini-3.1-flash-lite-preview', newKey: 'vertexai_model', newValue: 'gemini-3.1-flash-lite' },
+        { oldKey: 'google_model', oldValue: 'gemini-3.1-flash-image-preview', newKey: 'google_model', newValue: 'gemini-3.1-flash-image' },
+        { oldKey: 'vertexai_model', oldValue: 'gemini-3.1-flash-image-preview', newKey: 'vertexai_model', newValue: 'gemini-3.1-flash-image' },
+        { oldKey: 'google_model', oldValue: 'gemini-3-pro-image-preview', newKey: 'google_model', newValue: 'gemini-3-pro-image' },
+        { oldKey: 'vertexai_model', oldValue: 'gemini-3-pro-image-preview', newKey: 'vertexai_model', newValue: 'gemini-3-pro-image' },
         { oldKey: 'image_inlining', oldValue: false, newKey: 'media_inlining', newValue: false },
         { oldKey: 'image_inlining', oldValue: true, newKey: 'media_inlining', newValue: true },
         { oldKey: 'video_inlining', oldValue: true, newKey: 'media_inlining', newValue: true },
@@ -5970,6 +6082,8 @@ function resolveChatCompletionSourceSelectValue(settings) {
             return custom_source_variants.CLAUDE_MESSAGES;
         case custom_api_formats.GEMINI_INTERACTIONS:
             return custom_source_variants.GEMINI_INTERACTIONS;
+        case custom_api_formats.GEMINI_GENERATE_CONTENT:
+            return custom_source_variants.GEMINI_GENERATE_CONTENT;
         case custom_api_formats.OPENAI_COMPAT:
         default:
             return chat_completion_sources.CUSTOM;
@@ -6036,33 +6150,16 @@ function enforceIosPolicyChatCompletionSourceSelector() {
     }
 }
 
-function normalizeCustomEndpointBaseUrl(value) {
-    const url = String(value || '').trim();
-    return url ? url.replace(/\/+$/, '') : '';
-}
-
 function updateCustomEndpointPreview() {
-    const baseUrl = normalizeCustomEndpointBaseUrl($('#custom_api_url_text').val());
-    const base = baseUrl || '<Base URL>';
-
-    let suffix = '/chat/completions';
-    switch (oai_settings.custom_api_format) {
-        case custom_api_formats.OPENAI_RESPONSES:
-            suffix = '/responses';
-            break;
-        case custom_api_formats.CLAUDE_MESSAGES:
-            suffix = '/messages';
-            break;
-        case custom_api_formats.GEMINI_INTERACTIONS:
-            suffix = '/interactions';
-            break;
-        case custom_api_formats.OPENAI_COMPAT:
-        default:
-            suffix = '/chat/completions';
-    }
-
+    const { suffix, url } = getCustomEndpointPreview({
+        ...oai_settings,
+        custom_url: $('#custom_api_url_text').val(),
+    });
     $('#custom_endpoint_preview_suffix').text(suffix);
-    $('#custom_endpoint_preview').text(`${base}${suffix}`);
+    $('#custom_endpoint_preview').text(url);
+    const isGemini = isCustomGeminiGenerateContent();
+    $('#custom_endpoint_version_hint').toggle(!isGemini);
+    $('#custom_gemini_endpoint_hint').toggle(isGemini);
 }
 
 function applyChatCompletionSourceSelection(selection) {
@@ -6080,6 +6177,10 @@ function applyChatCompletionSourceSelection(selection) {
         case custom_source_variants.GEMINI_INTERACTIONS:
             oai_settings.chat_completion_source = chat_completion_sources.CUSTOM;
             oai_settings.custom_api_format = custom_api_formats.GEMINI_INTERACTIONS;
+            return;
+        case custom_source_variants.GEMINI_GENERATE_CONTENT:
+            oai_settings.chat_completion_source = chat_completion_sources.CUSTOM;
+            oai_settings.custom_api_format = custom_api_formats.GEMINI_GENERATE_CONTENT;
             return;
         case chat_completion_sources.CUSTOM:
             oai_settings.chat_completion_source = chat_completion_sources.CUSTOM;
@@ -6310,6 +6411,11 @@ async function getStatusOpen() {
         data.custom_url = oai_settings.custom_url;
     }
 
+    if (oai_settings.chat_completion_source === chat_completion_sources.OPENCODE) {
+        data.opencode_endpoint = oai_settings.opencode_endpoint;
+        data.opencode_api_format = oai_settings.opencode_api_format;
+    }
+
     if (oai_settings.chat_completion_source === chat_completion_sources.AZURE_OPENAI) {
         data.azure_base_url = oai_settings.azure_base_url;
         data.azure_deployment_name = oai_settings.azure_deployment_name;
@@ -6326,6 +6432,10 @@ async function getStatusOpen() {
 
     if (oai_settings.chat_completion_source === chat_completion_sources.MOONSHOT) {
         data.moonshot_endpoint = oai_settings.moonshot_endpoint;
+    }
+
+    if (oai_settings.chat_completion_source === chat_completion_sources.POLLINATIONS) {
+        data.pollinations_endpoint = oai_settings.pollinations_endpoint;
     }
 
     if (oai_settings.chat_completion_source === chat_completion_sources.AWS_BEDROCK) {
@@ -6438,8 +6548,7 @@ async function saveOpenAIPreset(name, settings, triggerUi = true) {
             if (triggerUi) $('#settings_preset_openai').append(option).trigger('change');
         }
     } else {
-        toastr.error(t`Failed to save preset`);
-        throw new Error('Failed to save preset');
+        throw new Error(t`Failed to save preset`);
     }
 }
 
@@ -6534,6 +6643,7 @@ function createLogitBiasListItem(entry) {
             preset.splice(index, 1);
         }
         onLogitBiasPresetChange();
+        $('#openai_logit_bias_new_entry').trigger('focus');
     });
     $('.openai_logit_bias_list').prepend(template);
 }
@@ -6826,6 +6936,17 @@ async function onLogitBiasPresetDeleteClick() {
     saveSettingsDebounced();
 }
 
+/** @type {Promise<void>} Completion of the most recently started preset application. */
+let presetApplicationPromise = Promise.resolve();
+
+/**
+ * Waits for preset settings and their before/after events to finish applying.
+ * @returns {Promise<void>}
+ */
+export function getPresetApplicationPromise() {
+    return presetApplicationPromise;
+}
+
 // Load OpenAI preset settings
 function onSettingsPresetChange() {
     const presetNameBefore = oai_settings.preset_settings_openai;
@@ -6844,7 +6965,7 @@ function onSettingsPresetChange() {
     const updateCheckbox = (selector, value) => $(selector).prop('checked', value).trigger('input', { source: 'preset' });
 
     // Allow subscribers to alter the preset before applying deltas
-    eventSource.emit(event_types.OAI_PRESET_CHANGED_BEFORE, {
+    presetApplicationPromise = eventSource.emit(event_types.OAI_PRESET_CHANGED_BEFORE, {
         preset: preset,
         presetName: presetName,
         settingsToUpdate: settingsToUpdate,
@@ -6852,6 +6973,8 @@ function onSettingsPresetChange() {
         savePreset: saveOpenAIPreset,
         presetNameBefore: presetNameBefore,
     }).finally(async () => {
+        if (oai_settings.preset_settings_openai !== presetName) return;
+
         if (oai_settings.bind_preset_to_connection) {
             $('.model_custom_select').empty();
         }
@@ -6899,52 +7022,96 @@ function getMaxContextOpenAI(value) {
     if (oai_settings.max_context_unlocked) {
         return unlocked_max;
     }
-    else if (/^gpt-5\.[45](?:$|-\d)/.test(value) || OPENAI_GPT56_MODEL_PATTERN.test(value)) {
-        return max_1mil;
+
+    /** @type {[RegExp, number][]} */
+    const contextMap = [
+        [/^gpt-6[-.]/, max_1050k],
+        [/^gpt-5\.6/, max_1050k],
+        [/^gpt-5\.[45]/, max_1mil],
+        [/^gpt-5/, max_400k],
+        [/gpt-4\.1/, max_1mil],
+        [/gpt-audio/, max_128k],
+        [/^o1/, max_128k],
+        [/^o[34]/, max_200k],
+        [/chatgpt-4o-latest|gpt-4-turbo|gpt-4o|gpt-4-1106|gpt-4-0125|gpt-4-vision/, max_128k],
+        [/gpt-3\.5-turbo-1106/, max_16k],
+        [/^(gpt-4|gpt-4-0314|gpt-4-0613)$/, max_8k],
+        [/^(gpt-4-32k|gpt-4-32k-0314|gpt-4-32k-0613)$/, max_32k],
+        [/gpt-realtime/, max_32k],
+        [/^(gpt-3\.5-turbo-16k|gpt-3\.5-turbo-16k-0613)$/, max_16k],
+        [/^code-davinci-002$/, max_8k],
+        [/^(text-curie-001|text-babbage-001|text-ada-001)$/, max_2k],
+        [/gpt-3/, max_4k],
+    ];
+
+    for (const [regex, max] of contextMap) {
+        if (regex.test(value)) {
+            return max;
+        }
     }
-    else if (value.startsWith('gpt-5')) {
-        return max_400k;
+
+    return max_128k;
+}
+
+/**
+ * Get the maximum context size for Gemini models based on model identifier and optional model list.
+ * @param {string} model Model identifier
+ * @param {boolean} isUnlocked Whether context limits are unlocked
+ * @returns {number} Maximum context size in tokens
+ */
+function getGeminiMaxContext(model, isUnlocked) {
+    if (isUnlocked) {
+        return unlocked_max;
     }
-    else if (value.includes('gpt-4.1')) {
-        return max_1mil;
+
+    if (Array.isArray(model_list) && model_list.length > 0) {
+        const contextLength = model_list.find((record) => record.id === model)?.inputTokenLimit;
+        if (Number.isFinite(contextLength) && contextLength > 0) {
+            return contextLength;
+        }
     }
-    else if (value.includes('gpt-audio')) {
-        return max_128k;
+
+    /** @type {[RegExp, number][]} */
+    const contextMap = [
+        [/gemini-2\.5-flash-image/, max_32k],
+        [/gemini-3\.1-flash-image/, max_128k],
+        [/gemini-3-pro-image/, max_64k],
+        [/gemini-(?:3[.\d]*|2\.(?:5|0))-(pro|flash)/, max_1mil],
+        [/gemini-4/, max_1mil],
+        [/(gemini-exp|learnlm-2\.0-flash|gemini-robotics)/, max_1mil],
+        [/gemma-3-27b-it/, max_128k],
+        [/gemma-3n-e4b-it/, max_8k],
+        [/gemma-3/, max_32k],
+        [/gemma-4/, max_256k],
+    ];
+
+    for (const [regex, max] of contextMap) {
+        if (regex.test(model)) {
+            return max;
+        }
     }
-    else if (value.startsWith('o1')) {
-        return max_128k;
+
+    return max_128k;
+}
+
+/**
+ * Get the maximum temperature for Gemini models based on model identifier and optional model list.
+ * @param {string} model Model identifier
+ * @returns {number} Maximum temperature for Gemini models
+ */
+function getGeminiMaxTemp(model) {
+    if (Array.isArray(model_list) && model_list.length > 0) {
+        const temp = model_list.find((record) => record.id === model)?.maxTemperature;
+        if (Number.isFinite(temp) && temp > 0) {
+            return temp;
+        }
     }
-    else if (value.startsWith('o4') || value.startsWith('o3')) {
-        return max_200k;
+
+    if (/(vision|ultra|gemma)/.test(model)) {
+        return 1.0;
     }
-    else if (value.includes('chatgpt-4o-latest') || value.includes('gpt-4-turbo') || value.includes('gpt-4o') || value.includes('gpt-4-1106') || value.includes('gpt-4-0125') || value.includes('gpt-4-vision')) {
-        return max_128k;
-    }
-    else if (value.includes('gpt-3.5-turbo-1106')) {
-        return max_16k;
-    }
-    else if (['gpt-4', 'gpt-4-0314', 'gpt-4-0613'].includes(value)) {
-        return max_8k;
-    }
-    else if (['gpt-4-32k', 'gpt-4-32k-0314', 'gpt-4-32k-0613'].includes(value)) {
-        return max_32k;
-    }
-    else if (value.includes('gpt-realtime')) {
-        return max_32k;
-    }
-    else if (['gpt-3.5-turbo-16k', 'gpt-3.5-turbo-16k-0613'].includes(value)) {
-        return max_16k;
-    }
-    else if (value == 'code-davinci-002') {
-        return max_8k;
-    }
-    else if (['text-curie-001', 'text-babbage-001', 'text-ada-001'].includes(value)) {
-        return max_2k;
-    }
-    else {
-        // default to gpt-3 (4095 tokens)
-        return max_4k;
-    }
+
+    return 2.0;
 }
 
 /**
@@ -7028,6 +7195,8 @@ function getZaiMaxContext(model, isUnlocked) {
     }
 
     const contextMap = {
+        'glm-5.3-flash': max_1mil,
+        'glm-5.3': max_1mil,
         'glm-5.2': max_1mil,
         'glm-5.1': max_200k,
         'glm-5-turbo': max_200k,
@@ -7284,6 +7453,14 @@ async function onModelChange() {
         oai_settings.openai_model = value;
     }
 
+    if ($(this).is('#model_opencode_select')) {
+        if (!value) {
+            console.debug('Null OpenCode model selected. Ignoring.');
+            return;
+        }
+        oai_settings.opencode_model = value;
+    }
+
     if ($(this).is('#model_openrouter_select')) {
         if (!value || (!hasModelsLoaded && !isCustomModelValueForSource(chat_completion_sources.OPENROUTER, value))) {
             console.debug('Null OR model selected. Ignoring.');
@@ -7494,36 +7671,15 @@ async function onModelChange() {
     }
 
     if ([chat_completion_sources.MAKERSUITE, chat_completion_sources.VERTEXAI].includes(oai_settings.chat_completion_source)) {
-        const vertexClaudeMaxContext = oai_settings.chat_completion_source === chat_completion_sources.VERTEXAI
+        const isVertexClaude = oai_settings.chat_completion_source === chat_completion_sources.VERTEXAI
+            && isVertexAiClaudeModelId(value);
+        const contextSize = isVertexClaude
             ? getVertexAiClaudeMaxContext(value, oai_settings.max_context_unlocked)
-            : null;
-
-        if (vertexClaudeMaxContext) {
-            $('#openai_max_context').attr('max', vertexClaudeMaxContext);
-        } else if (oai_settings.max_context_unlocked) {
-            $('#openai_max_context').attr('max', max_2mil);
-        } else if (value.includes('gemini-2.5-flash-image')) {
-            $('#openai_max_context').attr('max', max_32k);
-        } else if (value.includes('gemini-3-pro-image')) {
-            $('#openai_max_context').attr('max', max_64k);
-        } else if (/gemini-3[.\d]*-(pro|flash)/.test(value) || /gemini-2.5-(pro|flash)/.test(value) || /gemini-2.0-(pro|flash)/.test(value)) {
-            $('#openai_max_context').attr('max', max_1mil);
-        } else if (value.includes('gemini-exp') || value.includes('learnlm-2.0-flash') || value.includes('gemini-robotics')) {
-            $('#openai_max_context').attr('max', max_1mil);
-        } else if (value.includes('gemma-3-27b-it')) {
-            $('#openai_max_context').attr('max', max_128k);
-        } else if (value.includes('gemma-3n-e4b-it')) {
-            $('#openai_max_context').attr('max', max_8k);
-        } else if (value.includes('gemma-3')) {
-            $('#openai_max_context').attr('max', max_32k);
-        } else {
-            $('#openai_max_context').attr('max', max_32k);
-        }
-        let makersuite_max_temp = vertexClaudeMaxContext
-            ? claude_max_temp
-            : ((value.includes('vision') || value.includes('ultra') || value.includes('gemma')) ? 1.0 : 2.0);
-        oai_settings.temp_openai = Math.min(makersuite_max_temp, oai_settings.temp_openai);
-        $('#temp_openai').attr('max', makersuite_max_temp).val(oai_settings.temp_openai).trigger('input');
+            : getGeminiMaxContext(value, oai_settings.max_context_unlocked);
+        const maxTemp = isVertexClaude ? claude_max_temp : getGeminiMaxTemp(value);
+        $('#openai_max_context').attr('max', contextSize);
+        oai_settings.temp_openai = Math.min(maxTemp, oai_settings.temp_openai);
+        $('#temp_openai').attr('max', maxTemp).val(oai_settings.temp_openai).trigger('input');
         oai_settings.openai_max_context = Math.min(Number($('#openai_max_context').attr('max')), oai_settings.openai_max_context);
         $('#openai_max_context').val(oai_settings.openai_max_context).trigger('input');
     }
@@ -7666,7 +7822,7 @@ async function onModelChange() {
         $('#temp_openai').attr('max', oai_max_temp).val(oai_settings.temp_openai).trigger('input');
     }
 
-    if (oai_settings.chat_completion_source == chat_completion_sources.CUSTOM) {
+    if ([chat_completion_sources.CUSTOM, chat_completion_sources.OPENCODE].includes(oai_settings.chat_completion_source)) {
         $('#openai_max_context').attr('max', unlocked_max);
         oai_settings.openai_max_context = Math.min(Number($('#openai_max_context').attr('max')), oai_settings.openai_max_context);
         $('#openai_max_context').val(oai_settings.openai_max_context).trigger('input');
@@ -7717,15 +7873,8 @@ async function onModelChange() {
     }
 
     if (oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK) {
-        if (oai_settings.max_context_unlocked) {
-            $('#openai_max_context').attr('max', unlocked_max);
-        } else if (['deepseek-chat', 'deepseek-reasoner'].includes(oai_settings.deepseek_model) || oai_settings.deepseek_model.startsWith('deepseek-v4-')) {
-            $('#openai_max_context').attr('max', max_1mil);
-        } else if (oai_settings.deepseek_model == 'deepseek-coder') {
-            $('#openai_max_context').attr('max', max_16k);
-        } else {
-            $('#openai_max_context').attr('max', max_64k);
-        }
+        const maxContext = oai_settings.max_context_unlocked ? unlocked_max : max_1mil;
+        $('#openai_max_context').attr('max', maxContext);
 
         oai_settings.openai_max_context = Math.min(Number($('#openai_max_context').attr('max')), oai_settings.openai_max_context);
         $('#openai_max_context').val(oai_settings.openai_max_context).trigger('input');
@@ -7750,17 +7899,12 @@ async function onModelChange() {
     if (oai_settings.chat_completion_source === chat_completion_sources.XAI) {
         if (oai_settings.max_context_unlocked) {
             $('#openai_max_context').attr('max', unlocked_max);
-        } else if (oai_settings.xai_model.includes('grok-2-vision')) {
-            $('#openai_max_context').attr('max', max_32k);
-        } else if (oai_settings.xai_model.includes('grok-4-fast')) {
-            $('#openai_max_context').attr('max', max_2mil);
-        } else if (oai_settings.xai_model.includes('grok-4')) {
-            $('#openai_max_context').attr('max', max_256k);
-        } else if (oai_settings.xai_model.includes('grok-code')) {
+        } else if (['grok-4.5', 'grok-4.6', 'grok-4.7'].some(x => oai_settings.xai_model.includes(x))) {
+            $('#openai_max_context').attr('max', max_500k);
+        } else if (['grok-build', 'grok-code'].some(x => oai_settings.xai_model.includes(x))) {
             $('#openai_max_context').attr('max', max_256k);
         } else {
-            // grok 2 and grok 3
-            $('#openai_max_context').attr('max', max_128k);
+            $('#openai_max_context').attr('max', max_1mil);
         }
 
         oai_settings.openai_max_context = Math.min(Number($('#openai_max_context').attr('max')), oai_settings.openai_max_context);
@@ -7860,8 +8004,6 @@ async function onModelChange() {
         $('#temp_openai').attr('max', claude_max_temp).val(oai_settings.temp_openai).trigger('input');
     }
 
-    $('#openai_max_context_counter').attr('max', Number($('#openai_max_context').attr('max')));
-
     saveSettingsDebounced();
     updateFeatureSupportFlags();
     eventSource.emit(event_types.CHATCOMPLETION_MODEL_CHANGED, value);
@@ -7880,13 +8022,62 @@ async function onElectronHubModelSortChange() {
 }
 
 async function onNewPresetClick() {
-    const name = await Popup.show.input(t`Preset name:`, t`Hint: Use a character/group name to bind preset to a specific chat.`, oai_settings.preset_settings_openai);
+    const content = document.createElement('div');
+    const heading = document.createElement('h3');
+    heading.textContent = t`Preset name:`;
+    const hint = document.createElement('p');
+    hint.textContent = t`Hint: Use a character/group name to bind preset to a specific chat.`;
+    const feedback = document.createElement('p');
+    feedback.setAttribute('role', 'status');
+    feedback.hidden = true;
+    content.append(heading, hint, feedback);
 
-    if (!name) {
-        return;
-    }
+    const popup = new Popup(content, POPUP_TYPE.INPUT, oai_settings.preset_settings_openai, {
+        label: heading,
+        inputLabel: heading,
+        inputDescription: hint,
+        okButton: t`Save`,
+        cancelButton: t`Cancel`,
+        async onClosing(popup) {
+            if (popup.result !== POPUP_RESULT.AFFIRMATIVE) return true;
+            const name = popup.mainInput.value;
+            feedback.hidden = false;
+            if (!name.trim()) {
+                popup.mainInput.setAttribute('aria-invalid', 'true');
+                feedback.textContent = t`Preset name cannot be empty`;
+                popup.mainInput.focus();
+                return false;
+            }
 
-    await saveOpenAIPreset(name, oai_settings);
+            popup.mainInput.readOnly = true;
+            const buttons = [popup.okButton, popup.cancelButton, popup.closeButton];
+            for (const button of buttons) button.disabled = true;
+            popup.okButton.setAttribute('aria-busy', 'true');
+            feedback.textContent = t`Saving…`;
+            try {
+                await saveOpenAIPreset(name, oai_settings);
+                toastr.success(t`Preset saved`);
+                // The file is saved even if an extension later fails to apply it.
+                void getPresetApplicationPromise().catch(error => {
+                    toastr.error(toUserFacingErrorText(error), t`Preset saved, but could not be applied.`);
+                });
+                return true;
+            } catch (error) {
+                feedback.textContent = toUserFacingErrorText(error);
+                popup.mainInput.focus();
+                return false;
+            } finally {
+                popup.mainInput.readOnly = false;
+                for (const button of buttons) button.disabled = false;
+                popup.okButton.removeAttribute('aria-busy');
+            }
+        },
+    });
+    popup.mainInput.addEventListener('input', () => {
+        popup.mainInput.removeAttribute('aria-invalid');
+        feedback.hidden = true;
+    });
+    await popup.show();
 }
 
 function onReverseProxyInput() {
@@ -7897,79 +8088,85 @@ function onReverseProxyInput() {
 
 async function onConnectButtonClick(e) {
     e.stopPropagation();
+    if (isConnectionValidationSuspended()) return;
 
-    if (isConnectionValidationSuspended()) {
-        return;
-    }
+    try {
+        await readSecretState();
 
-    /** @type {Object.<string, {key: string, selector: string, proxy?: boolean, keyless?: boolean}>} */
-    const apiSourceConfig = {
-        [chat_completion_sources.OPENROUTER]: { key: SECRET_KEYS.OPENROUTER, selector: '#api_key_openrouter', proxy: false },
-        [chat_completion_sources.MAKERSUITE]: { key: SECRET_KEYS.MAKERSUITE, selector: '#api_key_makersuite', proxy: true },
-        [chat_completion_sources.CLAUDE]: { key: SECRET_KEYS.CLAUDE, selector: '#api_key_claude', proxy: true },
-        [chat_completion_sources.OPENAI]: { key: SECRET_KEYS.OPENAI, selector: '#api_key_openai', proxy: true },
-        [chat_completion_sources.AI21]: { key: SECRET_KEYS.AI21, selector: '#api_key_ai21', proxy: false },
-        [chat_completion_sources.MISTRALAI]: { key: SECRET_KEYS.MISTRALAI, selector: '#api_key_mistralai', proxy: true },
-        [chat_completion_sources.CUSTOM]: { key: SECRET_KEYS.CUSTOM, selector: '#api_key_custom', proxy: false, keyless: true },
-        [chat_completion_sources.COHERE]: { key: SECRET_KEYS.COHERE, selector: '#api_key_cohere', proxy: false },
-        [chat_completion_sources.PERPLEXITY]: { key: SECRET_KEYS.PERPLEXITY, selector: '#api_key_perplexity', proxy: false },
-        [chat_completion_sources.GROQ]: { key: SECRET_KEYS.GROQ, selector: '#api_key_groq', proxy: false },
-        [chat_completion_sources.SILICONFLOW]: { key: SECRET_KEYS.SILICONFLOW, selector: '#api_key_siliconflow', proxy: false },
-        [chat_completion_sources.ELECTRONHUB]: { key: SECRET_KEYS.ELECTRONHUB, selector: '#api_key_electronhub', proxy: false },
-        [chat_completion_sources.NANOGPT]: { key: SECRET_KEYS.NANOGPT, selector: '#api_key_nanogpt', proxy: false },
-        [chat_completion_sources.DEEPSEEK]: { key: SECRET_KEYS.DEEPSEEK, selector: '#api_key_deepseek', proxy: true },
-        [chat_completion_sources.XAI]: { key: SECRET_KEYS.XAI, selector: '#api_key_xai', proxy: true },
-        [chat_completion_sources.AIMLAPI]: { key: SECRET_KEYS.AIMLAPI, selector: '#api_key_aimlapi', proxy: false },
-        [chat_completion_sources.MOONSHOT]: { key: SECRET_KEYS.MOONSHOT, selector: '#api_key_moonshot', proxy: true },
-        [chat_completion_sources.FIREWORKS]: { key: SECRET_KEYS.FIREWORKS, selector: '#api_key_fireworks', proxy: false },
-        [chat_completion_sources.COMETAPI]: { key: SECRET_KEYS.COMETAPI, selector: '#api_key_cometapi', proxy: false },
-        [chat_completion_sources.AZURE_OPENAI]: { key: SECRET_KEYS.AZURE_OPENAI, selector: '#api_key_azure_openai', proxy: false },
-        [chat_completion_sources.ZAI]: { key: SECRET_KEYS.ZAI, selector: '#api_key_zai', proxy: true },
-        [chat_completion_sources.CHUTES]: { key: SECRET_KEYS.CHUTES, selector: '#api_key_chutes', proxy: false },
-        [chat_completion_sources.POLLINATIONS]: { key: SECRET_KEYS.POLLINATIONS, selector: '#api_key_pollinations', proxy: false },
-        [chat_completion_sources.WORKERS_AI]: { key: SECRET_KEYS.WORKERS_AI, selector: '#api_key_workers_ai', proxy: false },
-        [chat_completion_sources.MINIMAX]: { key: SECRET_KEYS.MINIMAX, selector: '#api_key_minimax', proxy: false },
-        [chat_completion_sources.AWS_BEDROCK]: { key: SECRET_KEYS.AWS_BEDROCK, selector: '#api_key_aws_bedrock', proxy: false },
-    };
+        /** @type {Object.<string, {key: string, selector: string, proxy?: boolean, keyless?: boolean}>} */
+        const apiSourceConfig = {
+            [chat_completion_sources.OPENROUTER]: { key: SECRET_KEYS.OPENROUTER, selector: '#api_key_openrouter', proxy: false },
+            [chat_completion_sources.MAKERSUITE]: { key: SECRET_KEYS.MAKERSUITE, selector: '#api_key_makersuite', proxy: true },
+            [chat_completion_sources.CLAUDE]: { key: SECRET_KEYS.CLAUDE, selector: '#api_key_claude', proxy: true },
+            [chat_completion_sources.OPENAI]: { key: SECRET_KEYS.OPENAI, selector: '#api_key_openai', proxy: true },
+            [chat_completion_sources.OPENCODE]: { key: SECRET_KEYS.OPENCODE, selector: '#api_key_opencode', proxy: false },
+            [chat_completion_sources.AI21]: { key: SECRET_KEYS.AI21, selector: '#api_key_ai21', proxy: false },
+            [chat_completion_sources.MISTRALAI]: { key: SECRET_KEYS.MISTRALAI, selector: '#api_key_mistralai', proxy: true },
+            [chat_completion_sources.CUSTOM]: { key: SECRET_KEYS.CUSTOM, selector: '#api_key_custom', proxy: false, keyless: true },
+            [chat_completion_sources.COHERE]: { key: SECRET_KEYS.COHERE, selector: '#api_key_cohere', proxy: false },
+            [chat_completion_sources.PERPLEXITY]: { key: SECRET_KEYS.PERPLEXITY, selector: '#api_key_perplexity', proxy: false },
+            [chat_completion_sources.GROQ]: { key: SECRET_KEYS.GROQ, selector: '#api_key_groq', proxy: false },
+            [chat_completion_sources.SILICONFLOW]: { key: SECRET_KEYS.SILICONFLOW, selector: '#api_key_siliconflow', proxy: false },
+            [chat_completion_sources.ELECTRONHUB]: { key: SECRET_KEYS.ELECTRONHUB, selector: '#api_key_electronhub', proxy: false },
+            [chat_completion_sources.NANOGPT]: { key: SECRET_KEYS.NANOGPT, selector: '#api_key_nanogpt', proxy: false },
+            [chat_completion_sources.DEEPSEEK]: { key: SECRET_KEYS.DEEPSEEK, selector: '#api_key_deepseek', proxy: true },
+            [chat_completion_sources.XAI]: { key: SECRET_KEYS.XAI, selector: '#api_key_xai', proxy: true },
+            [chat_completion_sources.AIMLAPI]: { key: SECRET_KEYS.AIMLAPI, selector: '#api_key_aimlapi', proxy: false },
+            [chat_completion_sources.MOONSHOT]: { key: SECRET_KEYS.MOONSHOT, selector: '#api_key_moonshot', proxy: true },
+            [chat_completion_sources.FIREWORKS]: { key: SECRET_KEYS.FIREWORKS, selector: '#api_key_fireworks', proxy: false },
+            [chat_completion_sources.COMETAPI]: { key: SECRET_KEYS.COMETAPI, selector: '#api_key_cometapi', proxy: false },
+            [chat_completion_sources.AZURE_OPENAI]: { key: SECRET_KEYS.AZURE_OPENAI, selector: '#api_key_azure_openai', proxy: false },
+            [chat_completion_sources.ZAI]: { key: SECRET_KEYS.ZAI, selector: '#api_key_zai', proxy: true },
+            [chat_completion_sources.CHUTES]: { key: SECRET_KEYS.CHUTES, selector: '#api_key_chutes', proxy: false },
+            [chat_completion_sources.POLLINATIONS]: { key: SECRET_KEYS.POLLINATIONS, selector: '#api_key_pollinations', proxy: false, keyless: oai_settings.pollinations_endpoint === POLLINATIONS_ENDPOINT.ANONYMOUS },
+            [chat_completion_sources.WORKERS_AI]: { key: SECRET_KEYS.WORKERS_AI, selector: '#api_key_workers_ai', proxy: false },
+            [chat_completion_sources.MINIMAX]: { key: SECRET_KEYS.MINIMAX, selector: '#api_key_minimax', proxy: false },
+            [chat_completion_sources.AWS_BEDROCK]: { key: SECRET_KEYS.AWS_BEDROCK, selector: '#api_key_aws_bedrock', proxy: false },
+        };
 
-    // Vertex AI Express version - use API key
-    if (oai_settings.vertexai_auth_mode === 'express') {
-        apiSourceConfig[chat_completion_sources.VERTEXAI] = { key: SECRET_KEYS.VERTEXAI, selector: '#api_key_vertexai', proxy: true };
-    }
+        // Vertex AI Express version - use API key
+        if (oai_settings.vertexai_auth_mode === 'express') {
+            apiSourceConfig[chat_completion_sources.VERTEXAI] = { key: SECRET_KEYS.VERTEXAI, selector: '#api_key_vertexai', proxy: true };
+        }
 
-    if (oai_settings.chat_completion_source === chat_completion_sources.VERTEXAI
-        && oai_settings.vertexai_auth_mode === 'express'
-        && isVertexAiClaudeModelId()
-        && !oai_settings.reverse_proxy) {
-        toastr.error(t`Claude on Vertex AI requires Full mode service account authentication or a reverse proxy.`);
-        return;
-    }
-
-    // Vertex AI Full version - use service account
-    if (oai_settings.chat_completion_source === chat_completion_sources.VERTEXAI && oai_settings.vertexai_auth_mode === 'full') {
-        if (!secret_state[SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT]) {
-            toastr.error(t`Service Account JSON is required for Vertex AI full version. Please validate and save your Service Account JSON.`);
+        if (oai_settings.chat_completion_source === chat_completion_sources.VERTEXAI
+            && oai_settings.vertexai_auth_mode === 'express'
+            && isVertexAiClaudeModelId()
+            && !oai_settings.reverse_proxy) {
+            toastr.error(t`Claude on Vertex AI requires Full mode service account authentication or a reverse proxy.`);
             return;
         }
-    }
 
-    // Other generic configs
-    const config = apiSourceConfig[oai_settings.chat_completion_source];
-    if (config) {
-        const apiKey = String($(config.selector).val()).trim();
-        if (apiKey.length) {
-            await writeSecret(config.key, apiKey);
+        // Vertex AI Full version - use service account
+        if (oai_settings.chat_completion_source === chat_completion_sources.VERTEXAI && oai_settings.vertexai_auth_mode === 'full') {
+            if (!secret_state[SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT]) {
+                toastr.error(t`Service Account JSON is required for Vertex AI full version. Please validate and save your Service Account JSON.`);
+                return;
+            }
         }
 
-        if (!secret_state[config.key] && (!config.proxy || !oai_settings.reverse_proxy) && !config.keyless) {
-            console.log(`No secret key saved for ${oai_settings.chat_completion_source}`);
-            return;
+        // Other generic configs
+        const config = apiSourceConfig[oai_settings.chat_completion_source];
+        if (config) {
+            const apiKey = String($(config.selector).val()).trim();
+            if (apiKey.length) {
+                await writeSecret(config.key, apiKey);
+            }
+
+            if (!secret_state[config.key] && (!config.proxy || !oai_settings.reverse_proxy) && !config.keyless) {
+                toastr.error(t`Please enter an API key or select a saved key.`);
+                return;
+            }
         }
+
+        startStatusLoading();
+        saveSettingsDebounced();
+        await getStatusOpen();
+    } catch (error) {
+        toastr.error(toUserFacingErrorText(error));
+        resultCheckStatus();
     }
 
-    startStatusLoading();
-    saveSettingsDebounced();
-    await getStatusOpen();
 }
 
 function toggleChatCompletionForms() {
@@ -7993,6 +8190,9 @@ function toggleChatCompletionForms() {
         $('#model_vertexai_select').trigger('change');
         // Update UI based on authentication mode
         onVertexAIAuthModeChange.call($('#vertexai_auth_mode')[0]);
+    }
+    else if (oai_settings.chat_completion_source === chat_completion_sources.OPENCODE) {
+        $('#model_opencode_select').trigger('change');
     }
     else if (oai_settings.chat_completion_source == chat_completion_sources.OPENROUTER) {
         $('#model_openrouter_select').trigger('change');
@@ -8043,6 +8243,7 @@ function toggleChatCompletionForms() {
         $('#model_xai_select').trigger('change');
     }
     else if (oai_settings.chat_completion_source == chat_completion_sources.POLLINATIONS) {
+        $('#pollinations_key_section').toggle(oai_settings.pollinations_endpoint === POLLINATIONS_ENDPOINT.AUTHENTICATED);
         $('#model_pollinations_select').trigger('change');
     }
     else if (oai_settings.chat_completion_source == chat_completion_sources.MOONSHOT) {
@@ -8108,10 +8309,8 @@ function reconnectOpenAi() {
     }
 }
 
-function onProxyPasswordShowClick() {
-    const $input = $('#openai_proxy_password');
-    const type = $input.attr('type') === 'password' ? 'text' : 'password';
-    $input.attr('type', type);
+function onProxyAccessKeyShowClick() {
+    $('#openai_proxy_access_key').toggleClass('masked-secret');
     $(this).toggleClass('fa-eye-slash fa-eye');
 }
 
@@ -8160,6 +8359,7 @@ export function isImageInliningSupported(settings = oai_settings) {
         'gpt-4.5-preview',
         'gpt-4o',
         'gpt-5',
+        'gpt-6',
         'o1',
         'o3',
         'o4-mini',
@@ -8168,6 +8368,7 @@ export function isImageInliningSupported(settings = oai_settings) {
         'claude-mythos-5',
         'claude-opus-5',
         'claude-sonnet-5',
+        'claude-haiku-5',
         'claude-3',
         'claude-opus-4',
         'claude-sonnet-4',
@@ -8179,9 +8380,14 @@ export function isImageInliningSupported(settings = oai_settings) {
         'gemini-2.0',
         'gemini-2.5',
         'gemini-3',
+        'gemini-4',
         'gemini-exp-1206',
         'learnlm',
         'gemini-robotics',
+        'gemma-3-27b',
+        'gemma-3-12b',
+        'gemma-3-4b',
+        'gemma-4',
         // MistralAI
         'mistral-small-2503',
         'mistral-small-2506',
@@ -8190,9 +8396,6 @@ export function isImageInliningSupported(settings = oai_settings) {
         'mistral-medium-2505',
         'mistral-medium-2508',
         'pixtral',
-        // xAI (Grok)
-        'grok-4',
-        'grok-2-vision',
         // Moonshot
         'moonshot-v1-8k-vision-preview',
         'moonshot-v1-32k-vision-preview',
@@ -8200,6 +8403,7 @@ export function isImageInliningSupported(settings = oai_settings) {
         'kimi-k2.5',
         'kimi-latest',
         // Z.AI (GLM)
+        'glm-5.3-flash',
         'glm-4.5v',
         'glm-4.6v',
         'autoglm-phone',
@@ -8229,7 +8433,7 @@ export function isImageInliningSupported(settings = oai_settings) {
         case chat_completion_sources.CLAUDE:
             return visionSupportedModels.some(model => settings.claude_model.includes(model));
         case chat_completion_sources.DEEPSEEK:
-            return settings.deepseek_model === 'deepseek-v4-flash-vision-exp';
+            return ['deepseek-v4-flash-vision-exp', 'deepseek-flash'].includes(settings.deepseek_model);
         case chat_completion_sources.OPENROUTER:
             return (Array.isArray(model_list) && model_list.find(m => m.id === settings.openrouter_model)?.architecture?.input_modalities?.includes('image'));
         case chat_completion_sources.CUSTOM:
@@ -8239,8 +8443,7 @@ export function isImageInliningSupported(settings = oai_settings) {
         case chat_completion_sources.COHERE:
             return visionSupportedModels.some(model => settings.cohere_model.includes(model));
         case chat_completion_sources.XAI:
-            // TODO: xAI's /models endpoint doesn't return modality info
-            return visionSupportedModels.some(model => settings.xai_model.includes(model));
+            return (Array.isArray(model_list) && model_list.find(m => m.id === settings.xai_model)?.input_modalities?.includes('image'));
         case chat_completion_sources.AIMLAPI:
             return (Array.isArray(model_list) && model_list.find(m => m.id === settings.aimlapi_model)?.features?.includes('openai/chat-completion.vision'));
         case chat_completion_sources.CHUTES:
@@ -8289,7 +8492,10 @@ export function isVideoInliningSupported(settings = oai_settings) {
         'gemini-2.5',
         'gemini-exp-1206',
         'gemini-3',
+        'gemini-4',
+        'gemma-4',
         // Z.AI (GLM)
+        'glm-5.3-flash',
         'glm-4.5v',
         'glm-4.6v',
     ];
@@ -8303,6 +8509,8 @@ export function isVideoInliningSupported(settings = oai_settings) {
             return (Array.isArray(model_list) && model_list.find(m => m.id === settings.openrouter_model)?.architecture?.input_modalities?.includes('video'));
         case chat_completion_sources.ZAI:
             return videoSupportedModels.some(model => settings.zai_model.includes(model));
+        case chat_completion_sources.CUSTOM:
+            return true;
         default:
             return false;
     }
@@ -8325,6 +8533,7 @@ export function isAudioInliningSupported(settings = oai_settings) {
         'gemini-2.0',
         'gemini-2.5',
         'gemini-3',
+        'gemini-4',
         'gemini-exp-1206',
         'gpt-4o-audio',
         'gpt-4o-realtime',
@@ -8377,13 +8586,43 @@ function getEffectiveToolReasoningMode(settings = oai_settings) {
     return getToolReasoningMode(settings);
 }
 
+function isCustomGeminiGenerateContent(settings = oai_settings) {
+    return settings.chat_completion_source === chat_completion_sources.CUSTOM
+        && settings.custom_api_format === custom_api_formats.GEMINI_GENERATE_CONTENT;
+}
+
+/**
+ * Check whether the selected connection replays DeepSeek tool reasoning.
+ * Keep this replay predicate scoped to Chat Completions; native-format continuations
+ * have their own representation. Request normalization remains in the backend.
+ * @param {ChatCompletionSettings} settings Settings object to use
+ * @param {string} model Model id
+ * @returns {boolean} Whether tool turns use DeepSeek reasoning_content
+ */
+function usesDeepSeekReasoningContent(settings, model = getChatCompletionModel(settings)) {
+    const source = settings.chat_completion_source;
+    if (source === chat_completion_sources.DEEPSEEK) {
+        return true;
+    }
+    const isCompat = (source === chat_completion_sources.CUSTOM
+        && (settings.custom_api_format ?? custom_api_formats.OPENAI_COMPAT) === custom_api_formats.OPENAI_COMPAT)
+        || (source === chat_completion_sources.OPENCODE
+            && (settings.opencode_api_format ?? OPENCODE_API_FORMAT.OPENAI_COMPAT) === OPENCODE_API_FORMAT.OPENAI_COMPAT);
+    if (!isCompat) {
+        return false;
+    }
+    const lastSegment = String(model ?? '').trim().toLowerCase().split('/').pop() ?? '';
+    return lastSegment.startsWith('deepseek-v4') || lastSegment.startsWith('deepseek-flash');
+}
+
 /**
  * Check whether the selected source uses Gemini's native GenerateContent protocol.
  * @param {ChatCompletionSettings} settings Settings object to use
  * @returns {boolean} True for direct Gemini providers
  */
 function isDirectGeminiSource(settings = oai_settings) {
-    return settings.chat_completion_source === chat_completion_sources.MAKERSUITE
+    return isCustomGeminiGenerateContent(settings)
+        || settings.chat_completion_source === chat_completion_sources.MAKERSUITE
         || (settings.chat_completion_source === chat_completion_sources.VERTEXAI
             && !isVertexAiClaudeModelId(getChatCompletionModel(settings) ?? ''));
 }
@@ -8442,7 +8681,7 @@ function setProxyPreset(name, url, password) {
     oai_settings.reverse_proxy = url;
     $('#openai_reverse_proxy').val(oai_settings.reverse_proxy);
     oai_settings.proxy_password = password;
-    $('#openai_proxy_password').val(oai_settings.proxy_password);
+    $('#openai_proxy_access_key').val(oai_settings.proxy_password);
     reconnectOpenAi();
 }
 
@@ -8461,7 +8700,7 @@ function onProxyPresetChange() {
 $('#save_proxy').on('click', async function () {
     const presetName = $('#openai_reverse_proxy_name').val();
     const reverseProxy = $('#openai_reverse_proxy').val();
-    const proxyPassword = $('#openai_proxy_password').val();
+    const proxyPassword = $('#openai_proxy_access_key').val();
 
     setProxyPreset(presetName, reverseProxy, proxyPassword);
     saveSettingsDebounced();
@@ -8495,7 +8734,7 @@ $('#delete_proxy').on('click', async function () {
         oai_settings.reverse_proxy = selected_proxy.url;
         $('#openai_reverse_proxy').val(selected_proxy.url);
         oai_settings.proxy_password = selected_proxy.password;
-        $('#openai_proxy_password').val(selected_proxy.password);
+        $('#openai_proxy_access_key').val(selected_proxy.password);
 
         saveSettingsDebounced();
         $('#openai_proxy_preset').val(selected_proxy.name);
@@ -8551,8 +8790,15 @@ async function onVertexAIValidateServiceAccount() {
         return;
     }
 
+    let serviceAccount;
     try {
-        const serviceAccount = JSON.parse(jsonContent);
+        serviceAccount = JSON.parse(jsonContent);
+    } catch {
+        toastr.error(t`Invalid JSON format`);
+        updateVertexAIServiceAccountStatus(false, t`Invalid JSON format`);
+        return;
+    }
+    try {
         const requiredFields = ['type', 'project_id', 'private_key', 'client_email', 'client_id'];
         const missingFields = requiredFields.filter(field => !serviceAccount[field]);
 
@@ -8578,9 +8824,7 @@ async function onVertexAIValidateServiceAccount() {
         toastr.success(t`Service Account JSON is valid and saved securely`);
         saveSettingsDebounced();
     } catch (error) {
-        console.error('JSON validation error:', error);
-        toastr.error(t`Invalid JSON format`);
-        updateVertexAIServiceAccountStatus(false, t`Invalid JSON format`);
+        toastr.error(toUserFacingErrorText(error));
     }
 }
 
@@ -8588,14 +8832,18 @@ async function onVertexAIValidateServiceAccount() {
  * Clear Vertex AI service account JSON
  */
 async function onVertexAIClearServiceAccount() {
-    $('#vertexai_service_account_json').val('');
+    try {
+        // Clear the editor only after the stored key was deleted.
+        await writeSecret(SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, '');
+        $('#vertexai_service_account_json').val('');
 
-    // Clear from backend secret storage
-    await writeSecret(SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, '');
+        updateVertexAIServiceAccountStatus(false);
+        toastr.info(t`Service Account JSON cleared`);
+        saveSettingsDebounced();
+    } catch (error) {
+        toastr.error(toUserFacingErrorText(error));
+    }
 
-    updateVertexAIServiceAccountStatus(false);
-    toastr.info(t`Service Account JSON cleared`);
-    saveSettingsDebounced();
 }
 
 /**
@@ -8709,8 +8957,6 @@ function updateFeatureSupportFlags() {
         }
     }
 
-    const model = getChatCompletionModel();
-    $('#continue_prefill_block').toggle(!isDirectGeminiSource() || !['gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.7-flash'].includes(model));
     updateReasoningEffortOptions();
 }
 
@@ -8800,11 +9046,17 @@ export function initOpenAI() {
 
     $('#stream_toggle').on('change', function () {
         oai_settings.stream_openai = !!$('#stream_toggle').prop('checked');
+        updateCustomEndpointPreview();
         saveSettingsDebounced();
     });
 
     $('#use_sysprompt').on('change', function () {
         oai_settings.use_sysprompt = !!$('#use_sysprompt').prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#claude_fast_mode').on('input change', function () {
+        oai_settings.claude_fast_mode = !!$('#claude_fast_mode').prop('checked');
         saveSettingsDebounced();
     });
 
@@ -8860,8 +9112,12 @@ export function initOpenAI() {
 
     $('#update_oai_preset').on('click', async function () {
         const name = oai_settings.preset_settings_openai;
-        await saveOpenAIPreset(name, oai_settings, false);
-        toastr.success(t`Preset updated`);
+        try {
+            await saveOpenAIPreset(name, oai_settings, false);
+            toastr.success(t`Preset updated`);
+        } catch (error) {
+            toastr.error(toUserFacingErrorText(error));
+        }
     });
 
     $('#impersonation_prompt_restore').on('click', function () {
@@ -8952,9 +9208,15 @@ export function initOpenAI() {
         saveSettingsDebounced();
     });
 
-    $('#openai_proxy_password').on('input', function () {
+    $('#openai_proxy_access_key').on('input', function () {
         oai_settings.proxy_password = String($(this).val());
         saveSettingsDebounced();
+    });
+
+    $('#openai_proxy_access_key').on('copy cut', function (event) {
+        if ($(this).hasClass('masked-secret')) {
+            event.preventDefault();
+        }
     });
 
     $('#claude_assistant_prefill').on('input', function () {
@@ -9084,6 +9346,7 @@ export function initOpenAI() {
 
     $('#custom_model_id').on('input', function () {
         oai_settings.custom_model = String($(this).val());
+        updateCustomEndpointPreview();
         updateFeatureSupportFlags();
         saveSettingsDebounced();
     });
@@ -9307,6 +9570,7 @@ export function initOpenAI() {
     $('#api_button_openai').on('click', onConnectButtonClick);
     $('#openai_reverse_proxy').on('input', onReverseProxyInput);
     $('#model_openai_select').on('change', onModelChange);
+    $('#model_opencode_select').on('change', onModelChange);
     $('#model_claude_select').on('change', onModelChange);
     $('#model_google_select').on('change', onModelChange);
     $('#model_vertexai_select').on('change', onModelChange);
@@ -9323,10 +9587,24 @@ export function initOpenAI() {
         oai_settings.zai_endpoint = String($(this).val());
         saveSettingsDebounced();
     });
+    $('#opencode_endpoint').on('input', function () {
+        oai_settings.opencode_endpoint = String($(this).val());
+        saveSettingsDebounced();
+    });
+    $('#opencode_api_format').on('input', function () {
+        oai_settings.opencode_api_format = String($(this).val());
+        saveSettingsDebounced();
+    });
     $('#siliconflow_endpoint').on('input', function () {
         oai_settings.siliconflow_endpoint = String($(this).val());
         saveSettingsDebounced();
     });
+    $('#pollinations_endpoint').on('input', function () {
+        oai_settings.pollinations_endpoint = String($(this).val());
+        $('#pollinations_key_section').toggle(oai_settings.pollinations_endpoint === POLLINATIONS_ENDPOINT.AUTHENTICATED);
+        saveSettingsDebounced();
+    });
+
     $('#minimax_endpoint').on('input', function () {
         oai_settings.minimax_endpoint = String($(this).val());
         saveSettingsDebounced();
@@ -9405,7 +9683,7 @@ export function initOpenAI() {
     $('#openai_logit_bias_export_preset').on('click', onLogitBiasPresetExportClick);
     $('#openai_logit_bias_delete_preset').on('click', onLogitBiasPresetDeleteClick);
     $('#import_oai_preset').on('click', onImportPresetClick);
-    $('#openai_proxy_password_show').on('click', onProxyPasswordShowClick);
+    $('#openai_proxy_access_key_show').on('click', onProxyAccessKeyShowClick);
     $('#customize_additional_parameters').on('click', onCustomizeParametersClick);
     $('#openai_proxy_preset').on('change', onProxyPresetChange);
 }

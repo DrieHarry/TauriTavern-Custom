@@ -54,6 +54,7 @@ function normalizeMaterializedElement(result) {
  *   domAdapter: ChatDomAdapter;
  *   scrollAdapter: ReturnType<import('../../adapters/chat-surface/chat-scroll-adapter.js').createChatScrollAdapter>;
  *   participantRegistry: ReturnType<import('./participant-registry.js').createChatSurfaceParticipantRegistry>;
+ *   contentPreparation?: ReturnType<import('./content-preparation.js').createContentPreparation>;
  * }} deps
  */
 export function createChatSurfaceController({
@@ -62,6 +63,7 @@ export function createChatSurfaceController({
     domAdapter,
     scrollAdapter,
     participantRegistry,
+    contentPreparation,
 }) {
     if (typeof getMessages !== 'function' || typeof materializeMessage !== 'function') {
         throw new TypeError('ChatSurface requires getMessages and materializeMessage functions');
@@ -159,6 +161,20 @@ export function createChatSurfaceController({
         setFault,
     });
 
+    /** @param {HTMLElement} element @param {{ content: HTMLElement; commit: () => unknown }} transaction @param {{ transient?: boolean }} [options] */
+    function updateContent(element, transaction, { transient = false } = {}) {
+        const record = contentReconciler.resolve(element, transaction);
+        // An open message editor owns the draft; closing it renders the message.
+        if (record.contentElement.querySelector('.edit_textarea')) return record.element;
+        const ready = contentPreparation?.prepare({ message: record.message, messageId: record.messageId, content: transaction.content, transient }) ?? true;
+        return contentReconciler.commit(record, transaction, { notifyParticipants: !transient && ready });
+    }
+
+    /** @param {HTMLElement} element @param {{ content: HTMLElement; commit: () => unknown }} transaction */
+    function commitContent(element, transaction) {
+        return contentReconciler.commit(contentReconciler.resolve(element, transaction), transaction);
+    }
+
     /** @param {HTMLElement[]} elements */
     function reconcileExternalRemovals(elements) {
         if (faults.current) {
@@ -232,6 +248,7 @@ export function createChatSurfaceController({
         materializeOptionsByMessageId = new Map(),
     }) {
         const nextProjection = createChatProjection(indices, { count: messages.length });
+        contentPreparation?.reconcile(messages);
         const replacements = new Set(replaceMessageIds);
         const sameProjection = replacements.size === 0
             && residencies.size === nextProjection.indices.length
@@ -250,7 +267,7 @@ export function createChatSurfaceController({
             for (const messageId of nextProjection.indices) {
                 residencies.getByMessageId(messageId).message = messages[messageId];
             }
-            domAdapter.syncLastMessage(messages.length - 1);
+            domAdapter.syncChatEnd(messages.length - 1);
             assertHealthy();
             return;
         }
@@ -305,7 +322,9 @@ export function createChatSurfaceController({
                 };
                 desired.push({ record, messageId, message });
                 added.push(record);
-                prepared.push(item);
+                if (!contentPreparation || contentPreparation.prepare({ message, messageId, content, transient: materializeOptionsByMessageId.get(messageId)?.transient })) {
+                    prepared.push(item);
+                }
             }
             participants.prepare(prepared);
         } catch (error) {
@@ -342,10 +361,11 @@ export function createChatSurfaceController({
 
         structure = nextStructure;
         projection = nextProjection;
-        domAdapter.syncLastMessage(messages.length - 1);
+        domAdapter.syncChatEnd(messages.length - 1);
         try {
             assertCommittedResidencies(residencies, projection, domAdapter);
-            participants.connected(prepared, ['didMount', 'didCommitContent']);
+            participants.connected(added.map(record => ({ record })), ['didMount']);
+            participants.connected(prepared, ['didCommitContent']);
             runtimeAdmission.register(participants.runtimeCandidates(prepared));
             assertCommittedResidencies(residencies, projection, domAdapter);
             assertHealthy();
@@ -381,6 +401,7 @@ export function createChatSurfaceController({
 
     /** @param {{ includeAuxiliary?: boolean }} [options] */
     function resetEpoch({ includeAuxiliary = false } = {}) {
+        contentPreparation?.reset();
         try {
             closeMessageResidencies([...residencies.values()].reverse(), 'epoch-reset');
             if (participantList) {
@@ -460,7 +481,8 @@ export function createChatSurfaceController({
         reconcileMounted: guardMutation('reconcileMounted', projectionEntrypoints.reconcileMounted),
         reconcileExternalRemovals: guardMutation('reconcileExternalRemovals', reconcileExternalRemovals),
         remountMessage: guardMutation('remountMessage', remountMessage),
-        updateContent: guardMutation('updateContent', contentReconciler.update),
+        updateContent: guardMutation('updateContent', updateContent),
+        commitContent: guardMutation('commitContent', commitContent),
         resetEpoch: guardMutation('resetEpoch', resetEpoch),
         configureRuntimeAdmission: guardMutation('configureRuntimeAdmission', configureRuntimeAdmission),
         setRuntimeDemand: guardMutation('setRuntimeDemand', setRuntimeDemand),

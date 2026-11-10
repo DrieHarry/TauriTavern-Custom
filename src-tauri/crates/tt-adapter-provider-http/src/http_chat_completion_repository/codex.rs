@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use reqwest::header::ACCEPT;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
+use tt_adapter_http::upstream;
 use tt_domain::errors::DomainError;
 use tt_ports::repositories::chat_completion_repository::{
     ChatCompletionApiConfig, ChatCompletionCancelReceiver,
@@ -50,9 +51,7 @@ pub(super) async fn list_models(
         .header(ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|error| {
-            HttpChatCompletionRepository::map_transport_error("Codex model lookup failed", error)
-        })?;
+        .map_err(upstream::request_failure)?;
 
     if !response.status().is_success() {
         return Err(HttpChatCompletionRepository::map_error_response(
@@ -155,12 +154,7 @@ pub(super) async fn generate(
         .json(&request_body)
         .send()
         .await
-        .map_err(|error| {
-            HttpChatCompletionRepository::map_transport_error(
-                "Codex chat completion request failed",
-                error,
-            )
-        })?;
+        .map_err(upstream::request_failure)?;
 
     if !response.status().is_success() {
         return Err(HttpChatCompletionRepository::map_error_response(
@@ -203,12 +197,7 @@ pub(super) async fn generate_stream(
         .json(&request_body)
         .send();
     let response = tokio::select! {
-        response = send => response.map_err(|error| {
-            HttpChatCompletionRepository::map_transport_error(
-                "Codex chat completion request failed",
-                error,
-            )
-        })?,
+        response = send => response.map_err(upstream::request_failure)?,
         changed = cancel.changed() => {
             let _ = changed;
             return Ok(());

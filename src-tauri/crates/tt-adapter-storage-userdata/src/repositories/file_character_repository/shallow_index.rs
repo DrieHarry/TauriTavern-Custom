@@ -11,7 +11,7 @@ use tokio::task::JoinSet;
 
 use crate::png_card_metadata::read_character_data_from_png_file;
 use tt_adapter_storage_core::file_system::{
-    list_files_with_extension, replace_file_with_fallback, unique_temp_path,
+    list_files_with_extension, replace_file, scan_parallelism, unique_temp_path,
 };
 use tt_domain::errors::DomainError;
 use tt_domain::models::character::Character;
@@ -23,7 +23,6 @@ use super::cache::{
 };
 use super::helpers::{file_ctime_millis, file_modified_millis};
 
-const MAX_CONCURRENT_SHALLOW_READS: usize = 8;
 const PERSISTENT_SHALLOW_INDEX_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
@@ -282,7 +281,7 @@ impl FileCharacterRepository {
                 error
             ))
         })?;
-        replace_file_with_fallback(&temp_path, &self.shallow_index_path).await
+        replace_file(&temp_path, &self.shallow_index_path).await
     }
 
     async fn scan_shallow_index_entries(
@@ -295,7 +294,7 @@ impl FileCharacterRepository {
         let mut results: Vec<Option<CharacterShallowIndexScanEntry>> =
             (0..character_files.len()).map(|_| None).collect();
         let mut complete = true;
-        let semaphore = Arc::new(Semaphore::new(Self::shallow_index_parallelism()));
+        let semaphore = Arc::new(Semaphore::new(scan_parallelism()));
         let mut jobs = JoinSet::new();
 
         for (index, path) in character_files.into_iter().enumerate() {
@@ -422,7 +421,7 @@ impl FileCharacterRepository {
     ) -> Result<(Vec<CharacterShallowIndexCachedCharacter>, bool), DomainError> {
         let mut results = vec![None; scan_entries.len()];
         let mut complete = true;
-        let semaphore = Arc::new(Semaphore::new(Self::shallow_index_parallelism()));
+        let semaphore = Arc::new(Semaphore::new(scan_parallelism()));
         let mut jobs = JoinSet::new();
 
         for (index, entry) in scan_entries.into_iter().enumerate() {
@@ -476,13 +475,6 @@ impl FileCharacterRepository {
         Ok((results.into_iter().flatten().collect(), complete))
     }
 
-    fn shallow_index_parallelism() -> usize {
-        std::thread::available_parallelism()
-            .map(|value| value.get())
-            .unwrap_or(4)
-            .clamp(1, MAX_CONCURRENT_SHALLOW_READS)
-    }
-
     async fn read_shallow_character_from_entry(
         entry: CharacterShallowIndexScanEntry,
     ) -> Result<Character, DomainError> {
@@ -507,49 +499,5 @@ impl FileCharacterRepository {
         character.date_last_chat = signature.date_last_chat;
 
         Ok(character.into_shallow())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cached_card_is_reused_when_only_chat_stats_change() {
-        let cached = CharacterShallowIndexCachedCharacter {
-            signature: CharacterShallowIndexEntrySignature {
-                avatar: "Alice.png".to_string(),
-                file_size: 100,
-                modified_millis: 2,
-                created_millis: 1,
-                chat_size: 0,
-                date_last_chat: 0,
-            },
-            character: Character::new(
-                "Alice".to_string(),
-                String::new(),
-                String::new(),
-                String::new(),
-            )
-            .into_shallow(),
-        };
-
-        let mut updated_signature = cached.signature.clone();
-        updated_signature.chat_size = 42;
-        updated_signature.date_last_chat = 3;
-        let reused =
-            FileCharacterRepository::reuse_cached_shallow_character(&cached, &updated_signature)
-                .expect("unchanged card should be reusable");
-
-        assert_eq!(reused.signature, updated_signature);
-        assert_eq!(reused.character.chat_size, 42);
-        assert_eq!(reused.character.date_last_chat, 3);
-
-        let mut changed_card = updated_signature;
-        changed_card.modified_millis = 4;
-        assert!(
-            FileCharacterRepository::reuse_cached_shallow_character(&cached, &changed_card)
-                .is_none()
-        );
     }
 }

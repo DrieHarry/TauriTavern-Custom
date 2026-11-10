@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { subscribe } from '@parcel/watcher';
 import { rspack } from '@rspack/core';
 
 import { createRspackConfigs } from '../rspack.config.js';
@@ -9,11 +10,13 @@ import { createRspackConfigs } from '../rspack.config.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const frontendRoot = path.resolve(__dirname, '..', 'src');
-const port = 1430;
+const tauriConfigPath = path.resolve(__dirname, '..', 'src-tauri', 'crates', 'tauritavern', 'tauri.conf.json');
+const devUrl = new URL(JSON.parse(fs.readFileSync(tauriConfigPath, 'utf8')).build.devUrl);
+const port = Number(devUrl.port);
 const reloadPath = '/__tauritavern_dev_reload';
 const reloadHost = process.env.TAURI_DEV_HOST || 'localhost';
 const reloadUrl = `http://${formatUrlHost(reloadHost)}:${port}${reloadPath}`;
-const devServiceWorkerBootstrap = '<script src="/dev-sw-bootstrap.js"></script>';
+const devServiceWorkerBootstrap = `<script src="/dev-sw-bootstrap.js" data-dev-server-origin="${devUrl.origin}"></script>`;
 const rspackConfigs = createRspackConfigs('development');
 const bundleOutputRoots = rspackConfigs.map(config => config.output.path);
 
@@ -56,7 +59,6 @@ const mimeTypes = new Map([
 const reloadClients = new Set();
 const bundledFiles = new Set();
 let reloadTimer;
-let watcherRefreshTimer;
 let closeBundleWatcher;
 let closeFrontendWatcher;
 let shuttingDown = false;
@@ -87,7 +89,7 @@ function contentType(filePath) {
 
 function isReloadEntryDocument(filePath) {
     const relativePath = path.relative(frontendRoot, filePath).split(path.sep).join('/');
-    return relativePath === 'index.html' || relativePath === 'login.html';
+    return relativePath === 'index.html';
 }
 
 async function resolveStaticFile(requestUrl) {
@@ -218,62 +220,20 @@ function scheduleReload() {
     }, 80);
 }
 
-function handleFrontendChange(filePath) {
-    if (!filePath || !isRspackOwned(filePath)) {
-        scheduleReload();
-    }
-}
-
-function watchTree(root) {
-    const watchers = new Map();
-
-    const watchDirectory = (directory) => {
-        if (watchers.has(directory)) {
+async function watchFrontend() {
+    // The native Windows backend excludes last-access notifications.
+    const watcher = await subscribe(frontendRoot, (error, events) => {
+        if (error) {
+            console.error(error);
+            void shutdown(1);
             return;
         }
-
-        const watcher = fs.watch(directory, (eventType, filename) => {
-            handleFrontendChange(filename ? path.join(directory, filename) : null);
-            if (eventType === 'rename') {
-                scheduleWatcherRefresh();
-            }
-        });
-        watchers.set(directory, watcher);
-    };
-
-    const scan = (directory) => {
-        watchDirectory(directory);
-        for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-            if (entry.isDirectory()) {
-                scan(path.join(directory, entry.name));
-            }
+        if (events.some(event => !isRspackOwned(event.path))) {
+            scheduleReload();
         }
-    };
+    });
 
-    const scheduleWatcherRefresh = () => {
-        clearTimeout(watcherRefreshTimer);
-        watcherRefreshTimer = setTimeout(() => scan(root), 200);
-    };
-
-    scan(root);
-
-    return () => {
-        for (const watcher of watchers.values()) {
-            watcher.close();
-        }
-        watchers.clear();
-    };
-}
-
-function watchFrontend() {
-    try {
-        const watcher = fs.watch(frontendRoot, { recursive: true }, (_eventType, filename) => {
-            handleFrontendChange(filename ? path.join(frontendRoot, filename) : null);
-        });
-        return () => watcher.close();
-    } catch {
-        return watchTree(frontendRoot);
-    }
+    return () => watcher.unsubscribe();
 }
 
 function rememberBundleDependencies(stats) {
@@ -372,9 +332,8 @@ async function shutdown(exitCode = 0) {
     }
     shuttingDown = true;
 
-    closeFrontendWatcher();
+    await closeFrontendWatcher();
     clearTimeout(reloadTimer);
-    clearTimeout(watcherRefreshTimer);
     for (const client of reloadClients) {
         client.end();
     }
@@ -389,9 +348,14 @@ process.on('SIGTERM', () => void shutdown());
 
 async function main() {
     closeBundleWatcher = await startBundleWatch();
-    closeFrontendWatcher = watchFrontend();
+    try {
+        closeFrontendWatcher = await watchFrontend();
+    } catch (error) {
+        await closeBundleWatcher();
+        throw error;
+    }
     server.listen(port, () => {
-        console.log(`TauriTavern frontend dev server listening on http://localhost:${port}`);
+        console.log(`TauriTavern frontend dev server listening on ${devUrl.origin}`);
         console.log(`TauriTavern reload endpoint advertised as ${reloadUrl}`);
     });
 }

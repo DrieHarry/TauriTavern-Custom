@@ -1,6 +1,8 @@
+import { setAriaRelation } from './dom-handlers.js';
 import dialogPolyfill from '../lib/dialog-polyfill.esm.js';
 import { shouldSendOnEnter } from './RossAscends-mods.js';
 import { t } from './i18n.js';
+import { isControlDisabled } from './legacy-controls.js';
 import { power_user, toastPositionClasses } from './power-user.js';
 import { clamp, removeFromArray, runAfterAnimation, uuidv4 } from './utils.js';
 
@@ -38,6 +40,9 @@ export const POPUP_RESULT = {
 
 /**
  * @typedef {object} PopupOptions
+ * @property {string|HTMLElement} [label] - Accessible name, or an explicit title element inside this popup whose text supplies its name.
+ * @property {string|HTMLElement} [inputLabel] - Name or visible label for the main input.
+ * @property {string|HTMLElement} [inputDescription] - Instructions or a visible description for the main input.
  * @property {string|boolean?} [okButton=null] - Custom text for the OK button. A set text will always show the button. `true` or `false` to explicitly show or hide the button. `null` will leave the behavior and display of the button unchanged, based on the popup type.
  * @property {string|boolean?} [cancelButton=null] - Custom text for the Cancel button. A set text will always show the button. `true` or `false` to explicitly show or hide the button. `null` will leave the behavior and display of the button unchanged, based on the popup type.
  * @property {number?} [rows=1] - The number of rows for the input field
@@ -85,6 +90,7 @@ export const POPUP_RESULT = {
  * @property {number?} [max] - The maximum value for number inputs
  * @property {number?} [step] - The step value for number inputs
  * @property {boolean?} [disabled=false] - Whether the input should be disabled
+ * @property {boolean?} [autoFocus=false] - Whether this input should be auto-focused when the popup opens
  */
 
 /**
@@ -106,6 +112,7 @@ const showPopupHelper = {
     input: async (header, text, defaultValue = '', popupOptions = {}) => {
         const content = PopupUtils.BuildTextWithHeader(header, text);
         const popup = new Popup(content, POPUP_TYPE.INPUT, defaultValue, popupOptions);
+        if (header && popupOptions.label === undefined) setPopupText(popup, popup.dlg, 'label', popup.content.firstElementChild);
         const value = await popup.show();
         // Return values: If empty string, we explicitly handle that as returning that empty string as "success" provided.
         // Otherwise, all non-truthy values (false, null, undefined) are treated as "cancel" and return null.
@@ -124,6 +131,7 @@ const showPopupHelper = {
     confirm: async (header, text, popupOptions = {}) => {
         const content = PopupUtils.BuildTextWithHeader(header, text);
         const popup = new Popup(content, POPUP_TYPE.CONFIRM, null, popupOptions);
+        if (header && popupOptions.label === undefined) setPopupText(popup, popup.dlg, 'label', popup.content.firstElementChild);
         const result = await popup.show();
         if (typeof result === 'string' || typeof result === 'boolean') throw new Error(`Invalid popup result. CONFIRM popups only support numbers, or null. Result: ${result}`);
         return result;
@@ -139,11 +147,37 @@ const showPopupHelper = {
     text: async (header, text, popupOptions = {}) => {
         const content = PopupUtils.BuildTextWithHeader(header, text);
         const popup = new Popup(content, POPUP_TYPE.TEXT, null, popupOptions);
+        if (header && popupOptions.label === undefined) setPopupText(popup, popup.dlg, 'label', popup.content.firstElementChild);
         const result = await popup.show();
         if (typeof result === 'string' || typeof result === 'boolean') throw new Error(`Invalid popup result. TEXT popups only support numbers, or null. Result: ${result}`);
         return result;
     },
 };
+
+/** @param {Popup} popup @param {HTMLElement} target @param {'label'|'description'} kind @param {string|Element} [text] */
+function setPopupText(popup, target, kind, text) {
+    if (text === undefined) return;
+    const attribute = `aria-${kind}`;
+    const relation = kind === 'label' ? 'labelledby' : 'describedby';
+    if (typeof text === 'string') {
+        target.setAttribute(attribute, text);
+        target.removeAttribute(`aria-${relation}`);
+    } else if (text instanceof HTMLElement && popup.dlg.contains(text)) {
+        setAriaRelation(target, relation, text);
+        target.removeAttribute(attribute);
+    } else {
+        throw new Error(`Popup ${kind} must be a string or an element inside this popup.`);
+    }
+}
+
+/** @param {string|number|null|undefined} value @returns {number|null|undefined} */
+function parsePopupResult(value) {
+    if (value === undefined || value === 'undefined') return undefined;
+    if (value === null || value === 'null') return null;
+    const result = Number(value);
+    if (Number.isNaN(result)) throw new Error('Invalid result control. Result must be a number. ' + value);
+    return result;
+}
 
 const POPUP_TEMPLATE_FALLBACK_HTML = `
     <dialog class="popup">
@@ -157,11 +191,11 @@ const POPUP_TEMPLATE_FALLBACK_HTML = `
             <textarea class="popup-input text_pole result-control auto-select" rows="1" data-result="1" data-result-event="submit"></textarea>
             <div class="popup-inputs"></div>
             <div class="popup-controls">
-                <div class="popup-button-ok menu_button result-control" data-result="1" data-i18n="Delete">Delete</div>
-                <div class="popup-button-cancel menu_button result-control" data-result="0" data-i18n="Cancel">Cancel</div>
+                <button type="button" class="popup-button-ok menu_button result-control" data-result="1" data-i18n="Delete">Delete</button>
+                <button type="button" class="popup-button-cancel menu_button result-control" data-result="0" data-i18n="Cancel">Cancel</button>
             </div>
         </div>
-        <div class="popup-button-close right_menu_button fa-solid fa-circle-xmark" data-result="0" title="Close popup" data-i18n="[title]Close popup"></div>
+        <button type="button" class="popup-button-close right_menu_button fa-solid fa-circle-xmark" data-result="0" title="Close popup" aria-label="Close popup" data-i18n="[title]Close popup;[aria-label]Close popup"></button>
     </dialog>
 `;
 
@@ -220,9 +254,9 @@ export class Popup {
     /** @readonly @type {HTMLTextAreaElement} */ mainInput;
     /** @readonly @type {HTMLDivElement} */ inputControls;
     /** @readonly @type {HTMLDivElement} */ buttonControls;
-    /** @readonly @type {HTMLDivElement} */ okButton;
-    /** @readonly @type {HTMLDivElement} */ cancelButton;
-    /** @readonly @type {HTMLDivElement} */ closeButton;
+    /** @readonly @type {HTMLButtonElement} */ okButton;
+    /** @readonly @type {HTMLButtonElement} */ cancelButton;
+    /** @readonly @type {HTMLButtonElement} */ closeButton;
     /** @readonly @type {HTMLDivElement} */ cropWrap;
     /** @readonly @type {HTMLImageElement} */ cropImage;
     /** @readonly @type {POPUP_RESULT|number?} */ defaultResult;
@@ -244,6 +278,7 @@ export class Popup {
     /** @type {(result: any) => any} */ #resolver;
     /** @type {boolean} */ #allowEscapeClose;
     /** @type {boolean} */ #isClosingPrevented;
+    /** @type {boolean} */ #isCompleting = false;
     /** @type {number} */ #lastEscapePress = 0;
     /** @type {boolean} */ #isShowingForceCloseConfirm = false;
 
@@ -256,6 +291,9 @@ export class Popup {
      * @param {PopupOptions} [options={}] - Additional options for the popup
      */
     constructor(content, type, inputValue = '', {
+        label,
+        inputLabel,
+        inputDescription,
         okButton = null,
         cancelButton = null,
         rows = 1,
@@ -347,11 +385,11 @@ export class Popup {
             /** @type {CustomPopupButton} */
             const button = typeof x === 'string' ? { text: x, result: index + 2 } : x;
 
-            const buttonElement = document.createElement('div');
+            const buttonElement = document.createElement('button');
+            buttonElement.type = 'button';
             buttonElement.classList.add('menu_button', 'popup-button-custom', 'result-control');
             buttonElement.classList.add(...(button.classes ?? []));
-            buttonElement.dataset.result = String(button.result); // This is expected to also write 'null' or 'staging', to indicate cancel and no action respectively
-            buttonElement.tabIndex = 0;
+            buttonElement.dataset.result = String(button.result); // 'null' cancels; 'undefined' leaves completion to the action.
 
             if (button.icon) {
                 const icon = document.createElement('i');
@@ -395,6 +433,7 @@ export class Popup {
                 inputElement.id = input.id;
                 inputElement.checked = Boolean(input.defaultState ?? false);
                 inputElement.disabled = Boolean(input.disabled ?? false);
+                if (input.autoFocus) { inputElement.setAttribute('autofocus', ''); inputElement.tabIndex = 0; }
                 label.appendChild(inputElement);
                 const labelText = document.createElement('span');
                 labelText.innerText = input.label;
@@ -421,6 +460,7 @@ export class Popup {
                 inputElement.value = String(input.defaultState ?? '');
                 inputElement.placeholder = input.tooltip ?? '';
                 inputElement.disabled = Boolean(input.disabled ?? false);
+                if (input.autoFocus) { inputElement.setAttribute('autofocus', ''); inputElement.tabIndex = 0; }
                 setTitleFromTooltip(inputElement, input.tooltip);
 
                 const labelText = document.createElement('span');
@@ -443,6 +483,7 @@ export class Popup {
                 inputElement.rows = input.rows ?? 1;
                 inputElement.placeholder = input.tooltip ?? '';
                 inputElement.disabled = Boolean(input.disabled ?? false);
+                if (input.autoFocus) { inputElement.setAttribute('autofocus', ''); inputElement.tabIndex = 0; }
                 setTitleFromTooltip(inputElement, input.tooltip);
 
                 const labelText = document.createElement('span');
@@ -468,6 +509,7 @@ export class Popup {
                 inputElement.max = String(input.max ?? '');
                 inputElement.step = String(input.step ?? '');
                 inputElement.disabled = Boolean(input.disabled ?? false);
+                if (input.autoFocus) { inputElement.setAttribute('autofocus', ''); inputElement.tabIndex = 0; }
                 setTitleFromTooltip(inputElement, input.tooltip);
 
                 inputElement.addEventListener('change', () => {
@@ -586,6 +628,9 @@ export class Popup {
         } else {
             console.warn('Unknown popup text type. Should be jQuery, HTMLElement or string.', content);
         }
+        setPopupText(this, this.dlg, 'label', label);
+        setPopupText(this, this.mainInput, 'label', inputLabel);
+        setPopupText(this, this.mainInput, 'description', inputDescription);
 
         // Already prepare the auto-focus control by adding the "autofocus" attribute, this should be respected by showModal()
         this.setAutoFocus({ applyAutoFocus: true });
@@ -593,18 +638,28 @@ export class Popup {
         // Set focus event that remembers the focused element
         this.dlg.addEventListener('focusin', (evt) => { if (evt.target instanceof HTMLElement && evt.target != this.dlg) this.lastFocus = evt.target; });
 
-        // Bind event listeners for all result controls to their defined event type
+        // Input submission must not bypass a disabled result button.
+        const isResultDisabled = (control, result) => {
+            if (isControlDisabled(control)) return true;
+            if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
+                const button = this.buttonControls.querySelector(`[data-result="${result}"]`);
+                return button instanceof HTMLElement && isControlDisabled(button);
+            }
+            return false;
+        };
+
+        // Only data-result controls opt into Popup's action/complete handling.
         this.dlg.querySelectorAll('[data-result]').forEach(resultControl => {
             if (!(resultControl instanceof HTMLElement)) return;
-            // If no value was set, we exit out and don't bind an action
-            if (String(resultControl.dataset.result) === String(undefined)) return;
-
-            // Make sure that both `POPUP_RESULT` numbers and also `null` as 'cancelled' are supported
-            const result = String(resultControl.dataset.result) === String(null) ? null
-                : Number(resultControl.dataset.result);
-
-            if (result !== null && isNaN(result)) throw new Error('Invalid result control. Result must be a number. ' + resultControl.dataset.result);
+            const result = parsePopupResult(resultControl.dataset.result);
             const type = resultControl.dataset.resultEvent || 'click';
+            // Capture runs before custom actions, including action-only buttons.
+            resultControl.addEventListener(type, event => {
+                if (!isResultDisabled(resultControl, result)) return;
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }, { capture: true });
+            if (result === undefined) return;
             resultControl.addEventListener(type, async () => await this.complete(result));
         });
 
@@ -680,47 +735,33 @@ export class Popup {
         this.dlg.addEventListener('close', closeListener.bind(this));
 
         const keyListener = async (evt) => {
-            switch (evt.key) {
-                case 'Enter': {
-                    // CTRL+Enter counts as a closing action, but all other modifiers (ALT, SHIFT) should not trigger this
-                    if (evt.altKey || evt.shiftKey)
-                        return;
+            if (evt.key !== 'Enter' || evt.defaultPrevented || evt.isComposing || evt.keyCode === 229
+                || evt.altKey || evt.shiftKey) return;
 
-                    // Check if we are the currently active popup
-                    if (this.dlg != document.activeElement?.closest('.popup'))
-                        return;
+            const control = document.activeElement;
+            if (!(control instanceof HTMLElement) || evt.target !== control
+                || control.closest('.popup') !== this.dlg || !control.matches('.result-control')) return;
 
-                    // Check if the current focus is a result control. Only should we apply the complete action
-                    const resultControl = document.activeElement?.closest('.result-control');
-                    if (!resultControl)
-                        return;
-
-                    // Check if we are inside an input type text or a textarea field and send on enter is disabled
-                    const textarea = document.activeElement?.closest('textarea');
-                    if (textarea instanceof HTMLTextAreaElement && !shouldSendOnEnter())
-                        return;
-                    const input = document.activeElement?.closest('input[type="text"]');
-                    if (input instanceof HTMLInputElement && !shouldSendOnEnter())
-                        return;
-
-                    // If this is a multiline input popup, we should still not simply send on enter, that'd be weird.
-                    // Let's still make it possible if CTRL is toggled though
-                    if ((textarea instanceof HTMLTextAreaElement || input instanceof HTMLInputElement)
-                        && !evt.ctrlKey && this.mainInput.rows > 1) {
-                        return;
-                    }
-
-                    evt.preventDefault();
-                    evt.stopPropagation();
-                    const result = Number(document.activeElement.getAttribute('data-result') ?? this.defaultResult);
-
-                    // Call complete on the popup. Make sure that we handle `onClosing` cancels correctly and don't remove the listener then.
-                    await this.complete(result);
-
-                    break;
-                }
+            // Native controls activate themselves. Legacy result actions still use their click path.
+            const isInput = control instanceof HTMLTextAreaElement
+                || (control instanceof HTMLInputElement && !['button', 'submit', 'reset', 'image', 'checkbox', 'radio'].includes(control.type));
+            if (!isInput) {
+                if (control.matches('button, input, select, a[href], summary') || control.isContentEditable) return;
+                evt.preventDefault();
+                evt.stopPropagation();
+                if (!isControlDisabled(control)) control.click();
+                return;
             }
 
+            const isText = control instanceof HTMLTextAreaElement
+                || (control instanceof HTMLInputElement && control.type === 'text');
+            if (isText && (!shouldSendOnEnter() || (!evt.ctrlKey && this.mainInput.rows > 1))) return;
+
+            const result = parsePopupResult(control.dataset.result ?? this.defaultResult);
+            if (result === undefined) return;
+            evt.preventDefault();
+            evt.stopPropagation();
+            if (!isResultDisabled(control, result)) await this.complete(result);
         };
         this.dlg.addEventListener('keydown', keyListener.bind(this));
     }
@@ -808,53 +849,60 @@ export class Popup {
      * @returns {Promise<string|number|boolean|undefined?>} A promise that resolves with the value of the popup when it is completed. <b>Returns `undefined` if the closing action was cancelled.</b>
      */
     async complete(result) {
-        // In all cases besides INPUT the popup value should be the result
-        /** @type {POPUP_RESULT|number|boolean|string?} */
-        let value = result;
-        // Input type have special results, so the input can be accessed directly without the need to save the popup and access both result and value
-        if (this.type === POPUP_TYPE.INPUT) {
-            if (result >= POPUP_RESULT.AFFIRMATIVE) value = this.mainInput.value;
-            else if (result === POPUP_RESULT.NEGATIVE) value = false;
-            else if (result === POPUP_RESULT.CANCELLED) value = null;
-            else value = false; // Might a custom negative value?
-        }
-
-        // Cropped image should be returned as a data URL
-        if (this.type === POPUP_TYPE.CROP) {
-            value = result >= POPUP_RESULT.AFFIRMATIVE
-                ? $(this.cropImage).data('cropper').getCroppedCanvas().toDataURL('image/jpeg')
-                : null;
-        }
-
-        if (this.customInputs?.length) {
-            this.inputResults = new Map(this.customInputs.map(input => {
-                /** @type {HTMLInputElement} */
-                const inputControl = this.dlg.querySelector(`#${input.id}`);
-                const value = ['text', 'textarea', 'number'].includes(input.type) ? inputControl.value : inputControl.checked;
-                return [inputControl.id, value];
-            }));
-        }
-
-        this.value = value;
-        this.result = result;
-
-        if (this.onClosing) {
-            const shouldClose = await this.onClosing(this);
-            if (!shouldClose) {
-                this.#isClosingPrevented = true;
-                // Set values back if we cancel out of closing the popup
-                this.value = undefined;
-                this.result = undefined;
-                this.inputResults = undefined;
-                return undefined;
+        // Keep the first result intact until asynchronous validation and closing finish.
+        if (this.#isCompleting) return undefined;
+        this.#isCompleting = true;
+        try {
+            // In all cases besides INPUT the popup value should be the result
+            /** @type {POPUP_RESULT|number|boolean|string?} */
+            let value = result;
+            // Input type have special results, so the input can be accessed directly without the need to save the popup and access both result and value
+            if (this.type === POPUP_TYPE.INPUT) {
+                if (result >= POPUP_RESULT.AFFIRMATIVE) value = this.mainInput.value;
+                else if (result === POPUP_RESULT.NEGATIVE) value = false;
+                else if (result === POPUP_RESULT.CANCELLED) value = null;
+                else value = false; // Might a custom negative value?
             }
+
+            // Cropped image should be returned as a data URL
+            if (this.type === POPUP_TYPE.CROP) {
+                value = result >= POPUP_RESULT.AFFIRMATIVE
+                    ? $(this.cropImage).data('cropper').getCroppedCanvas().toDataURL('image/jpeg')
+                    : null;
+            }
+
+            if (this.customInputs?.length) {
+                this.inputResults = new Map(this.customInputs.map(input => {
+                    /** @type {HTMLInputElement} */
+                    const inputControl = this.dlg.querySelector(`#${input.id}`);
+                    const value = ['text', 'textarea', 'number'].includes(input.type) ? inputControl.value : inputControl.checked;
+                    return [inputControl.id, value];
+                }));
+            }
+
+            this.value = value;
+            this.result = result;
+
+            if (this.onClosing) {
+                const shouldClose = await this.onClosing(this);
+                if (!shouldClose) {
+                    this.#isClosingPrevented = true;
+                    // Set values back if we cancel out of closing the popup
+                    this.value = undefined;
+                    this.result = undefined;
+                    this.inputResults = undefined;
+                    return undefined;
+                }
+            }
+            this.#isClosingPrevented = false;
+
+            Popup.util.lastResult = { value, result, inputResults: this.inputResults };
+            this.#hide();
+
+            return await this.#promise;
+        } finally {
+            this.#isCompleting = false;
         }
-        this.#isClosingPrevented = false;
-
-        Popup.util.lastResult = { value, result, inputResults: this.inputResults };
-        this.#hide();
-
-        return this.#promise;
     }
     async completeAffirmative() {
         return await this.complete(POPUP_RESULT.AFFIRMATIVE);

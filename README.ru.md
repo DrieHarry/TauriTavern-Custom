@@ -22,6 +22,8 @@
 
 </div>
 
+<p align="center"><sub>Спасибо <a href="https://github.com/shiyue137">@shiyue137</a> за логотип TauriTavern 💛</sub></p>
+
 ## Скачать
 
 <div align="center">
@@ -35,6 +37,7 @@
 [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat-square)](https://tauritavern.github.io/en/downloads/platforms/)
 [![Android](https://img.shields.io/badge/Android-3DDC84?logo=android&logoColor=white&style=flat-square)](https://tauritavern.github.io/en/downloads/platforms/)
 [![iOS TestFlight](https://img.shields.io/badge/iOS-TestFlight-0D96F6?logo=apple&logoColor=white&style=flat-square)](https://testflight.apple.com/join/gpqAdeTm)
+[![HarmonyOS Beta](https://img.shields.io/badge/HarmonyOS-Beta-000000?logo=harmonyos&logoColor=white&style=flat-square)](https://tauritavern.github.io/en/downloads/platforms/)
 
 [Все платформы](https://tauritavern.github.io/en/downloads/platforms/) · [Релизы на GitHub](https://github.com/Darkatse/TauriTavern/releases)
 
@@ -42,6 +45,14 @@
 
 <details>
 <summary><b>📦 Установка через менеджер пакетов</b> (Windows · macOS · Linux)</summary>
+
+### Windows · WinGet
+
+Выполните в PowerShell:
+
+```powershell
+winget install --id TauriTavern.TauriTavern
+```
 
 ### Windows · Scoop
 
@@ -79,7 +90,7 @@ yay -S tauritavern-bin
 **Стабильная версия**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Darkatse/TauriTavern/main/scripts/install-linux.sh | sh
+curl -fsSL https://get.tauritavern.com/linux.sh | sh
 ```
 
 **Nix / NixOS**
@@ -113,7 +124,7 @@ Canary обновляется ежедневно и включает новые 
 **Linux**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Darkatse/TauriTavern/main/scripts/install-linux.sh \
+curl -fsSL https://get.tauritavern.com/linux.sh \
   | sh -s -- --channel canary
 ```
 
@@ -126,13 +137,17 @@ nix profile add github:Darkatse/TauriTavern/Canary#canary
 </details>
 
 > [!TIP]
-> **iOS**: установите приложение через [открытое тестирование в TestFlight](https://testflight.apple.com/join/gpqAdeTm). Требуется iOS 16 или новее. На тестовые сборки распространяются правила и ограничения TestFlight.
+> **iOS**: установите приложение через [открытое тестирование в TestFlight](https://testflight.apple.com/join/gpqAdeTm). Требуется iOS 15.0 или новее. Для iOS 15.0–16.3 предоставляется ограниченная поддержка; полная поддержка начинается с iOS 16.4. На тестовые сборки распространяются правила и ограничения TestFlight.
 >
 > **Портативная версия для Windows**: в системе должен быть установлен WebView2 Runtime.
+>
+> **HarmonyOS (бета)**: HAP в релизах предназначен для HarmonyOS NEXT. Перед установкой подпишите его своим сертификатом; рекомендуем [Auto-Installer](https://github.com/likuai2010/auto-installer/). Пока он тестировался только на эмуляторе.
+>
+> **Если приложение не открывается**: закройте и снова откройте TauriTavern 5 раз подряд в течение 3 минут — приложение спросит, включить ли безопасный режим.
 
 ## Что такое TauriTavern
 
-TauriTavern переносит [SillyTavern](https://github.com/SillyTavern/SillyTavern) в нативное приложение. Фронтенд сохраняет возможности исходного проекта и синхронизирован с версией 1.18.0, а бэкенд переписан с Node.js на Rust с использованием Tauri v2.
+TauriTavern переносит [SillyTavern](https://github.com/SillyTavern/SillyTavern) в нативное приложение. Фронтенд сохраняет возможности исходного проекта и синхронизирован с версией 1.19.0, а бэкенд переписан с Node.js на Rust с использованием Tauri v2.
 
 Устанавливать Node.js и работать с командной строкой не нужно: достаточно скачать и запустить приложение. Карточки персонажей, чаты, пресеты, информация о мире и расширения фронтенда совместимы с SillyTavern.
 
@@ -140,13 +155,13 @@ TauriTavern переносит [SillyTavern](https://github.com/SillyTavern/Sill
 
 ## Основные возможности
 
-- 🖥️ **Пять нативных платформ**: Windows, macOS, Linux, Android и iOS с единым пользовательским интерфейсом
-- 🎭 **Совместимость с SillyTavern**: фронтенд синхронизирован с версией 1.18.0, форматы данных и структура каталогов совместимы с исходным проектом
+- 🖥️ **Пять нативных платформ**: Windows, macOS, Linux, Android и iOS с единым пользовательским интерфейсом; нативная поддержка HarmonyOS пока в бета-версии
+- 🎭 **Совместимость с SillyTavern**: фронтенд синхронизирован с версией 1.19.0, форматы данных и структура каталогов совместимы с исходным проектом
 - 🧩 **Расширения фронтенда**: встроенный нативный Git позволяет устанавливать и обновлять расширения, а также переключать ветки прямо в интерфейсе (плагины бэкенда, рассчитанные только на Node.js, не поддерживаются)
 - 🔄 **Синхронизация между устройствами**: зашифрованное сопряжение по локальной сети или автоматическая отправка через удалённый TT-Sync v2
 - 🤖 **Agent Framework**: вызов инструментов, Skills, субагенты и временная шкала выполнения; разработка продолжается
 - 📦 **Перенос данных**: скрипты экспорта из SillyTavern и импорт внутри приложения
-- ⚡ **Работа с длинными чатами**: поэтапный запуск и загрузка только видимой части чата помогают интерфейсу сохранять отзывчивость
+- ⚡ **Работа с длинными чатами**: поэтапный запуск и виртуализация DOM чата сохраняют плавную работу интерфейса даже в очень длинных беседах
 - 🔒 **Данные остаются у вас**: всё хранится на устройстве; при необходимости доступен портативный режим
 
 ## Снимки экрана
@@ -189,11 +204,13 @@ pnpm run ios:dev       # режим разработки iOS
 
 **Tauri Pilot (разработка интерфейса с помощью ИИ-агентов)**
 
-В проект входит плагин [Tauri Pilot](https://github.com/mpiton/tauri-pilot) с разрешениями, доступными только при разработке. Он позволяет ИИ-агенту проверять и управлять содержимым WebView для настольной версии через снимки доступности. Обычные команды разработки и сборки релизов его не включают.
+В проект входит плагин [Tauri Pilot](https://github.com/mpiton/tauri-pilot) с разрешениями, доступными только при разработке. Он позволяет ИИ-агенту проверять и управлять содержимым WebView на компьютере, в Android и в симуляторе iOS через снимки доступности. Обычные команды разработки и сборки релизов его не включают.
 
 ```bash
 cargo install tauri-pilot-cli  # требуется только один раз
-pnpm run tauri:dev:pilot
+pnpm run tauri:dev:pilot       # компьютер
+pnpm run android:dev:pilot     # Android: сначала перенаправьте сокет, см. docs/AndroidDevelopment.md
+pnpm run ios:dev:pilot         # симулятор iOS
 ```
 
 После запуска приложения откройте другой терминал и выполните основные шаги:
@@ -230,7 +247,7 @@ tauri-pilot logs --level error
 
 ## Благодарности и лицензия
 
-Проект основан на [SillyTavern](https://github.com/SillyTavern/SillyTavern) и [Tauri](https://tauri.app/). Благодарим авторов [Cocktail](https://github.com/Lianues/cocktail), [Tavern-Helper](https://github.com/N0VI028/JS-Slash-Runner), [LittleWhiteBox](https://github.com/RT15548/LittleWhiteBox), [MikTik](https://github.com/Darkatse/MikTik), а также [@LX2000WASD](https://github.com/LX2000WASD) за поддержку [пакета TauriTavern для AUR](https://github.com/LX2000WASD/TauriTavern-aur).
+Проект основан на [SillyTavern](https://github.com/SillyTavern/SillyTavern) и [Tauri](https://tauri.app/). Благодарим авторов [Cocktail](https://github.com/Lianues/cocktail), [Tavern-Helper](https://github.com/N0VI028/JS-Slash-Runner), [LittleWhiteBox](https://github.com/RT15548/LittleWhiteBox), [MikTik](https://github.com/Darkatse/MikTik), а также [@LX2000WASD](https://github.com/LX2000WASD) за поддержку [пакета TauriTavern для AUR](https://github.com/LX2000WASD/TauriTavern-aur) и [@LeenHawk](https://github.com/LeenHawk) за порт на HarmonyOS.
 
 Проект распространяется по лицензии [AGPL-3.0](LICENSE), которая относится к тому же семейству лицензий, что и лицензия SillyTavern.
 

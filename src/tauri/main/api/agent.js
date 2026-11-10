@@ -2,15 +2,20 @@
 
 import { buildAgentPromptSnapshotSeed } from './agent-prompt-snapshot.js';
 import { assemblePromptSnapshotForProfile, createPromptAssemblyApi } from './agent-prompt-assembly-run.js';
-import { attachHostCommitBridge } from './agent-chat-commit-bridge.js';
+import { attachHostCommitBridge, settleHostCommitBridge } from './agent-chat-commit-bridge.js';
 import { attachHostPromptAssemblyBridge } from './agent-prompt-assembly-bridge.js';
 import { resolveStableChatId } from './agent-chat-identity.js';
 import { createAgentProfilesApi } from './agent-profiles.js';
 import { createSharedRunEventSubscribe } from './agent-run-event-subscription.js';
+import { createAgentRunLiveSubscribe } from './agent-run-live-subscription.js';
 import { normalizeAgentRunOptions } from './agent-run-options.js';
 import { createAgentRunRuntimeApi } from './agent-run-runtime.js';
+import { createAgentSessionsApi } from './agent-sessions.js';
+import { createAgentToolsApi } from './agent-tools.js';
+import { confirmEmptyAgentPersist } from '../adapters/st/agent-empty-persist-popup.js';
 import { DEFAULT_AGENT_PROFILE_ID } from '../../../scripts/tauritavern/agent/agent-system-settings.js';
 import { ensureModelTargetLlmConnectionForProfile } from '../../../scripts/tauritavern/agent/model-target-llm-connection.js';
+import { restoreHostPresentation } from './agent-chat-presentation-checkpoint.js';
 
 /**
  * @typedef {{ kind: 'character'; characterId: string; fileName: string }} CharacterChatRef
@@ -19,12 +24,27 @@ import { ensureModelTargetLlmConnectionForProfile } from '../../../scripts/tauri
  */
 
 /**
- * @param {{ safeInvoke: (command: string, args?: any) => Promise<any> }} deps
+ * @param {{ safeInvoke: (command: string, args?: any) => Promise<any>; loadScript?: () => Promise<any> }} deps
  */
-function createAgentApi({ safeInvoke }) {
+export function createAgentApi({ safeInvoke, loadScript = () => import('../../../script.js') }) {
     const promptAssembly = createPromptAssemblyApi({ safeInvoke });
     const profiles = createAgentProfilesApi({ safeInvoke });
     const runtime = createAgentRunRuntimeApi({ safeInvoke });
+    const subscribeLiveProjection = createAgentRunLiveSubscribe({ safeInvoke });
+    const commitBridges = new Map();
+
+    function subscribeRunEvents(run) {
+        return createSharedRunEventSubscribe(run.runId, runtime.subscribe, run.afterSeq);
+    }
+
+    function attachAssemblyBridge(run) {
+        attachHostPromptAssemblyBridge({ runId: run.runId, safeInvoke, promptAssembly, subscribe: subscribeRunEvents(run) });
+    }
+
+    async function restoreAssemblyBridges() {
+        const runs = await safeInvoke('list_active_agent_runs');
+        for (const run of runs) attachAssemblyBridge(run);
+    }
 
     async function startRunWithPromptSnapshot(input) {
         return startRunWithPromptSnapshotInternal(input, { ensureModelTargetConnection: true });
@@ -36,21 +56,87 @@ function createAgentApi({ safeInvoke }) {
             ensureModelTargetConnection,
             runProfile,
         });
-        const handle = await safeInvoke('start_agent_run', { dto });
-        const hostSubscribe = createSharedRunEventSubscribe(handle?.runId, runtime.subscribe);
-        attachHostCommitBridge({
-            runId: handle?.runId,
+        const chatLength = (await loadScript()).chat.length;
+        let handle;
+        try {
+            handle = await safeInvoke('start_agent_run', { dto });
+        } catch (error) {
+            // Only a missing inherited version can be replaced by an explicit empty start.
+            if (!/^(?:Bad request: |Not found: )?agent\.(?:persist_state_missing|persistent_state_not_found):/u.test(error.message)) {
+                throw error;
+            }
+            if (!await confirmEmptyAgentPersist()) {
+                throw new DOMException('Agent run cancelled by user', 'AbortError');
+            }
+            dto.persistBaseStateId = undefined;
+            dto.options.startWithEmptyPersist = true;
+            handle = await safeInvoke('start_agent_run', { dto });
+        }
+        attachRunBridges(handle, dto, null, chatLength);
+        return handle;
+    }
+
+    function attachRunBridges(handle, dto, presentation = null, chatLength = presentation?.chatLength) {
+        const hostSubscribe = subscribeRunEvents(handle);
+        const commitBridge = attachHostCommitBridge({
+            runId: handle.runId,
+            chatRef: dto.chatRef,
+            stableChatId: dto.stableChatId,
+            generationType: dto.generationType,
             safeInvoke,
             readWorkspaceFile: runtime.readWorkspaceFile,
             readModelTurn: runtime.readModelTurn,
             subscribe: hostSubscribe,
+            loadScript,
+            presentation,
+            chatLength,
+            finishPresentation: async dto => {
+                await safeInvoke('finish_agent_run_presentation', { dto });
+                commitBridges.delete(handle.runId);
+            },
+            subscribeLiveProjection: dto.options?.stream !== false
+                && dto.options?.presentation === 'foreground'
+                ? subscribeLiveProjection
+                : null,
         });
-        attachHostPromptAssemblyBridge({
-            runId: handle?.runId,
-            safeInvoke,
-            promptAssembly,
-            subscribe: hostSubscribe,
-        });
+        commitBridges.set(handle.runId, commitBridge);
+        attachHostPromptAssemblyBridge({ runId: handle.runId, safeInvoke, promptAssembly, subscribe: hostSubscribe });
+    }
+
+    async function readCheckpoint(runId) {
+        if (typeof runId !== 'string' || !runId.trim()) throw new Error('runId is required');
+        runId = runId.trim();
+        const pending = commitBridges.get(runId);
+        if (pending?.terminalEvent) await settleHostCommitBridge(pending);
+        return safeInvoke('read_agent_run_checkpoint', { dto: { runId } });
+    }
+
+    async function resume({ runId, checkpoint = null, revisionGuidance = null } = {}) {
+        runId = String(runId || '').trim();
+        checkpoint ??= await readCheckpoint(runId);
+        if (checkpoint.run.sessionId) throw new Error('agent.session_resume_unsupported: Session runs cannot be resumed');
+        if (checkpoint.run.runId !== runId) throw new Error('agent.resume_checkpoint_mismatch: checkpoint belongs to another run');
+        const revision = revisionGuidance !== null;
+        if (checkpoint.blockedReason || (!revision && checkpoint.nextStep === 'finished')) {
+            throw new Error(`agent.resume_unavailable: ${checkpoint.blockedReason || 'this run has already finished'}`);
+        }
+        const presentation = await restoreHostPresentation(runId, checkpoint.presentation, await loadScript(), revision);
+        const chatRef = window.__TAURITAVERN__?.api?.chat?.current?.ref?.();
+        const stableChatId = await resolveStableChatId(chatRef);
+        const handle = await safeInvoke('resume_agent_run', { dto: {
+            runId,
+            expectedTerminalSeq: checkpoint.terminalSeq,
+            chatRef,
+            stableChatId,
+            hostPresentation: true,
+            ...(revision ? { revision: { guidance: revisionGuidance, previousOutput: presentation.rawCommittedText } } : {}),
+        } });
+        attachRunBridges(handle, {
+            chatRef,
+            stableChatId,
+            generationType: handle.generationType,
+            options: { presentation: presentation.liveEnabled ? 'foreground' : 'background' },
+        }, presentation);
         return handle;
     }
 
@@ -91,31 +177,43 @@ function createAgentApi({ safeInvoke }) {
         });
     }
 
-    async function listTools() {
-        return safeInvoke('list_agent_tools');
+    async function copyChatPersistentStates(input) {
+        return safeInvoke('copy_agent_chat_persistent_states', { dto: input });
     }
 
-    return {
+    async function settleChatPresentation({ runId }) {
+        const bridge = commitBridges.get(runId);
+        if (bridge) await settleHostCommitBridge(bridge);
+    }
+
+    const api = {
         startRunWithPromptSnapshot,
         startRunFromLegacyGenerate,
+        readCheckpoint,
+        resume,
         cancel: runtime.cancel,
         submitGuidance: runtime.submitGuidance,
         readEvents: runtime.readEvents,
         readWorkspaceFile: runtime.readWorkspaceFile,
+        readWorkspaceBytes: runtime.readWorkspaceBytes,
+        readTaskDetail: runtime.readTaskDetail,
         readModelTurn: runtime.readModelTurn,
         pruneChatPersistentStates: runtime.pruneChatPersistentStates,
+        copyChatPersistentStates,
         retention: runtime.retention,
         subscribe: runtime.subscribe,
+        subscribeLiveProjection,
+        settleChatPresentation,
         profiles,
-        tools: {
-            list: listTools,
-        },
+        sessions: createAgentSessionsApi({ safeInvoke, promptAssembly, attachAssemblyBridge }),
+        tools: createAgentToolsApi({ safeInvoke }),
         promptAssembly,
         approveToolCall() {
             throw new Error('approveToolCall is not implemented');
         },
         listRuns: runtime.listRuns,
     };
+    return { api, restoreAssemblyBridges };
 }
 
 function normalizeGenerationType(value) {
@@ -132,41 +230,26 @@ async function normalizePromptSnapshotRunInput(input, { safeInvoke, ensureModelT
         throw new Error('chatRef is required');
     }
 
-    const stableChatId = String(input.stableChatId || '').trim() || await resolveStableChatId(chatRef);
-    if (!stableChatId) {
-        throw new Error('stableChatId is required');
+    const stableChatId = input.stableChatId ?? await resolveStableChatId(chatRef);
+    if (typeof stableChatId !== 'string' || stableChatId.length === 0) {
+        throw new Error('stableChatId must be a non-empty string');
     }
 
+    const options = normalizeAgentRunOptions(input.options, input.presentation);
     let resolvedRunProfile = runProfile;
     if (ensureModelTargetConnection) {
         resolvedRunProfile = await ensureRunProfileModelTargetConnection(input.profileId ?? input.profile_id, safeInvoke);
     }
-    const skillScopeRefs = await resolveSkillScopeRefsForRun(input, safeInvoke, resolvedRunProfile);
 
     return {
         ...input,
         chatRef,
         stableChatId,
-        skillScopeRefs,
         persistBaseStateId: normalizeOptionalString(input.persistBaseStateId),
-        options: normalizeAgentRunOptions(input.options, input.presentation),
-    };
-}
-
-async function resolveSkillScopeRefsForRun(input, safeInvoke, runProfile = null) {
-    const refs = normalizeSkillScopeRefs(input.skillScopeRefs ?? input.skill_scope_refs);
-    if (refs.preset) {
-        return refs;
-    }
-
-    const profile = runProfile || await loadRunProfile(input.profileId ?? input.profile_id, safeInvoke);
-    if (profile?.preset?.mode !== 'currentPromptSnapshot') {
-        return refs;
-    }
-
-    return {
-        ...refs,
-        preset: resolveCurrentPresetRef(),
+        options: { ...normalizeAgentRunOptions(
+            options,
+            options.presentation ?? resolvedRunProfile?.run?.presentation,
+        ), hostPresentation: true },
     };
 }
 
@@ -188,65 +271,6 @@ async function ensureRunProfileModelTargetConnection(profileId, safeInvoke) {
     const profile = await loadRunProfile(profileId, safeInvoke);
     await ensureModelTargetLlmConnectionForProfile(profile);
     return profile;
-}
-
-function normalizeSkillScopeRefs(value) {
-    if (value == null) {
-        return {};
-    }
-    if (!isPlainObject(value)) {
-        throw new Error('agent.skill_scope_refs_invalid: skillScopeRefs must be an object');
-    }
-
-    const refs = {};
-    const preset = normalizeOptionalPresetRef(value.preset);
-    if (preset) {
-        refs.preset = preset;
-    }
-    const characterId = normalizeOptionalString(value.characterId ?? value.character_id);
-    if (characterId) {
-        refs.characterId = characterId;
-    }
-    return refs;
-}
-
-function normalizeOptionalPresetRef(value) {
-    if (value == null) {
-        return undefined;
-    }
-    if (!isPlainObject(value)) {
-        throw new Error('agent.skill_scope_refs_preset_invalid: skillScopeRefs.preset must be an object');
-    }
-    const apiId = normalizeOptionalString(value.apiId ?? value.api_id);
-    const name = normalizeOptionalString(value.name);
-    if (!apiId || !name) {
-        throw new Error('agent.skill_scope_refs_preset_invalid: skillScopeRefs.preset requires apiId and name');
-    }
-    return { apiId, name };
-}
-
-function resolveCurrentPresetRef() {
-    const context = window.SillyTavern?.getContext?.();
-    if (!context || typeof context !== 'object') {
-        throw new Error('agent.current_preset_context_unavailable: SillyTavern context is required to resolve the current preset');
-    }
-    const presetManager = context.getPresetManager?.();
-    if (!presetManager) {
-        throw new Error('agent.current_preset_manager_unavailable: current preset manager is unavailable');
-    }
-
-    const selectedPreset = String(presetManager.getSelectedPreset?.() ?? '').trim();
-    if (selectedPreset === 'gui') {
-        throw new Error('agent.current_preset_unsaved: CurrentPromptSnapshot Agent runs require a saved preset to resolve preset-scoped Skills');
-    }
-
-    const apiId = normalizeOptionalString(presetManager.apiId);
-    const name = normalizeOptionalString(presetManager.getSelectedPresetName?.());
-    if (!apiId || !name) {
-        throw new Error('agent.current_preset_ref_invalid: current preset did not resolve apiId and name');
-    }
-
-    return { apiId, name };
 }
 
 function normalizeOptionalString(value) {
@@ -297,5 +321,7 @@ export function installAgentApi(context) {
         hostAbi.api = {};
     }
 
-    hostAbi.api.agent = createAgentApi({ safeInvoke });
+    const { api, restoreAssemblyBridges } = createAgentApi({ safeInvoke });
+    hostAbi.api.agent = api;
+    return restoreAssemblyBridges;
 }

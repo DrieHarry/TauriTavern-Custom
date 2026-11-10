@@ -7,14 +7,17 @@ use uuid::Uuid;
 
 use super::FileAgentRepository;
 use super::run_record::{read_agent_run_record, write_agent_run_record};
+use tt_adapter_storage_core::file_system::{persist_file, unique_temp_path};
 use tt_domain::errors::DomainError;
 use tt_domain::models::agent::{
-    AgentRun, AgentRunEvent, AgentRunEventLevel, AgentRunSummaryProjection,
+    AgentRun, AgentRunEvent, AgentRunEventLevel, AgentRunSummaryProjection, WorkspacePath,
 };
 use tt_ports::repositories::agent_run_repository::{
     AgentRunEventReadQuery, AgentRunListCursor, AgentRunListQuery, AgentRunRepository,
-    AgentRunStorageEntryStats, AgentRunStorageStats, event_belongs_to_invocation,
+    AgentRunStorageEntryStats, AgentRunStorageStats,
 };
+
+const RUN_CHECKPOINT_PATH: &str = "checkpoints/latest.json";
 
 #[async_trait]
 impl AgentRunRepository for FileAgentRepository {
@@ -29,11 +32,27 @@ impl AgentRunRepository for FileAgentRepository {
         })?;
 
         write_agent_run_record(&run_dir.join("run.json"), run).await?;
-        write_agent_run_record(&self.index_run_path(&run.id)?, run).await
+        write_agent_run_record(&self.index_path_for_run(run)?, run).await?;
+        self.event_sequences.lock().await.insert(run.id.clone(), 0);
+        Ok(())
     }
 
     async fn load_run(&self, run_id: &str) -> Result<AgentRun, DomainError> {
-        read_agent_run_record(&self.index_run_path(run_id)?).await
+        let (run, session_index) = match read_agent_run_record(&self.index_run_path(run_id)?).await
+        {
+            Ok(run) => (run, false),
+            Err(DomainError::NotFound(_)) => (
+                read_agent_run_record(&self.index_session_run_path(run_id)?).await?,
+                true,
+            ),
+            Err(error) => return Err(error),
+        };
+        if run.id != run_id || run.target.session_id().is_some() != session_index {
+            return Err(DomainError::InvalidData(format!(
+                "Agent run index identity or target mismatch: {run_id}"
+            )));
+        }
+        Ok(run)
     }
 
     async fn list_runs(&self, query: AgentRunListQuery) -> Result<Vec<AgentRun>, DomainError> {
@@ -99,7 +118,71 @@ impl AgentRunRepository for FileAgentRepository {
     async fn save_run(&self, run: &AgentRun) -> Result<(), DomainError> {
         let run_dir = self.run_dir(run)?;
         write_agent_run_record(&run_dir.join("run.json"), run).await?;
-        write_agent_run_record(&self.index_run_path(&run.id)?, run).await
+        write_agent_run_record(&self.index_path_for_run(run)?, run).await
+    }
+
+    async fn save_run_checkpoint(&self, run_id: &str, data: &[u8]) -> Result<(), DomainError> {
+        let files = self.open_run_files(run_id).await?;
+        let _guard = files.lock.write().await;
+        let path = files
+            .resolve(&WorkspacePath::parse(RUN_CHECKPOINT_PATH)?)
+            .await?;
+        fs::create_dir_all(path.parent().expect("checkpoint parent"))
+            .await
+            .map_err(|error| DomainError::file_io("create checkpoint parent", run_id, error))?;
+        let temp_path = unique_temp_path(&path);
+        let result = async {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .await
+                .map_err(|error| {
+                    DomainError::InternalError(format!(
+                        "Failed to create agent checkpoint {}: {error}",
+                        temp_path.display()
+                    ))
+                })?;
+            let written = async {
+                file.write_all(data).await?;
+                file.flush().await
+            }
+            .await;
+            written.map_err(|error: std::io::Error| {
+                DomainError::InternalError(format!(
+                    "Failed to write agent checkpoint {}: {error}",
+                    temp_path.display()
+                ))
+            })?;
+            persist_file(file, &temp_path, &path).await
+        }
+        .await;
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path).await;
+        }
+        result
+    }
+
+    async fn load_run_checkpoint(&self, run_id: &str) -> Result<Option<Vec<u8>>, DomainError> {
+        let files = self.open_run_files(run_id).await?;
+        let _guard = files.lock.read().await;
+        let path = files
+            .resolve(&WorkspacePath::parse(RUN_CHECKPOINT_PATH)?)
+            .await?;
+        match fs::read(&path).await {
+            Ok(data) => Ok(Some(data)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(DomainError::InternalError(format!(
+                "Failed to read agent checkpoint {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    async fn reset_event_sequence(&self, run_id: &str) -> Result<(), DomainError> {
+        self.load_run(run_id).await?;
+        self.event_sequences.lock().await.remove(run_id);
+        Ok(())
     }
 
     async fn append_event(
@@ -109,25 +192,19 @@ impl AgentRunRepository for FileAgentRepository {
         event_type: &str,
         payload: Value,
     ) -> Result<AgentRunEvent, DomainError> {
-        let _guard = self.event_lock.lock().await;
+        let mut sequences = self.event_sequences.lock().await;
         let run_dir = self.load_run_dir(run_id).await?;
         let events_path = run_dir.join("events.jsonl");
-        if let Some(parent) = events_path.parent() {
-            fs::create_dir_all(parent).await.map_err(|error| {
-                DomainError::InternalError(format!(
-                    "Failed to create agent event journal parent {}: {}",
-                    parent.display(),
-                    error
-                ))
-            })?;
-        }
 
-        let seq = self
-            .read_all_events(run_id)
-            .await?
-            .last()
-            .map(|event| event.seq + 1)
-            .unwrap_or(1);
+        let seq = match sequences.get(run_id) {
+            Some(last_seq) => last_seq + 1,
+            None => self
+                .read_all_events(run_id)
+                .await?
+                .last()
+                .map(|event| event.seq + 1)
+                .unwrap_or(1),
+        };
 
         let event = AgentRunEvent {
             seq,
@@ -139,9 +216,10 @@ impl AgentRunRepository for FileAgentRepository {
             payload,
         };
 
-        let line = serde_json::to_string(&event).map_err(|error| {
+        let mut line = serde_json::to_string(&event).map_err(|error| {
             DomainError::InvalidData(format!("Failed to serialize agent event: {error}"))
         })?;
+        line.push('\n');
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -155,28 +233,21 @@ impl AgentRunRepository for FileAgentRepository {
                     error
                 ))
             })?;
-        file.write_all(line.as_bytes()).await.map_err(|error| {
-            DomainError::InternalError(format!(
-                "Failed to append agent event journal {}: {}",
+        let persist_result = async {
+            file.write_all(line.as_bytes()).await?;
+            file.flush().await
+        }
+        .await;
+        if let Err(error) = persist_result {
+            sequences.remove(run_id);
+            return Err(DomainError::InternalError(format!(
+                "Failed to persist agent event journal {}: {}",
                 events_path.display(),
                 error
-            ))
-        })?;
-        file.write_all(b"\n").await.map_err(|error| {
-            DomainError::InternalError(format!(
-                "Failed to append agent event journal newline {}: {}",
-                events_path.display(),
-                error
-            ))
-        })?;
-        file.flush().await.map_err(|error| {
-            DomainError::InternalError(format!(
-                "Failed to flush agent event journal {}: {}",
-                events_path.display(),
-                error
-            ))
-        })?;
+            )));
+        }
 
+        sequences.insert(run_id.to_string(), seq);
         Ok(event)
     }
 
@@ -185,25 +256,7 @@ impl AgentRunRepository for FileAgentRepository {
         run_id: &str,
         query: AgentRunEventReadQuery,
     ) -> Result<Vec<AgentRunEvent>, DomainError> {
-        let limit = query.limit.clamp(1, 500);
-        let mut events = self.read_all_events(run_id).await?;
-
-        if let Some(invocation_id) = query.invocation_id.as_deref() {
-            events.retain(|event| event_belongs_to_invocation(event, invocation_id));
-        }
-
-        if let Some(before_seq) = query.before_seq {
-            events.retain(|event| event.seq < before_seq);
-            let start = events.len().saturating_sub(limit);
-            return Ok(events.into_iter().skip(start).collect());
-        }
-
-        if let Some(after_seq) = query.after_seq {
-            events.retain(|event| event.seq > after_seq);
-        }
-
-        events.truncate(limit);
-        Ok(events)
+        self.read_event_page(run_id, query).await
     }
 
     async fn read_all_events(&self, run_id: &str) -> Result<Vec<AgentRunEvent>, DomainError> {
@@ -278,7 +331,7 @@ impl FileAgentRepository {
             super::paths::validate_segment(run_id, "run_id")?;
 
             let run = read_agent_run_record(&path).await?;
-            if run.id != run_id {
+            if run.id != run_id || run.target.session_id().is_some() {
                 return Err(DomainError::InvalidData(format!(
                     "Agent run index id mismatch in {}: expected {}, found {}",
                     path.display(),
@@ -294,17 +347,20 @@ impl FileAgentRepository {
 }
 
 fn run_matches_list_query(run: &AgentRun, query: &AgentRunListQuery) -> bool {
+    let Ok(chat) = run.chat_target() else {
+        return false;
+    };
     if query
         .chat_ref
         .as_ref()
-        .is_some_and(|chat_ref| &run.chat_ref != chat_ref)
+        .is_some_and(|chat_ref| &chat.chat_ref != chat_ref)
     {
         return false;
     }
     if query
         .stable_chat_id
         .as_ref()
-        .is_some_and(|stable_chat_id| &run.stable_chat_id != stable_chat_id)
+        .is_some_and(|stable_chat_id| &chat.stable_chat_id != stable_chat_id)
     {
         return false;
     }

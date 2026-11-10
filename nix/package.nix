@@ -13,7 +13,7 @@
   nodejs_22,
   openssl,
   pkg-config,
-  pnpm_10,
+  pnpm_11,
   pnpmConfigHook,
   webkitgtk_4_1,
   wrapGAppsHook4,
@@ -24,7 +24,7 @@
 
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "tauritavern";
-  version = "2.2.0";
+  version = "2.4.0";
 
   inherit src;
 
@@ -40,16 +40,16 @@ rustPlatform.buildRustPackage (finalAttrs: {
       version
       src
       ;
-    pnpm = pnpm_10;
+    pnpm = pnpm_11;
     fetcherVersion = 3;
-    hash = "sha256-QYMEUw8WH83FlGBkEd6cjSYAW6erhf0aslNclsbCY8I=";
+    hash = "sha256-l+F8Euyhw5sDXPolAPPB3I81mOB63mTOUmZlxuCRhj4=";
   };
 
   nativeBuildInputs = [
     cargo-tauri.hook
     nodejs_22
     pkg-config
-    pnpm_10
+    pnpm_11
     pnpmConfigHook
     wrapGAppsHook4
   ];

@@ -49,8 +49,10 @@ pub trait AgentRunRepository: Send + Sync {
 
     async fn load_run(&self, run_id: &str) -> Result<AgentRun, DomainError>;
 
+    /// Chat history only; Session history is read through AgentSessionRepository.
     async fn list_runs(&self, query: AgentRunListQuery) -> Result<Vec<AgentRun>, DomainError>;
 
+    /// Chat retention candidates; Session runs have an independent lifetime.
     async fn list_all_runs(&self) -> Result<Vec<AgentRun>, DomainError>;
 
     async fn inspect_run_storage(
@@ -76,6 +78,14 @@ pub trait AgentRunRepository: Send + Sync {
     ) -> Result<(), DomainError>;
 
     async fn save_run(&self, run: &AgentRun) -> Result<(), DomainError>;
+
+    /// Atomically replace the latest execution checkpoint with already serialized bytes.
+    async fn save_run_checkpoint(&self, run_id: &str, data: &[u8]) -> Result<(), DomainError>;
+
+    async fn load_run_checkpoint(&self, run_id: &str) -> Result<Option<Vec<u8>>, DomainError>;
+
+    /// Rebuild the append cursor from the journal on the next write after external changes.
+    async fn reset_event_sequence(&self, run_id: &str) -> Result<(), DomainError>;
 
     async fn append_event(
         &self,

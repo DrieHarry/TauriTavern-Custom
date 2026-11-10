@@ -20,14 +20,10 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const tr = (key: string) => key;
 
 const handles: SettingsHandle[] = [];
-const containers: HTMLElement[] = [];
 
 afterEach(() => {
     for (const handle of handles.splice(0)) {
         act(() => handle.unmount());
-    }
-    for (const container of containers.splice(0)) {
-        container.remove();
     }
 });
 
@@ -48,6 +44,8 @@ function createValues(overrides: ValuesOverrides = {}): SettingsValues {
         panelRuntimeProfile: 'off',
         embeddedRuntimeProfile: 'off',
         chatVirtualizationEnabled: false,
+        coldSwipesEnabled: false,
+        codeMirrorEditorEnabled: false,
         chatBackups: {
             automaticEnabled: true,
             zstdCompressionEnabled: false,
@@ -60,7 +58,7 @@ function createValues(overrides: ValuesOverrides = {}): SettingsValues {
         requestProxy: { enabled: false, url: '', bypass: [], ...overrides.requestProxy },
         allowKeysExposure: false,
         avatarPersonaOriginalImagesEnabled: false,
-        nativeRegexBackendEnabled: true,
+        oledBackgroundEnabled: false,
         dynamicTheme: {
             themeEnabled: false,
             dayTheme: '',
@@ -80,6 +78,7 @@ function createActions(overrides: Partial<SettingsActions> = {}): SettingsAction
         chooseDataRoot: () => Promise.resolve(null),
         chooseWallpaper: () => Promise.resolve(null),
         showHelp: () => Promise.resolve(),
+        manageQuickAccess: () => Promise.resolve(),
         reloadFrontend: () => Promise.resolve(),
         openFrontendLogs: () => Promise.resolve(),
         openBackendLogs: () => Promise.resolve(),
@@ -125,7 +124,6 @@ function createOptions(overrides: Partial<SettingsMountOptions> = {}): SettingsM
 function mountApp(options: SettingsMountOptions = createOptions()): { container: HTMLElement; handle: SettingsHandle } {
     const container = document.createElement('div');
     document.body.append(container);
-    containers.push(container);
     let handle!: SettingsHandle;
     act(() => {
         handle = mountTauriTavernSettingsApp(container, options);
@@ -213,10 +211,13 @@ test('draft preserves stored emptiness and exposes synchronous isolated edits', 
             target: { value: 'aggressive' },
         });
         fireEvent.click(within(container).getByRole('checkbox', { name: 'Automatic Chat Backups' }));
+        fireEvent.click(within(container).getByRole('checkbox', { name: 'OLED Pure Black Background' }));
         snapshot = handle.getDraft();
     });
     expect(snapshot.panelRuntimeProfile).toBe('aggressive');
     expect(snapshot.chatBackups.automaticEnabled).toBe(false);
+    expect(snapshot.oledBackgroundEnabled).toBe(true);
+    expect(options.viewModel.values.oledBackgroundEnabled).toBe(false);
 
     snapshot.chatBackups.maxTotalFiles = 'mutated';
     expect(handle.getDraft().chatBackups.maxTotalFiles).toBe('500');
@@ -289,7 +290,7 @@ test('iOS proxy repair path: an enabled proxy can be disabled but not re-enabled
     const { container, handle } = mountApp(options);
 
     // The summary meta shows the live proxy URL instead of a click hint.
-    const details = disclosure(container, 'Request Proxy (Advanced)');
+    const details = disclosure(container, 'Request Proxy');
     expect(details.querySelector('.tt-settings-summary-meta small')?.textContent).toBe('http://127.0.0.1:7890');
 
     const toggle = within(container).getByRole<HTMLInputElement>('checkbox', { name: 'Enable Request Proxy' });
@@ -301,7 +302,7 @@ test('iOS proxy repair path: an enabled proxy can be disabled but not re-enabled
     await user.click(toggle);
     expect(handle.getDraft().requestProxy.enabled).toBe(false);
     expect(within(container).queryByRole('checkbox', { name: 'Enable Request Proxy' })).toBeNull();
-    expect(container.textContent).not.toContain('Request Proxy (Advanced)');
+    expect(container.textContent).not.toContain('Request Proxy');
 });
 
 test('unknown stored theme stays selectable and wallpaper choosing preserves raw filenames', async () => {
@@ -347,8 +348,7 @@ test('choosing a data root projects busy state and the pending migration result'
     });
     const { container } = mountApp(options);
     const dataRootDisclosure = disclosure(container, 'Data Directory');
-    dataRootDisclosure.open = true;
-    fireEvent(dataRootDisclosure, new Event('toggle'));
+    act(() => { dataRootDisclosure.open = true; });
 
     const chooseButton = within(container).getByRole<HTMLButtonElement>('button', { name: 'Choose...' });
     await user.click(chooseButton);

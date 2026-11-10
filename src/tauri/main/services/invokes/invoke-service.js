@@ -1,10 +1,11 @@
 // @ts-check
 
+import { translateSillyTavern } from '../../adapters/st/sillytavern-i18n.js';
 import { createInvokeBroker } from '../../brokers/invoke-broker.js';
 import {
     asUpstreamFailureDetails,
     findUpstreamFailureDetails,
-    upstreamFailureFallbackText,
+    upstreamFailureMessage,
 } from '../../kernel/upstream-failure.js';
 
 /**
@@ -21,7 +22,8 @@ import {
 export function createInvokeService({ invoke, policies }) {
     /** @param {Record<string, any> | null | undefined} args */
     function withTauriArgumentAliases(args) {
-        if (!args || typeof args !== 'object' || Array.isArray(args)) {
+        if (!args || typeof args !== 'object' || Array.isArray(args)
+            || ArrayBuffer.isView(args) || args instanceof ArrayBuffer) {
             return args;
         }
 
@@ -135,8 +137,14 @@ export function createInvokeService({ invoke, policies }) {
                 return `Internal server error: ${nested}`;
             case 'TooManyRequests':
                 return `Too many requests: ${nested}`;
-            case 'UpstreamFailure':
-                return upstreamFailureFallbackText(asUpstreamFailureDetails(payload)) || nested;
+            case 'UpstreamFailure': {
+                const details = asUpstreamFailureDetails(payload);
+                if (!details) {
+                    return nested;
+                }
+                const message = upstreamFailureMessage(details, translateSillyTavern);
+                return details.endpoint ? `${message} (${details.endpoint})` : message;
+            }
             default:
                 return '';
         }
@@ -172,12 +180,13 @@ export function createInvokeService({ invoke, policies }) {
     /**
      * @param {TauriInvokeCommand} command
      * @param {any} args
+     * @param {{ headers?: HeadersInit }} [options]
      */
-    async function invokeTransport(command, args = {}) {
+    async function invokeTransport(command, args = {}, options) {
         const invokeArgs = withTauriArgumentAliases(args);
 
         try {
-            return await invoke(command, invokeArgs);
+            return await invoke(command, invokeArgs, options);
         } catch (error) {
             const message = normalizeInvokeErrorMessage(error, `Command failed: ${command}`);
             const details = findUpstreamFailureDetails(error);

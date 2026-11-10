@@ -14,7 +14,7 @@ import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
 import { SlashCommandScope } from '../../slash-commands/SlashCommandScope.js';
 import { collapseSpaces, getUniqueName, isFalseBoolean, isTrueBoolean, uuidv4, waitUntilCondition } from '../../utils.js';
 import { t } from '../../i18n.js';
-import { getSecretLabelById, resolveSecretKey } from '../../secrets.js';
+import { getSecretLabelById, resolveSecretKey, SECRET_KEYS } from '../../secrets.js';
 import { connectCurrentApi } from '../../slash-commands.js';
 import { performFuzzySearch } from '/scripts/power-user.js';
 import { StreamingDisplay } from '/scripts/streaming-display.js';
@@ -467,11 +467,12 @@ function setOptionalField(target, key, value) {
 function readModelTargetAdapterHints(target) {
     const settings = getContext().chatCompletionSettings;
     const format = String(target['custom-api-format'] || '');
+    const isCustom = String(target.api || '').startsWith('custom');
     target.adapterHints = {
-        ...(format === 'claude_messages' && settings.custom_claude_prompt_caching
+        ...(isCustom && format === 'claude_messages' && settings.custom_claude_prompt_caching
             ? { claudePromptCaching: 'enabled' }
             : {}),
-        ...(format === 'openai_responses' && settings.custom_openai_responses_websocket
+        ...(isCustom && format === 'openai_responses' && settings.custom_openai_responses_websocket
             ? { openaiResponsesMode: 'websocket' }
             : {}),
     };
@@ -878,6 +879,11 @@ async function applyModelTarget(target) {
             await withConnectionValidationSuspended('Model target application', async () => {
                 await requireManagedCommand('api', target.api);
 
+                if (target.api === 'vertexai') {
+                    const mode = target.secretRef?.key === SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT ? 'full' : 'express';
+                    $('#vertexai_auth_mode').val(mode).trigger('change');
+                }
+
                 if (target['custom-api-format']) {
                     await requireManagedCommand('custom-api-format', target['custom-api-format']);
                 } else if (target.api === 'custom') {
@@ -1202,10 +1208,7 @@ async function generateStreamCallback(args, value) {
         }
 
         const effectiveProfile = ConnectionManagerRequestService.getProfile(effectiveProfileId);
-        const selectedApiMap = ConnectionManagerRequestService.validateProfile(effectiveProfile);
-        if (globalThis.__TAURI_RUNNING__ === true && selectedApiMap.selected === 'textgenerationwebui') {
-            throw new Error('Text Completion profiles are not supported by the native TauriTavern generation backend yet. Use a Chat Completion profile.');
-        }
+        ConnectionManagerRequestService.validateProfile(effectiveProfile);
 
         const display = new StreamingDisplay();
         display.show({

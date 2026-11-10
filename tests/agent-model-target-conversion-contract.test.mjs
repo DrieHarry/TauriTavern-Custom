@@ -123,6 +123,36 @@ test('Agent model target conversion preserves native adapter opt-ins', async () 
     assert.deepEqual(connection.capabilities, {});
 });
 
+test('Agent model target conversion keeps OpenCode service and wire format', async () => {
+    const { buildLlmConnectionFromModelTarget } = await importConversion();
+    const connection = buildLlmConnectionFromModelTarget(sampleTarget({
+        api: 'opencode',
+        model: 'qwen3-coder',
+        'api-url': 'go',
+        'custom-api-format': 'claude_messages',
+        secretRef: { key: 'api_key_opencode', id: 'secret-opencode' },
+    }));
+
+    assert.deepEqual(connection.provider, { chatCompletionSource: 'opencode' });
+    assert.deepEqual(connection.endpoint.sourceSpecific, {
+        opencode_endpoint: 'go',
+        opencode_api_format: 'claude_messages',
+    });
+});
+
+test('Vertex AI targets preserve credential type and region', async () => {
+    const { buildLlmConnectionFromModelTarget } = await importConversion();
+    for (const [key, mode] of [['vertexai_service_account_json', 'full'], ['api_key_vertexai', 'express']]) {
+        const connection = buildLlmConnectionFromModelTarget(sampleTarget({
+            api: 'vertexai', model: 'gemini-2.5-pro', 'api-url': 'europe-west4',
+            secretRef: { key, id: 'vertex-secret' },
+        }));
+        assert.equal(connection.endpoint.sourceSpecific.vertexai_auth_mode ?? 'express', mode);
+        assert.equal(connection.endpoint.sourceSpecific.vertexai_region, 'europe-west4');
+        assert.deepEqual(connection.auth.secretRef, { key, id: 'vertex-secret' });
+    }
+});
+
 
 
 test('Agent run model target ensure refreshes by connection ref without adopting target model changes', async () => {
@@ -178,10 +208,6 @@ test('Agent model target conversion rejects lossy or invalid targets', async () 
     } = await importConversion();
 
     assert.throws(
-        () => buildLlmConnectionFromModelTarget(sampleTarget({ proxy: 'corporate-proxy' })),
-        /cannot be converted to an Agent LLM connection/,
-    );
-    assert.throws(
         () => buildLlmConnectionFromModelTarget(sampleTarget({ mode: 'tc' })),
         /is not a chat-completion target/,
     );
@@ -193,4 +219,18 @@ test('Agent model target conversion rejects lossy or invalid targets', async () 
         () => modelTargetConnectionRef({ id: 'x'.repeat(129) }),
         /too long/,
     );
+});
+
+test('Agent model targets preserve a named reverse proxy and the provider-specific model name', async () => {
+    const { buildLlmConnectionFromModelTarget, modelBindingFromTarget } = await importConversion();
+    const target = sampleTarget({
+        api: 'google', model: '[v]gemini-custom', proxy: 'Team proxy',
+        secretRef: { key: 'api_key_makersuite', id: 'google-key' },
+    });
+    const connection = buildLlmConnectionFromModelTarget(target);
+    assert.deepEqual(connection.routing, { reverseProxy: { preset: 'Team proxy' } });
+    assert.equal(connection.provider.chatCompletionSource, 'makersuite');
+    assert.equal(modelBindingFromTarget(target).modelId, '[v]gemini-custom');
+    assert.deepEqual(buildLlmConnectionFromModelTarget({ ...target, secretRef: undefined }).auth, {});
+    assert.deepEqual(buildLlmConnectionFromModelTarget({ ...target, proxy: 'None' }).routing, {});
 });

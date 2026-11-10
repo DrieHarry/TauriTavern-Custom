@@ -1,23 +1,10 @@
+pub mod repair;
+pub mod revision;
+
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use crate::models::update::UpdateChannel;
-
-fn default_ios_policy_seed() -> Option<Value> {
-    if !cfg!(target_os = "ios") {
-        return None;
-    }
-
-    let profile = env!("TAURITAVERN_IOS_POLICY_PROFILE").trim();
-    if profile.is_empty() {
-        return None;
-    }
-
-    Some(json!({
-        "version": crate::ios_policy::IOS_POLICY_VERSION,
-        "profile": profile,
-    }))
-}
 
 fn default_perf_profile() -> String {
     "auto".to_string()
@@ -39,7 +26,7 @@ fn default_avatar_persona_original_images_enabled() -> bool {
     false
 }
 
-fn default_native_regex_backend_enabled() -> bool {
+fn default_codemirror_editor_enabled() -> bool {
     true
 }
 
@@ -111,7 +98,7 @@ pub struct DynamicThemeSettings {
 }
 
 fn default_close_to_tray_on_close() -> bool {
-    cfg!(target_os = "windows")
+    true
 }
 
 fn default_request_proxy_bypass() -> Vec<String> {
@@ -336,6 +323,10 @@ pub struct TauriTavernSettings {
     #[serde(default)]
     pub chat_virtualization_enabled: bool,
     #[serde(default)]
+    pub cold_swipes_enabled: bool,
+    #[serde(default = "default_codemirror_editor_enabled")]
+    pub codemirror_editor_enabled: bool,
+    #[serde(default)]
     pub chat_backups: ChatBackupSettings,
     #[serde(default = "default_close_to_tray_on_close")]
     pub close_to_tray_on_close: bool,
@@ -347,8 +338,6 @@ pub struct TauriTavernSettings {
     /// cached/generated thumbnails. Background thumbnails are intentionally unaffected.
     #[serde(default = "default_avatar_persona_original_images_enabled")]
     pub avatar_persona_original_images_enabled: bool,
-    #[serde(default = "default_native_regex_backend_enabled")]
-    pub native_regex_backend_enabled: bool,
     #[serde(default)]
     pub dev: DevLoggingSettings,
     #[serde(default)]
@@ -375,18 +364,19 @@ impl Default for TauriTavernSettings {
             panel_runtime_profile: default_panel_runtime_profile(),
             embedded_runtime_profile: default_embedded_runtime_profile(),
             chat_virtualization_enabled: false,
+            cold_swipes_enabled: false,
+            codemirror_editor_enabled: default_codemirror_editor_enabled(),
             chat_backups: ChatBackupSettings::default(),
             close_to_tray_on_close: default_close_to_tray_on_close(),
             request_proxy: RequestProxySettings::default(),
             allow_keys_exposure: false,
             avatar_persona_original_images_enabled: default_avatar_persona_original_images_enabled(
             ),
-            native_regex_backend_enabled: default_native_regex_backend_enabled(),
             dev: DevLoggingSettings::default(),
             dynamic_theme: DynamicThemeSettings::default(),
             models: default_model_settings(),
             agent: AgentSettings::default(),
-            ios_policy: default_ios_policy_seed(),
+            ios_policy: None,
         }
     }
 }
@@ -394,9 +384,7 @@ impl Default for TauriTavernSettings {
 impl TauriTavernSettings {
     /// Deserializes settings while keeping backward compatibility with older
     /// `tauritavern-settings.json` schemas.
-    pub fn from_json_str_with_compat(raw: &str) -> Result<Self, serde_json::Error> {
-        let mut value: Value = serde_json::from_str(raw)?;
-
+    pub fn from_json_value_with_compat(mut value: Value) -> Result<Self, serde_json::Error> {
         if let Value::Object(map) = &mut value {
             // Migration: `avatar_persona_thumbnails_enabled` (legacy, default true) ->
             // `avatar_persona_original_images_enabled` (current, default false).
@@ -462,8 +450,8 @@ mod tests {
 
     #[test]
     fn avatar_persona_original_images_enabled_migrates_legacy_thumbnail_setting() {
-        let settings = TauriTavernSettings::from_json_str_with_compat(
-            r#"{"updates":{"startup_popup":{"dismissed_release_token":null}},"avatar_persona_thumbnails_enabled":false}"#,
+        let settings = TauriTavernSettings::from_json_value_with_compat(
+            serde_json::json!({"updates":{"startup_popup":{"dismissed_release_token":null}},"avatar_persona_thumbnails_enabled":false}),
         )
         .expect("parse settings");
 
@@ -471,12 +459,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_settings_defaults_when_loading_older_settings() {
-        let settings = TauriTavernSettings::from_json_str_with_compat(
-            r#"{"updates":{"startup_popup":{"dismissed_release_token":null}}}"#,
+    fn new_settings_default_when_loading_older_settings() {
+        let settings = TauriTavernSettings::from_json_value_with_compat(
+            serde_json::json!({"updates":{"startup_popup":{"dismissed_release_token":null}}}),
         )
         .expect("parse settings");
 
+        assert!(settings.codemirror_editor_enabled);
         assert!(!settings.agent.retention.auto_prune_enabled);
         assert_eq!(
             settings.agent.retention.keep_recent_terminal_runs,
@@ -490,12 +479,10 @@ mod tests {
 
     #[test]
     fn chat_backup_settings_default_missing_nested_fields() {
-        let settings = TauriTavernSettings::from_json_str_with_compat(
-            r#"{
-                "updates":{"startup_popup":{"dismissed_release_token":null}},
-                "chat_backups":{"max_total_files":12}
-            }"#,
-        )
+        let settings = TauriTavernSettings::from_json_value_with_compat(serde_json::json!({
+            "updates":{"startup_popup":{"dismissed_release_token":null}},
+            "chat_backups":{"max_total_files":12}
+        }))
         .expect("parse settings");
 
         assert!(settings.chat_backups.automatic_enabled);

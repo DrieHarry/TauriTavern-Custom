@@ -4,12 +4,12 @@ import {
     type ReactNode,
     type Ref,
 } from 'react';
-import { createRoot } from 'react-dom/client';
 
 import {
     createConfirmPopup,
     errorText,
     isPopupAffirmative,
+    showReactPopup,
     tr,
     type McpTranslator,
 } from './host';
@@ -28,7 +28,7 @@ type ToolDescriptionDialogHandle = {
  * overrides survive a description edit; an emptied description drops the whole
  * entry once nothing else remains.
  */
-export function withDescription(
+function withDescription(
     override: TauriTavernToolDescriptionOverride | undefined,
     description: string,
 ): TauriTavernToolDescriptionOverride | null {
@@ -48,7 +48,7 @@ type ToolDescriptionDialogProps = ToolDescriptionDialogInput & {
     ref: Ref<ToolDescriptionDialogHandle>;
 };
 
-export function ToolDescriptionDialog({
+function ToolDescriptionDialog({
     tool,
     override,
     save,
@@ -99,9 +99,10 @@ export function ToolDescriptionDialog({
                     rows={5}
                     value={draft}
                     disabled={saving}
+                    aria-describedby="tt-mcp-tool-custom-description-hint"
                     onChange={event => setDraft(event.currentTarget.value)}
                 />
-                <small>{tr('customDescriptionHint')}</small>
+                <small id="tt-mcp-tool-custom-description-hint">{tr('customDescriptionHint')}</small>
             </div>
 
             {error && <p className="tt-mcp-error" role="alert">{error}</p>}
@@ -118,24 +119,18 @@ export async function openToolDialog({
     override,
     save,
 }: ToolDescriptionDialogInput): Promise<void> {
-    const mount = document.createElement('div');
     let dialog: ToolDescriptionDialogHandle | null = null;
-
-    const root = createRoot(mount);
-    try {
-        root.render(
-            <ToolDescriptionDialog
-                tool={tool}
-                override={override}
-                save={save}
-                tr={tr}
-                ref={handle => {
-                    dialog = handle;
-                }}
-            />,
-        );
-
-        const popup = createConfirmPopup(mount, {
+    await showReactPopup(
+        <ToolDescriptionDialog
+            tool={tool}
+            override={override}
+            save={save}
+            tr={tr}
+            ref={handle => {
+                dialog = handle;
+            }}
+        />,
+        mount => createConfirmPopup(mount, {
             okButton: tr('save'),
             cancelButton: tr('cancel'),
             ...(override ? { customButtons: [tr('resetCustomization')] } : {}),
@@ -148,9 +143,6 @@ export async function openToolDialog({
                 }
                 return (await dialog?.submit(reset)) === true;
             },
-        });
-        await popup.show();
-    } finally {
-        root.unmount();
-    }
+        }),
+    );
 }

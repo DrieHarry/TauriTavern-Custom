@@ -47,6 +47,7 @@ type FrontendLogEntry = {
 - 前端日志 capture 开关由宿主统一管理。
 - 调用方不应再自行读写相关 `localStorage` key。
 - `unsubscribe` 可安全重复调用。
+- 页面开始卸载（非 bfcache 的 `pagehide`）后，宿主不再捕获日志，订阅者也不会在页面销毁过程中被调用。
 - 为避免 DEBUG/INFO 噪声挤掉关键告警，宿主按级别独立保留：`debug` 400 条、`info` 300 条、`warn`+`error` 共 100 条。
 - `message` 是用于 UI 展示的 **preview**：可能被截断；对象参数会被摘要化。需要完整请求/响应体请使用 `llmApiLogs.getRaw()` 或导出日志。
 
@@ -160,17 +161,18 @@ type LlmApiLogRaw = {
 ## 4. `exportBundle()`
 
 ```js
-const zipPath = await dev.exportBundle();
+const delivered = await dev.exportBundle();
 ```
 
 ### 方法
 
 | 方法 | 返回值 | 说明 |
 | --- | --- | --- |
-| `exportBundle()` | `Promise<string>` | 导出 debug bundle（zip）并返回保存路径 |
+| `exportBundle()` | `Promise<boolean>` | 生成并交付 debug bundle（zip）；取消返回 `false`，失败抛出错误 |
 
 ### 语义
 
+- 由用户在系统保存面板中选择位置（iOS 为分享面板），见[文件传输](../CurrentState/FileTransfer.md)。
 - 导出内容包含后端文件日志、前端日志 snapshot、LLM API Logs（含 raw）与设置/版本信息。
 - 导出文件可能包含 prompt/响应体等敏感信息；分享前请自行检查。
 

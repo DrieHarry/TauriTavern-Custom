@@ -1,4 +1,4 @@
-# ChatSurface Participant Project Contract v1
+# ChatSurface Project Contract v1
 
 ChatSurface 只建立一个边界：完整 `chat[]` 是数据事实，`#chat > .mes` 是可丢弃的有界投影。扩展在消息、内容或重型 runtime 存活期间持有的资源，必须在相应寿命结束时同步释放。投影变化不是消息业务变化，因此不会伪造 SillyTavern 事件。
 
@@ -9,6 +9,7 @@ window.__TAURITAVERN__.api.chatSurface = {
     protocolVersion: 1,
     isManagedOwnershipRequired(),
     registerParticipant(definition),
+    registerContentProcessor(definition),
 };
 ```
 
@@ -55,6 +56,50 @@ registration?.fault(error); // participant 已无法继续履约
 - `false` 或 API 不存在：保留上游 static renderer。
 
 扩展不能从当前 DOM 形状推断 ownership。所有 participant 必须在第一次 projection 前完成注册；本页不支持热注册或热注销。
+
+## 异步内容预处理
+
+异步模板通过 `registerContentProcessor()` 计算显示 HTML，在 participant 申领 runtime source 之前完成。只处理内容的扩展无需注册 participant，也不参与通用代码块 renderer 的互斥判断。
+
+扩展在 manifest 中声明独立的启动 hook：
+
+```json
+{ "hooks": { "chatSurface": "registerChatSurface" } }
+```
+
+bounded 启动会提前激活这些扩展，按现有 manifest 顺序等待 hook 完成，再允许首次聊天投影。hook 必须是 JS 入口的真实命名导出；初始化失败会阻止启动，不使用普通 activation 的诊断超时继续执行。上游 SillyTavern 忽略此 hook，扩展仍需保留自己的 static 路径。
+
+```js
+let registration;
+
+export async function registerChatSurface() {
+    await initializeTemplateData();
+    registration = window.__TAURITAVERN__.api.chatSurface.registerContentProcessor({
+        id: 'my-extension/message-content',
+        async prepare({ message, mesid, signal }, renderBase) {
+            await processRawMessage(message, mesid, signal);
+            const html = await renderBase();
+            return evaluateDisplayTemplate(html, { message, mesid, signal });
+        },
+    });
+}
+
+// 世界书、设置或其他模板依赖发生变化。
+await registration.refresh();
+```
+
+- `prepare` 接收稳定的消息对象、本次请求的 `mesid` 和 `AbortSignal`，返回 HTML 字符串；不读写 live DOM，也不创建运行中的 iframe、observer 或 timer。
+- `renderBase()` 取得后续处理器和宿主格式化的结果；同一次 `prepare` 中重复读取共用同一个 Promise，不会重复执行下游。先注册的处理器包裹后注册的处理器；消息请求串行执行。需要修改原文时，在首次调用 `renderBase()` 前完成；不要在 hook 中调用 `updateMessageBlock()`、重绘或 `refresh()`。
+- 异步处理结果按消息对象缓存，内容与宿主格式化输出不变时可在重挂载时复用；同步格式化仍可重跑。世界书、变量等外部依赖变化须由扩展调用 `refresh()`。
+- 宿主仅保存 participant 加入 wrapper/runtime 之前的 HTML 字符串，不保存 DOM、不写回 `extra.display_text`，聊天 epoch 结束后释放结果。
+- 首次准备或更新等待期间，`.mes_text` 为空且标记 `aria-busy`；`didMount` 仍表达楼层挂载。准备完成后，通过现有内容事务提交，再运行 `prepareContent`、`didCommitContent` 与 runtime admission。
+- 编辑与流式中间内容不执行处理器或启动 runtime。核心生成路径在 `MESSAGE_RECEIVED` 处理完成后提交最终内容，再发送 rendered 事件；同步 `addOneMessage()` / `updateMessageBlock()` 仍同步返回，异步显示完成以 `didCommitContent` 为准。
+- 消息编辑器打开期间，正文更新（包括 `updateMessageBlock()`）不替换它；完成或取消编辑时按消息数据重新渲染。
+- `refresh()` 更新已挂载的正文与 reasoning，保留 root 和 mount lease；流式内容与正在编辑的 reasoning 延至结束后更新。reasoning 不进入正文异步处理链。
+- 内容被替代、处理中消息被删除或重编号、聊天切换时，signal abort，旧结果不得回写。扩展需要配合取消自己的异步操作；宿主无法回滚模板已经产生的业务副作用。
+- 注册必须早于首次投影；重复 id、非法返回值与处理异常立即报错，处理异常带处理器 id 和消息位置并 fault 当前 epoch。`refresh()` 返回的 Promise 等待当前挂载消息完成准备并传播错误。
+
+生成普通 HTML 代码块后，JSR 可继续按 participant v1 申领它们。扩展若有自己的 iframe 功能，也必须输出可申领的惰性 source，并通过现有 participant 的 grant/revoke 生命周期创建和释放 iframe。
 
 ## Participant
 
@@ -119,7 +164,9 @@ activate({ source, mesid, element, content, signal }) => Disposable
 ## 错误与事件边界
 
 - registration 字段、协议版本和 hook 参数不合法时立即抛错；
+- 必需 renderer 激活失败时向启动调用者传播原始错误；只有激活流程正常返回后才检查 required participant，避免掩盖加载或 hook 的实际失败原因；
 - duplicate claim、ownership 分歧、异步 disposer 或同步写重入会 fault 当前有界 epoch；
+- 有界模式下 `#chat` 的直接子元素只有楼层、spacer 与 style pins。其他直接子元素在下一次投影提交时 fault 当前有界 epoch，错误以 `tag#id.class` 描述该元素；扩展要在聊天末尾显示内容，应放在 `#chat` 之外或楼层内部；
 - participant 在 hook 外无法继续履约时调用 `registration.fault(error)`；
 - fault 保留完整 `chat[]` 和当前有界 DOM，不自动展开完整历史；
 - mount/remount/content/runtime lifecycle 不发送 `MESSAGE_UPDATED`、`MORE_MESSAGES_LOADED`、`USER_MESSAGE_RENDERED` 或 `CHARACTER_MESSAGE_RENDERED`。
@@ -133,6 +180,6 @@ activate({ source, mesid, element, content, signal }) => Disposable
 | JS-Slash-Runner | `js-slash-runner/message-runtime` |
 | LittleWhiteBox | `littlewhitebox/message-runtime` |
 
-缺少 required participant、协议不匹配或 participant fault 会拒绝 bounded epoch，不会退回 full DOM。static 策略仍运行原 renderer。
+缺少 required participant、多个已知 renderer 同时开启代码块渲染、协议不匹配或 participant fault 会拒绝 bounded epoch，不会退回 full DOM。static 策略仍运行原 renderer。
 
 managed 首版只承诺 capability matrix 中已经验证的核心 frontend/iframe runtime；不宣称支持 JSR managed streaming renderer，也不宣称支持 LWB immersive、TTS、draw、story-outline 或 custom-template 等未接入能力。

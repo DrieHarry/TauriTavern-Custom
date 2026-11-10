@@ -4,12 +4,14 @@ use std::collections::{BinaryHeap, HashSet};
 use serde::Deserialize;
 
 use tt_domain::errors::DomainError;
+use tt_domain::frozen_macros::{FrozenMacros, MAX_EXPANDED_TEXT_BYTES};
 use tt_domain::text_search::normalize_search_query;
 use tt_ports::repositories::chat_repository::{
     ChatMessageRole, ChatMessageSearchFilters, ChatMessageSearchHit, ChatMessageSearchQuery,
 };
 
 use super::{FileChatRepository, classify_message_role};
+use crate::chat_jsonl::trim_whitespace;
 
 const MAX_QUERY_TOKENS: usize = 64;
 const MAX_BIGRAM_TOKENS_PER_SEGMENT: usize = 32;
@@ -229,6 +231,7 @@ struct Candidate {
 }
 
 struct CandidateSearchPlan {
+    frozen_macros: Option<std::sync::Arc<FrozenMacros>>,
     min_index: usize,
     max_index: usize,
     role_filter: Option<ChatMessageRole>,
@@ -327,6 +330,7 @@ impl FileChatRepository {
 
         let mut remaining_scan = resolve_scan_limit(total_count, filters)?;
         let plan = CandidateSearchPlan {
+            frozen_macros: query.frozen_macros,
             min_index: start_index,
             max_index: end_index,
             role_filter,
@@ -414,6 +418,7 @@ impl FileChatRepository {
 
         let mut remaining_scan = resolve_scan_limit(total_count, filters)?;
         let plan = CandidateSearchPlan {
+            frozen_macros: query.frozen_macros,
             min_index: start_index,
             max_index: end_index,
             role_filter,
@@ -476,7 +481,12 @@ fn collect_candidates_from_lines(
             continue;
         }
 
-        let message: SearchableChatMessage = serde_json::from_str(line).map_err(|error| {
+        if !trim_whitespace(line.as_bytes()).starts_with(b"{") {
+            return Err(DomainError::InvalidData(format!(
+                "Chat message {index} must be a JSON object"
+            )));
+        }
+        let mut message: SearchableChatMessage = serde_json::from_str(line).map_err(|error| {
             DomainError::InvalidData(format!("Failed to parse chat message JSON: {}", error))
         })?;
 
@@ -487,6 +497,12 @@ fn collect_candidates_from_lines(
             continue;
         }
 
+        if let Some(macros) = &plan.frozen_macros
+            && let std::borrow::Cow::Owned(text) =
+                macros.render(&message.mes, MAX_EXPANDED_TEXT_BYTES)?
+        {
+            message.mes = text;
+        }
         let (score, match_byte) = score_text(&message.mes, &plan.tokens, plan.needs_lowercase);
         if score <= 0.0 {
             continue;
