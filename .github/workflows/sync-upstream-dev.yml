@@ -24,6 +24,7 @@ jobs:
         with:
           ref: dev
           fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
 
       - name: Configure Git
         run: |
