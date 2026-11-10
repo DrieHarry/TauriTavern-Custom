@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use tt_contracts::host::HostKind;
+use tt_ports::database::DatabaseFileAccess;
 
 use async_trait::async_trait;
 use ttsync_client::{
@@ -24,17 +26,20 @@ use tt_domain::errors::DomainError;
 use tt_ports::sync::{SyncJobEventPublisher, SyncJobExecutor};
 
 pub struct InfrastructureSyncJobExecutor {
+    host_kind: HostKind,
     lan_sync_root: std::path::PathBuf,
     events: Arc<dyn SyncJobEventPublisher>,
     lan_peer_store: LanPeerStore,
     lan_discovery: LanPeerDiscovery,
     tt_runtime: Arc<TtSyncRuntime>,
     product_user_agent: String,
+    database: Arc<dyn DatabaseFileAccess>,
 }
 
 // Sync failures intentionally carry the error and any partial local mutation state together.
 #[allow(clippy::result_large_err)]
 impl InfrastructureSyncJobExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         lan_sync_root: std::path::PathBuf,
         events: Arc<dyn SyncJobEventPublisher>,
@@ -42,6 +47,8 @@ impl InfrastructureSyncJobExecutor {
         lan_discovery: LanPeerDiscovery,
         tt_runtime: Arc<TtSyncRuntime>,
         product_user_agent: impl Into<String>,
+        database: Arc<dyn DatabaseFileAccess>,
+        host_kind: HostKind,
     ) -> Self {
         let product_user_agent = product_user_agent.into();
         assert!(
@@ -50,6 +57,8 @@ impl InfrastructureSyncJobExecutor {
         );
 
         Self {
+            host_kind,
+            database,
             lan_sync_root,
             events,
             lan_peer_store,
@@ -70,7 +79,10 @@ impl InfrastructureSyncJobExecutor {
         let identity = self.lan_peer_store.load_or_create_identity().await?;
         let (client, status, base_url) =
             connect_peer(&peer, &self.lan_discovery, &self.product_user_agent).await?;
-        let workspace = Arc::new(TauriTavernSyncWorkspace::new(self.lan_sync_root.clone()));
+        let workspace = Arc::new(TauriTavernSyncWorkspace::new(
+            self.lan_sync_root.clone(),
+            self.database.clone(),
+        ));
         let engine = ClientSyncEngine::new(
             client.into_sync_client(),
             workspace,
@@ -83,7 +95,11 @@ impl InfrastructureSyncJobExecutor {
         let observer = SyncJobProgressObserver::new(self.events.clone(), job.context());
         let result = engine
             .pull(
-                client_options(mode, options, sync_transfer::default_transfer_concurrency()),
+                client_options(
+                    mode,
+                    options,
+                    sync_transfer::default_transfer_concurrency(self.host_kind),
+                ),
                 &observer,
             )
             .await;
@@ -135,6 +151,7 @@ impl InfrastructureSyncJobExecutor {
         )?;
         let workspace = Arc::new(TauriTavernSyncWorkspace::new(
             self.tt_runtime.sync_root.clone(),
+            self.database.clone(),
         ));
         let engine = ClientSyncEngine::new(
             client,
@@ -148,7 +165,7 @@ impl InfrastructureSyncJobExecutor {
         let observer = SyncJobProgressObserver::new(self.events.clone(), job.context());
         let result = engine
             .pull(
-                client_options(mode, options, tt_sync_transfer_concurrency()),
+                client_options(mode, options, tt_sync_transfer_concurrency(self.host_kind)),
                 &observer,
             )
             .await;
@@ -194,6 +211,7 @@ impl InfrastructureSyncJobExecutor {
         )?;
         let workspace = Arc::new(TauriTavernSyncWorkspace::new(
             self.tt_runtime.sync_root.clone(),
+            self.database.clone(),
         ));
         let engine = ClientSyncEngine::new(
             client,
@@ -207,7 +225,7 @@ impl InfrastructureSyncJobExecutor {
         let observer = SyncJobProgressObserver::new(self.events.clone(), job.context());
         let result = engine
             .direct_push(
-                client_options(mode, options, tt_sync_transfer_concurrency()),
+                client_options(mode, options, tt_sync_transfer_concurrency(self.host_kind)),
                 &observer,
             )
             .await;
@@ -312,11 +330,10 @@ fn client_options(
     client_options
 }
 
-fn tt_sync_transfer_concurrency() -> usize {
-    if cfg!(any(target_os = "android", target_os = "ios")) {
-        8
-    } else {
-        16
+fn tt_sync_transfer_concurrency(kind: HostKind) -> usize {
+    match kind {
+        HostKind::Mobile => 8,
+        HostKind::Desktop => 16,
     }
 }
 

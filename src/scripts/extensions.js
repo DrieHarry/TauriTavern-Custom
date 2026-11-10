@@ -1,6 +1,7 @@
 import { Popper, getHljs } from '../lib.js';
 
-import { eventSource, event_types, saveSettings, saveSettingsDebounced, getRequestHeaders, animation_duration, CLIENT_VERSION } from '../script.js';
+import { eventSource, event_types, saveSettings, saveSettingsDebounced, getRequestHeaders, animation_duration, CLIENT_VERSION, this_chid } from '../script.js';
+import { selected_group } from './group-chats.js';
 import { POPUP_RESULT, POPUP_TYPE, Popup, callGenericPopup } from './popup.js';
 import { renderTemplate, renderTemplateAsync } from './templates.js';
 import { delay, deleteValueByPath, equalsIgnoreCaseAndAccents, escapeHtml, isSubsetOf, sanitizeSelector, setValueByPath, versionCompare } from './utils.js';
@@ -12,10 +13,10 @@ import { accountStorage } from './util/AccountStorage.js';
 import { stripCommandErrorPrefixes } from './util/command-error-utils.js';
 import { toUserFacingErrorText } from './util/user-facing-error.js';
 import { SimpleMutex } from './util/SimpleMutex.js';
+import { initPopupMenu } from './popup-menu.js';
 import { createThirdPartyStylesheetResolver } from './extensions/runtime/third-party-runtime.js';
 import { createExtensionAssetLoader } from './extensions/runtime/asset-loader.js';
 import { getExtensionResourceUrl, isThirdPartyExtension } from './extensions/runtime/resource-paths.js';
-import { waitForTauriMainReady } from './extensions/runtime/tauri-ready.js';
 
 export {
     getContext,
@@ -106,11 +107,10 @@ export function cancelDebouncedMetadataSave() {
 }
 
 export function saveMetadataDebounced() {
-    const context = getContext();
-    const groupId = context.groupId;
-    const characterId = context.characterId;
+    const groupId = selected_group;
+    const characterId = this_chid;
 
-    cancelDebouncedMetadataSave();
+    clearTimeout(saveMetadataTimeout);
 
     saveMetadataTimeout = setTimeout(async () => {
         const newContext = getContext();
@@ -372,19 +372,17 @@ export function startOfflineExtensionsDiscovery({ forceRefresh = false } = {}) {
 
     const generation = offlineExtensionsDiscoveryGeneration;
     offlineExtensionsDiscoveryPromise = (async () => {
-        await waitForTauriMainReady();
         const extensions = await discoverExtensions();
-        const nextExtensionNames = extensions.map(x => x.name);
-        const nextExtensionTypes = Object.fromEntries(extensions.map(x => [x.name, x.type]));
-        const nextManifests = await getManifests(nextExtensionNames);
+        const nextManifests = await getManifests(extensions.map(x => x.name));
         if (generation !== offlineExtensionsDiscoveryGeneration) {
             return offlineExtensionsDiscoveryPromise ?? [];
         }
 
-        extensionNames = nextExtensionNames;
-        extensionTypes = nextExtensionTypes;
+        const availableExtensions = extensions.filter(x => Object.hasOwn(nextManifests, x.name));
+        extensionNames = availableExtensions.map(x => x.name);
+        extensionTypes = Object.fromEntries(availableExtensions.map(x => [x.name, x.type]));
         manifests = nextManifests;
-        return extensions;
+        return availableExtensions;
     })();
 
     return offlineExtensionsDiscoveryPromise;
@@ -404,7 +402,6 @@ async function prepareOfflineExtensionsActivation({
     }
 
     offlineExtensionsPreparationPromise = (async () => {
-        await waitForTauriMainReady();
         const uiReady = ensureExtensionsUiReady();
 
         extensionLoadErrors.clear();
@@ -623,14 +620,19 @@ export function findExtension(name) {
     return { name: internalExtensionName, enabled: isEnabled };
 }
 
+// An absent switch counts as enabled: both renderers default to rendering, and a
+// missing schema must not silently admit two runtime claimants for one source.
 export const CHAT_SURFACE_RENDERER_CAPABILITIES = Object.freeze([
     Object.freeze({
         extensionName: 'JS-Slash-Runner',
         participantId: 'js-slash-runner/message-runtime',
+        rendersCodeBlocks: () => extension_settings.tavern_helper?.render?.enabled !== false,
     }),
     Object.freeze({
         extensionName: 'LittleWhiteBox',
         participantId: 'littlewhitebox/message-runtime',
+        rendersCodeBlocks: () => extension_settings.LittleWhiteBox?.enabled !== false
+            && extension_settings.LittleWhiteBox?.renderEnabled !== false,
     }),
 ]);
 
@@ -653,15 +655,25 @@ export function isCodeRenderDelegatedToThirdPartyRenderer() {
     return getEnabledChatSurfaceRendererCapabilities().length > 0;
 }
 
+/** More than one enabled renderer extension renders code blocks. */
+export class ChatSurfaceRendererConflictError extends Error {
+    /** @param {string[]} displayNames */
+    constructor(displayNames) {
+        super(`Bounded ChatSurface cannot start while multiple renderers have code block rendering enabled: ${displayNames.join(', ')}`);
+        this.name = 'ChatSurfaceRendererConflictError';
+        this.displayNames = displayNames;
+    }
+}
+
 /**
  * Initializes ChatSurface hooks and the required renderer before the first projection.
  */
 export async function activateRequiredChatSurfaceExtensions() {
     const enabled = getEnabledChatSurfaceRendererCapabilities();
-    if (enabled.length > 1) {
-        throw new Error(
-            'Bounded ChatSurface cannot start while JS-Slash-Runner and LittleWhiteBox are both enabled',
-        );
+    const codeRenderers = enabled.filter(capability => capability.rendersCodeBlocks());
+    if (codeRenderers.length > 1) {
+        throw new ChatSurfaceRendererConflictError(codeRenderers.map(({ extensionName, internalName }) =>
+            manifests[internalName].display_name || extensionName));
     }
     const requiredNames = new Set(enabled.map(capability => capability.internalName));
     const contentExtensions = extensionNames.filter(name =>
@@ -925,31 +937,14 @@ async function addExtensionsButtonAndMenu() {
 
     const button = $('#extensionsMenuButton');
     const dropdown = $('#extensionsMenu');
-    let isDropdownVisible = false;
 
     let popper = Popper.createPopper(button.get(0), dropdown.get(0), {
         placement: 'top-start',
     });
 
-    $(button).on('click', function () {
-        if (isDropdownVisible) {
-            dropdown.fadeOut(animation_duration);
-            isDropdownVisible = false;
-        } else {
-            dropdown.fadeIn(animation_duration);
-            isDropdownVisible = true;
-        }
-        popper.update();
-    });
-
-    $('html').on('click', function (e) {
-        if (!isDropdownVisible) return;
-        const clickTarget = $(e.target);
-        const noCloseTargets = ['#sd_gen', '#extensionsMenuButton', '#roll_dice'];
-        if (!noCloseTargets.some(id => clickTarget.closest(id).length > 0)) {
-            dropdown.fadeOut(animation_duration);
-            isDropdownVisible = false;
-        }
+    initPopupMenu(button[0], dropdown[0], {
+        onOpen: () => { popper.update(); },
+        closesOnClick: target => !target.closest('#sd_gen, #roll_dice'),
     });
 }
 

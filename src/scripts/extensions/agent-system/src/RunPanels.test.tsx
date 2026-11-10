@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, expect, test } from '@rstest/core';
 
@@ -93,7 +93,6 @@ function unusedRetention(): RunRetentionController {
 const disposables: Array<RunHistoryController | RunRetentionController> = [];
 
 afterEach(() => {
-    cleanup();
     disposables.splice(0).forEach((controller) => controller.dispose());
 });
 
@@ -111,6 +110,7 @@ test('the newest History filter response wins', async () => {
             stableChatId: 'stable-current',
         }),
         openRun: () => undefined,
+        resumeRun: () => Promise.resolve(),
     });
     const retention = unusedRetention();
     disposables.push(history, retention);
@@ -138,6 +138,26 @@ test('the newest History filter response wins', async () => {
     expect(screen.queryByText('Stale Chat')).toBeNull();
 });
 
+test('History resumes stopped runs from the current chat and leaves completed runs read-only', async () => {
+    const stopped = { ...run('stopped-run', 'Current'), status: 'cancelled' as const };
+    const resumed: string[] = [];
+    const history = createRunHistoryController({
+        listRuns: () => Promise.resolve({ runs: [stopped, run('completed-run', 'Current')] }),
+        currentChatRunFilter: () => Promise.resolve({ chatRef: stopped.chatRef, stableChatId: stopped.stableChatId }),
+        openRun: () => undefined,
+        resumeRun: runId => { resumed.push(runId); return Promise.resolve(); },
+    });
+    const retention = unusedRetention();
+    disposables.push(history, retention);
+    render(<RunHistoryPanel controller={history} retention={retention} tr={tr} />);
+    await act(() => history.refresh());
+    expect(screen.queryByRole('button', { name: 'timelineActionResume' })).toBeNull();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'runHistoryCurrentChat' }));
+    await user.click(await screen.findByRole('button', { name: 'timelineActionResume' }));
+    expect(resumed).toEqual(['stopped-run']);
+});
+
 test('Retention validates, confirms, applies, and refreshes History', async () => {
     const state = {
         readCalls: 0,
@@ -155,6 +175,7 @@ test('Retention validates, confirms, applies, and refreshes History', async () =
         },
         currentChatRunFilter: () => Promise.reject(new Error('unused')),
         openRun: () => undefined,
+        resumeRun: () => Promise.resolve(),
     });
     const retention = createRunRetentionController({
         getRetentionApi: () => ({

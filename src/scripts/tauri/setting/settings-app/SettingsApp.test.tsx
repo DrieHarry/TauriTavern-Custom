@@ -20,14 +20,10 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const tr = (key: string) => key;
 
 const handles: SettingsHandle[] = [];
-const containers: HTMLElement[] = [];
 
 afterEach(() => {
     for (const handle of handles.splice(0)) {
         act(() => handle.unmount());
-    }
-    for (const container of containers.splice(0)) {
-        container.remove();
     }
 });
 
@@ -48,6 +44,7 @@ function createValues(overrides: ValuesOverrides = {}): SettingsValues {
         panelRuntimeProfile: 'off',
         embeddedRuntimeProfile: 'off',
         chatVirtualizationEnabled: false,
+        coldSwipesEnabled: false,
         codeMirrorEditorEnabled: false,
         chatBackups: {
             automaticEnabled: true,
@@ -61,7 +58,7 @@ function createValues(overrides: ValuesOverrides = {}): SettingsValues {
         requestProxy: { enabled: false, url: '', bypass: [], ...overrides.requestProxy },
         allowKeysExposure: false,
         avatarPersonaOriginalImagesEnabled: false,
-        nativeRegexBackendEnabled: true,
+        oledBackgroundEnabled: false,
         dynamicTheme: {
             themeEnabled: false,
             dayTheme: '',
@@ -125,7 +122,6 @@ function createOptions(overrides: Partial<SettingsMountOptions> = {}): SettingsM
 function mountApp(options: SettingsMountOptions = createOptions()): { container: HTMLElement; handle: SettingsHandle } {
     const container = document.createElement('div');
     document.body.append(container);
-    containers.push(container);
     let handle!: SettingsHandle;
     act(() => {
         handle = mountTauriTavernSettingsApp(container, options);
@@ -180,10 +176,13 @@ test('draft preserves stored emptiness and exposes synchronous isolated edits', 
             target: { value: 'aggressive' },
         });
         fireEvent.click(within(container).getByRole('checkbox', { name: 'Automatic Chat Backups' }));
+        fireEvent.click(within(container).getByRole('checkbox', { name: 'OLED Pure Black Background' }));
         snapshot = handle.getDraft();
     });
     expect(snapshot.panelRuntimeProfile).toBe('aggressive');
     expect(snapshot.chatBackups.automaticEnabled).toBe(false);
+    expect(snapshot.oledBackgroundEnabled).toBe(true);
+    expect(options.viewModel.values.oledBackgroundEnabled).toBe(false);
 
     snapshot.chatBackups.maxTotalFiles = 'mutated';
     expect(handle.getDraft().chatBackups.maxTotalFiles).toBe('500');

@@ -5,7 +5,10 @@ use reqwest::StatusCode;
 use reqwest::header::CONTENT_TYPE;
 use serde_json::Value;
 
+use tt_adapter_http::upstream;
 use tt_domain::errors::DomainError;
+
+use super::context_overflow::context_overflow_or;
 
 /// Maximum number of bytes from a non-JSON upstream body to capture in the
 /// diagnostic log. Anything larger is truncated; the full `body_len` is still
@@ -69,23 +72,10 @@ pub(super) async fn read_upstream_json_body(
         .to_string();
     let endpoint = response.url().clone();
 
-    let body = response.bytes().await.map_err(|error| {
-        let failure = crate::http_error::reqwest_body_failure(&error, Some(&endpoint));
-        tracing::warn!(
-            provider = provider_name,
-            operation = operation,
-            status = status.as_u16(),
-            code = %failure.code,
-            category = %failure.category,
-            endpoint = failure.endpoint.as_deref().unwrap_or(""),
-            timeout = error.is_timeout(),
-            connect = error.is_connect(),
-            body = error.is_body(),
-            request = error.is_request(),
-            "upstream response body read failed",
-        );
-        DomainError::upstream_failure(failure)
-    })?;
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| upstream::body_failure(error, &endpoint))?;
 
     parse_upstream_json_body(
         provider_name,
@@ -104,7 +94,14 @@ pub(super) fn parse_upstream_json_body(
     body: &[u8],
 ) -> Result<Value, DomainError> {
     match serde_json::from_slice::<Value>(body) {
-        Ok(value) => Ok(value),
+        Ok(value) => match provider_error(&value) {
+            Some(error) => Err(context_overflow_or(
+                error,
+                format!("{provider_name}: {}", provider_error_message(error, &value)),
+                DomainError::InvalidData,
+            )),
+            None => Ok(value),
+        },
         Err(error) => {
             log_upstream_body_parse_failure(
                 provider_name,
@@ -120,6 +117,31 @@ pub(super) fn parse_upstream_json_body(
             )))
         }
     }
+}
+
+/// Provider-declared errors can arrive in a successful HTTP response.
+pub(super) fn provider_error(value: &Value) -> Option<&Value> {
+    value
+        .get("error")
+        .or_else(|| value.pointer("/detail/error"))
+        .filter(|error| !error.is_null() && **error != Value::Bool(false))
+}
+
+pub(super) fn provider_error_message(error: &Value, envelope: &Value) -> String {
+    let message = if error.is_string() {
+        error
+    } else {
+        error
+            .get("message")
+            .or_else(|| envelope.get("message"))
+            .or_else(|| error.get("code"))
+            .or_else(|| error.get("type"))
+            .unwrap_or(error)
+    };
+    message
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| message.to_string())
 }
 
 #[cfg(test)]

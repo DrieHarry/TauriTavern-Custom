@@ -7,6 +7,8 @@ mod persistent_store;
 mod run_prune_store;
 mod run_record;
 mod run_store;
+mod session_store;
+mod workspace_fs;
 mod workspace_store;
 
 #[cfg(test)]
@@ -19,18 +21,18 @@ use std::sync::Weak;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::fs::read_to_string;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use tt_adapter_storage_core::file_system::{read_json_file, write_json_file};
 use tt_domain::errors::DomainError;
 
 pub struct FileAgentRepository {
     pub(super) root: PathBuf,
-    // ponytail: one append lock stays simpler than per-run lock lifecycle; split only if
+    // One append lock stays simpler than per-run lock lifecycle; split only if
     // concurrent runs become measurable after removing journal scans from the hot path.
     pub(super) event_sequences: Mutex<HashMap<String, u64>>,
     pub(super) persist_lock: Mutex<()>,
-    pub(super) workspace_write_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+    pub(super) workspace_locks: Mutex<HashMap<String, Weak<RwLock<()>>>>,
 }
 
 impl FileAgentRepository {
@@ -39,7 +41,7 @@ impl FileAgentRepository {
             root,
             event_sequences: Mutex::new(HashMap::new()),
             persist_lock: Mutex::new(()),
-            workspace_write_locks: Mutex::new(HashMap::new()),
+            workspace_locks: Mutex::new(HashMap::new()),
         }
     }
 

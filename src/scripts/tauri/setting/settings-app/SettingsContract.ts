@@ -30,11 +30,12 @@ export type SettingsDataRootState = {
     migrationError: string;
 };
 
-/** The camelCase subset of setting-panel/settings-state.js that the app reads. */
+/** Normalized backend settings and device-local appearance from settings-view-model.js. */
 export type SettingsValues = {
     panelRuntimeProfile: string;
     embeddedRuntimeProfile: string;
     chatVirtualizationEnabled: boolean;
+    coldSwipesEnabled: boolean;
     codeMirrorEditorEnabled: boolean;
     chatBackups: {
         automaticEnabled: boolean;
@@ -51,7 +52,7 @@ export type SettingsValues = {
     };
     allowKeysExposure: boolean;
     avatarPersonaOriginalImagesEnabled: boolean;
-    nativeRegexBackendEnabled: boolean;
+    oledBackgroundEnabled: boolean;
     dynamicTheme: {
         themeEnabled: boolean;
         dayTheme: string;
@@ -102,6 +103,7 @@ export type SettingsDraft = {
     panelRuntimeProfile: string;
     embeddedRuntimeProfile: string;
     chatVirtualizationEnabled: boolean;
+    coldSwipesEnabled: boolean;
     codeMirrorEditorEnabled: boolean;
     chatBackups: {
         automaticEnabled: boolean;
@@ -119,7 +121,7 @@ export type SettingsDraft = {
     };
     allowKeysExposure: boolean;
     avatarPersonaOriginalImagesEnabled: boolean;
-    nativeRegexBackendEnabled: boolean;
+    oledBackgroundEnabled: boolean;
     dynamicTheme: {
         themeEnabled: boolean;
         dayTheme: string;
@@ -148,6 +150,7 @@ export function createSettingsDraft(values: SettingsValues): SettingsDraft {
         panelRuntimeProfile: values.panelRuntimeProfile,
         embeddedRuntimeProfile: values.embeddedRuntimeProfile,
         chatVirtualizationEnabled: values.chatVirtualizationEnabled,
+        coldSwipesEnabled: values.coldSwipesEnabled,
         codeMirrorEditorEnabled: values.codeMirrorEditorEnabled,
         chatBackups: {
             automaticEnabled: values.chatBackups.automaticEnabled,
@@ -165,7 +168,7 @@ export function createSettingsDraft(values: SettingsValues): SettingsDraft {
         },
         allowKeysExposure: values.allowKeysExposure,
         avatarPersonaOriginalImagesEnabled: values.avatarPersonaOriginalImagesEnabled,
-        nativeRegexBackendEnabled: values.nativeRegexBackendEnabled,
+        oledBackgroundEnabled: values.oledBackgroundEnabled,
         dynamicTheme: {
             themeEnabled: values.dynamicTheme.themeEnabled,
             dayTheme: values.dynamicTheme.dayTheme,

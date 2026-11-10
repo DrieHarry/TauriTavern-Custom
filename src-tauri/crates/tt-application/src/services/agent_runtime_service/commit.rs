@@ -1,5 +1,4 @@
-use serde_json::{Value, json};
-use std::path::Path;
+use serde_json::json;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -15,15 +14,15 @@ use crate::errors::ApplicationError;
 use crate::services::agent_tools::{
     AgentToolDispatchOutcome, AgentToolEffect, classify_workspace_io_error,
 };
+use crate::services::agent_workspace_scope::is_auto_commit_text_path;
+use tt_domain::errors::DomainError;
 use tt_domain::models::agent::{
-    AgentChatCommitMode, AgentInvocationStatus, AgentRun, AgentRunEventLevel, AgentRunStatus,
-    AgentToolResult, ArtifactTarget, WorkspacePath, WorkspacePersistentChangeSet,
+    AgentChatCommitMode, AgentRun, AgentRunEventLevel, AgentRunStatus, AgentToolResult,
+    ArtifactTarget, WorkspacePath, WorkspacePersistentChangeSet,
 };
 use tt_domain::models::tool::ToolInvocation;
 use tt_domain::text_metrics::TextMetrics;
-use tt_ports::repositories::workspace_repository::WorkspaceFile;
-
-const AUTO_COMMIT_TEXT_EXTENSIONS: &[&str] = &["md", "markdown", "txt", "text"];
+use tt_ports::workspace_fs::WorkspaceFile;
 
 enum HostChatCommitOutcome {
     Committed {
@@ -144,21 +143,21 @@ impl AgentRuntimeService {
         commit_ledger: &mut RunCommitLedger,
         cancel: &mut AgentCancelReceiver,
     ) -> Result<AgentToolDispatchOutcome, ApplicationError> {
-        let file = match self.workspace_repository.read_text(run_id, &path).await {
+        let file = match self.workspace_files(run_id).await?.read_text(&path).await {
             Ok(file) => file,
             Err(error) => match classify_workspace_io_error(call, error) {
                 Ok(result) => {
-                    return Ok(AgentToolDispatchOutcome {
+                    return Ok(AgentToolDispatchOutcome::new(
                         result,
-                        effect: AgentToolEffect::None,
+                        AgentToolEffect::None,
                         elapsed_ms,
-                    });
+                    ));
                 }
                 Err(error) => return Err(error.into()),
             },
         };
         if self.required_artifact_is_empty(run_id, &file).await? {
-            return Ok(recoverable_tool_error(
+            return Ok(AgentToolDispatchOutcome::error(
                 call,
                 "workspace.required_artifact_empty",
                 &format!("{} is empty", path.as_str()),
@@ -189,7 +188,7 @@ impl AgentRuntimeService {
                 message_index,
             } => (message_id, message_index),
             HostChatCommitOutcome::Rejected(message) => {
-                return Ok(recoverable_tool_error(
+                return Ok(AgentToolDispatchOutcome::error(
                     call,
                     "agent.chat_commit_rejected",
                     &message,
@@ -198,54 +197,63 @@ impl AgentRuntimeService {
             }
         };
 
-        Ok(AgentToolDispatchOutcome {
-            result: AgentToolResult {
-                call_id: call.call_id.clone(),
-                tool_id: call.tool_id.clone(),
-                content: format!(
-                    "Committed {} to the current chat message with mode {:?}. \
+        let mut result = AgentToolResult::ok(
+            call,
+            format!(
+                "Committed {} to the current chat message with mode {:?}. \
                      You may continue editing and commit again if needed. When all intended \
                      commits are complete, call workspace_finish to end the run. Do not use \
                      plain text as the final answer; the run must finish through \
                      workspace_finish.",
-                    path.as_str(),
-                    mode
-                ),
-                structured: json!({
-                    "path": path.as_str(),
-                    "mode": mode,
-                    "messageId": message_id.as_deref(),
-                    "messageIndex": message_index,
-                    "chars": file_metrics.chars,
-                    "words": file_metrics.words,
-                }),
-                is_error: false,
-                error_code: None,
-                resource_refs: vec![path.as_str().to_string()],
-            },
-            effect: AgentToolEffect::None,
+                path.as_str(),
+                mode
+            ),
+            json!({
+                "path": path.as_str(),
+                "mode": mode,
+                "messageId": message_id.as_deref(),
+                "messageIndex": message_index,
+                "chars": file_metrics.chars,
+                "words": file_metrics.words,
+            }),
+        );
+        result.resource_refs = vec![path.as_str().to_string()];
+        Ok(AgentToolDispatchOutcome::new(
+            result,
+            AgentToolEffect::None,
             elapsed_ms,
-        })
+        ))
     }
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "automatic commit forwards the round's final immutable mutation to the shared host boundary"
+        reason = "automatic commit reads the round's current file before the shared host boundary"
     )]
     pub(super) async fn auto_commit_text_file_if_eligible(
         &self,
         run_id: &str,
         call_id: &str,
-        file: &WorkspaceFile,
+        path: &WorkspacePath,
         round: usize,
         invocation_id: &str,
         commit_ledger: &mut RunCommitLedger,
         cancel: &mut AgentCancelReceiver,
     ) -> Result<(), ApplicationError> {
-        if commit_ledger.has_explicit_commit() || !is_auto_commit_text_path(&file.path) {
+        if commit_ledger.has_explicit_commit() || !is_auto_commit_text_path(path) {
             return Ok(());
         }
-        if self.required_artifact_is_empty(run_id, file).await? {
+        let files = &self.active_run_handle(run_id).await?.files;
+        let file = match files.read_text(path).await {
+            Ok(file) => file,
+            // A later operation may have removed the candidate or replaced its kind.
+            Err(
+                DomainError::NotFound(_)
+                | DomainError::WorkspacePathIsDirectory { .. }
+                | DomainError::WorkspaceFileNotText { .. },
+            ) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if self.required_artifact_is_empty(run_id, &file).await? {
             return Ok(());
         }
 
@@ -253,7 +261,7 @@ impl AgentRuntimeService {
             run_id,
             HostChatCommit {
                 call_id,
-                file,
+                file: &file,
                 is_explicit: false,
                 mode: AgentChatCommitMode::Replace,
                 reason: None,
@@ -327,11 +335,11 @@ impl AgentRuntimeService {
                 "callId": call_id,
                 "runId": run.id.as_str(),
                 "workspaceId": run.workspace_id.as_str(),
-                "stableChatId": run.stable_chat_id.as_str(),
-                "chatRef": &run.chat_ref,
-                "generationType": run.generation_type.as_str(),
+                "stableChatId": run.chat_target()?.stable_chat_id.as_str(),
+                "chatRef": &run.chat_target()?.chat_ref,
+                "generationType": run.chat_target()?.generation_type.as_str(),
                 "profileId": run.profile_id.as_ref(),
-                "persistBaseStateId": run.persist_base_state_id.as_deref(),
+                "persistBaseStateId": run.chat_target()?.persist_base_state_id.as_deref(),
                 "path": file.path.as_str(),
                 "mode": mode,
                 "isExplicit": is_explicit,
@@ -430,55 +438,59 @@ impl AgentRuntimeService {
     pub(super) async fn finish_run(
         &self,
         run_id: &str,
-        final_invocation_id: &str,
         incoming_handoff_task_id: Option<&str>,
         commit_ledger: &RunCommitLedger,
+        published_state: &mut Option<WorkspacePersistentChangeSet>,
+        previous_published_state_id: Option<&str>,
         cancel: &mut AgentCancelReceiver,
     ) -> Result<(), ApplicationError> {
-        self.cancel_unfinished_child_tasks(run_id).await?;
-        self.close_guidance_mailbox_for_run(
-            run_id,
-            "run_finished_before_next_model_request",
-            AgentRunEventLevel::Info,
-        )
-        .await?;
         self.transition_status(run_id, AgentRunStatus::Finishing)
             .await?;
         let run = self.run_repository.load_run(run_id).await?;
 
-        let persistent_changes = match self
-            .workspace_repository
-            .commit_persistent_changes(run_id)
-            .await
-        {
-            Ok(changes) => changes,
-            Err(error) => {
-                self.event(
-                    run_id,
-                    AgentRunEventLevel::Error,
-                    "persistent_changes_commit_failed",
-                    json!({ "message": error.to_string() }),
-                )
-                .await?;
-                return Err(error.into());
-            }
-        };
-        self.event(
-            run_id,
-            AgentRunEventLevel::Info,
-            "persistent_changes_committed",
-            json!({
-                "stateId": persistent_changes.state_id,
-                "baseStateId": persistent_changes.base_state_id,
-                "changeCount": persistent_changes.changes.len(),
-                "changes": persistent_change_payloads(&persistent_changes),
-            }),
-        )
-        .await?;
+        // Publication is atomic. Once it succeeds, only metadata remains to retry.
+        if published_state.is_none() {
+            let persistent_changes = match self
+                .workspace_repository
+                .commit_persistent_changes(run_id, previous_published_state_id)
+                .await
+            {
+                Ok(changes) => changes,
+                Err(error) => {
+                    self.event(
+                        run_id,
+                        AgentRunEventLevel::Error,
+                        "persistent_changes_commit_failed",
+                        json!({ "message": error.to_string() }),
+                    )
+                    .await?;
+                    return Err(error.into());
+                }
+            };
+            *published_state = Some(persistent_changes);
+            let persistent_changes = published_state
+                .as_ref()
+                .expect("published persistent state");
+            self.event(
+                run_id,
+                AgentRunEventLevel::Info,
+                "persistent_changes_committed",
+                json!({
+                    "stateId": persistent_changes.state_id,
+                    "baseStateId": persistent_changes.base_state_id,
+                    "changeCount": persistent_changes.changes.len(),
+                    "changes": persistent_changes.changes,
+                }),
+            )
+            .await?;
+        }
+        let persistent_changes = published_state
+            .as_ref()
+            .expect("published persistent state");
 
         self.request_persistent_state_metadata_update(
             &run,
-            &persistent_changes,
+            persistent_changes,
             commit_ledger,
             cancel,
         )
@@ -494,24 +506,6 @@ impl AgentRuntimeService {
             )
             .await?;
         }
-        self.finish_invocation(
-            run_id,
-            final_invocation_id,
-            AgentInvocationStatus::Completed,
-        )
-        .await?;
-        self.transition_status(run_id, AgentRunStatus::Completed)
-            .await?;
-        self.event(
-            run_id,
-            AgentRunEventLevel::Info,
-            "run_completed",
-            Value::Null,
-        )
-        .await?;
-        self.active_runs.write().await.remove(run_id);
-        self.clear_pending_host_requests_for_run(run_id).await;
-
         Ok(())
     }
 
@@ -558,15 +552,15 @@ impl AgentRuntimeService {
                 "updateId": update_id.as_str(),
                 "runId": run.id.as_str(),
                 "workspaceId": run.workspace_id.as_str(),
-                "stableChatId": run.stable_chat_id.as_str(),
-                "chatRef": &run.chat_ref,
-                "generationType": run.generation_type.as_str(),
+                "stableChatId": run.chat_target()?.stable_chat_id.as_str(),
+                "chatRef": &run.chat_target()?.chat_ref,
+                "generationType": run.chat_target()?.generation_type.as_str(),
                 "profileId": run.profile_id.as_ref(),
                 "messageId": message_id,
                 "stateId": persistent_changes.state_id.as_str(),
                 "baseStateId": persistent_changes.base_state_id.as_deref(),
                 "changeCount": persistent_changes.changes.len(),
-                "changes": persistent_change_payloads(persistent_changes),
+                "changes": persistent_changes.changes,
             }),
         )
         .await?;
@@ -641,77 +635,6 @@ impl AgentRuntimeService {
     }
 }
 
-fn persistent_change_payloads(changes: &WorkspacePersistentChangeSet) -> Vec<Value> {
-    changes
-        .changes
-        .iter()
-        .map(|change| {
-            json!({
-                "path": change.path.as_str(),
-                "kind": change.kind,
-                "sha256": change.sha256.as_str(),
-            })
-        })
-        .collect()
-}
-
-fn is_auto_commit_text_path(path: &WorkspacePath) -> bool {
-    Path::new(path.as_str())
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            AUTO_COMMIT_TEXT_EXTENSIONS
-                .iter()
-                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-        })
-}
-
 fn message_index_from_message_id(message_id: Option<&str>) -> Option<usize> {
     message_id?.trim().parse::<usize>().ok()
-}
-
-fn recoverable_tool_error(
-    call: &ToolInvocation,
-    code: &str,
-    message: &str,
-    elapsed_ms: u128,
-) -> AgentToolDispatchOutcome {
-    AgentToolDispatchOutcome {
-        result: AgentToolResult {
-            call_id: call.call_id.clone(),
-            tool_id: call.tool_id.clone(),
-            content: message.to_string(),
-            structured: json!({
-                "error": {
-                    "code": code,
-                    "message": message,
-                }
-            }),
-            is_error: true,
-            error_code: Some(code.to_string()),
-            resource_refs: Vec::new(),
-        },
-        effect: AgentToolEffect::None,
-        elapsed_ms,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_auto_commit_text_path;
-    use tt_domain::models::agent::WorkspacePath;
-
-    #[test]
-    fn automatic_commit_uses_case_insensitive_text_extensions_only() {
-        for path in ["a.md", "a.MARKDOWN", "a.txt", "a.TEXT"] {
-            assert!(is_auto_commit_text_path(
-                &WorkspacePath::parse(path).unwrap()
-            ));
-        }
-        for path in ["a.json", "a.md.bak", "README"] {
-            assert!(!is_auto_commit_text_path(
-                &WorkspacePath::parse(path).unwrap()
-            ));
-        }
-    }
 }

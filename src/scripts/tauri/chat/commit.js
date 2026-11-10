@@ -1,72 +1,77 @@
 import { invoke } from '../../../tauri-bridge.js';
-import { encodeBytesToBase64 } from '../../../tauri/main/binary-utils.js';
-import { isAndroidRuntime } from '../../util/mobile-runtime.js';
-import { payloadToJsonlByteChunks } from './jsonl.js';
+import { commitBytes } from '../../../tauri/main/services/files/byte-commit.js';
+import { jsonlRecordsToByteChunks, serializeChatPayload } from './jsonl.js';
+import { coldSourceForPayload } from './cold-swipes.js';
 
-function positiveSafeInteger(value, label) {
-    const number = Number(value);
-    if (!Number.isSafeInteger(number) || number <= 0) {
-        throw new Error(`${label} must be a positive safe integer`);
+const INTEGRITY = 'integrity';
+
+/**
+ * Host commands reject with serde-tagged `CommandError` values: `{ Variant: payload }` plain objects
+ * without `message` or `stack`. Every rejection leaves this module as an Error carrying the original
+ * value as `cause`; the integrity conflict is the only one callers branch on, through `code`.
+ */
+function toChatCommitError(error) {
+    if (error instanceof Error) {
+        return error;
     }
-    return number;
+    if (error?.BadRequest === INTEGRITY) {
+        return Object.assign(new Error(INTEGRITY, { cause: error }), { code: INTEGRITY });
+    }
+    return new Error(typeof error === 'string' ? error : JSON.stringify(error), { cause: error });
+}
+
+function invokeChatCommit(...args) {
+    return invoke(...args).catch((error) => {
+        throw toChatCommitError(error);
+    });
+}
+
+export async function commitChatMetadata({ target, chatMetadata }) {
+    return commitChatRecords({
+        target,
+        operation: { kind: 'metadata' },
+        records: [serializeJson(chatMetadata)],
+        commitReason: 'mutation',
+    });
+}
+
+export async function commitChatMetadataExtension({ target, namespace, value }) {
+    return commitChatRecords({
+        target,
+        operation: { kind: 'metadataExtension', namespace },
+        records: [serializeJson(value)],
+        commitReason: 'mutation',
+    });
+}
+
+function serializeJson(value) {
+    const text = JSON.stringify(value);
+    if (text === undefined) throw new Error('Chat commit value must serialize to JSON');
+    return text;
 }
 
 export async function commitChatPayload({ target, payload, force, commitReason }) {
-    let sessionId = '';
-    const normalizedCommitReason = commitReason ?? 'mutation';
+    const records = serializeChatPayload(payload);
+    const coldSourceId = coldSourceForPayload(payload);
+    return commitChatRecords({
+        target,
+        operation: { kind: 'payload', force, ...(coldSourceId === undefined ? {} : { coldSourceId }) },
+        records,
+        commitReason,
+    });
+}
 
-    try {
-        const begin = await invoke('begin_chat_commit', { target, force });
-        sessionId = String(begin?.sessionId || '').trim();
-        if (!sessionId) {
-            throw new Error('Host chat commit did not return a session id');
-        }
-
-        const maxFrameBytes = positiveSafeInteger(begin?.maxFrameBytes, 'Host chat commit frame limit');
-        const android = isAndroidRuntime();
-        let offset = 0;
-
-        for (const frame of payloadToJsonlByteChunks(payload, { maxChunkBytes: maxFrameBytes })) {
-            const headers = {
-                'session-id': sessionId,
-                offset: String(offset),
-            };
-            const nextOffset = Number(await (android
-                ? invoke('append_chat_commit_chunk', { data: encodeBytesToBase64(frame) }, {
-                    headers: {
-                        ...headers,
-                        'chunk-encoding': 'base64',
-                    },
-                })
-                : invoke('append_chat_commit_chunk', frame, { headers })));
-            const expectedNextOffset = offset + frame.byteLength;
-            if (nextOffset !== expectedNextOffset) {
-                throw new Error(`Host chat commit returned unexpected offset ${nextOffset}`);
-            }
-            offset = nextOffset;
-        }
-
-        const finished = await invoke('finish_chat_commit', {
+// Callers capture all payload values as JSON text before this first await.
+async function commitChatRecords({ target, operation, records, commitReason }) {
+    await commitBytes({
+        begin: () => invokeChatCommit('begin_chat_commit', { target, operation }),
+        frames: maxChunkBytes => jsonlRecordsToByteChunks(records, { maxChunkBytes }),
+        append: (body, options) => invokeChatCommit('append_chat_commit_chunk', body, options),
+        finish: (sessionId, expectedSize) => invokeChatCommit('finish_chat_commit', {
             sessionId,
-            expectedSize: offset,
-            commitReason: normalizedCommitReason,
-        });
-        sessionId = '';
-
-        if (Number(finished?.size) !== offset) {
-            throw new Error(`Host chat commit returned unexpected size ${finished?.size}`);
-        }
-    } catch (error) {
-        if (sessionId) {
-            try {
-                await invoke('abort_chat_commit', { sessionId });
-            } catch (abortError) {
-                throw new AggregateError(
-                    [error, abortError],
-                    String(error?.message || error || 'Chat commit failed'),
-                );
-            }
-        }
-        throw error;
-    }
+            expectedSize,
+            commitReason,
+        }),
+        abort: sessionId => invokeChatCommit('abort_chat_commit', { sessionId }),
+    });
 }

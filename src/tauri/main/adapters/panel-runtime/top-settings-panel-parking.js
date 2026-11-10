@@ -1,18 +1,13 @@
 // @ts-check
 
+import { isTopLevelDrawerOpen, subscribeDrawerState } from '../../../../scripts/drawers.js';
+
 import { PanelRuntimeKind } from '../../services/panel-runtime/panel-runtime-kinds.js';
 
 /**
  * @typedef {import('../../services/embedded-runtime/embedded-runtime-manager.js').createEmbeddedRuntimeManager} createEmbeddedRuntimeManager
  * @typedef {ReturnType<createEmbeddedRuntimeManager>} EmbeddedRuntimeManager
  */
-
-/**
- * @param {HTMLElement} drawerContent
- */
-function isDrawerOpen(drawerContent) {
-    return drawerContent.classList.contains('openDrawer') && !drawerContent.classList.contains('closedDrawer');
-}
 
 const LEFT_NAV_MAIN_API_BLOCKS = Object.freeze({
     koboldhorde: {
@@ -47,12 +42,16 @@ const LEFT_NAV_MAIN_API_BLOCKS = Object.freeze({
     },
 });
 
-// Keep the OpenAI control surface connected in compat mode so third-party
-// scripts can continue to drive preset/context settings while the drawer is parked.
-const LEFT_NAV_COMPAT_PINNED_SELECTORS = Object.freeze([
+// Keep controls read from outside this drawer connected in every profile.
+const LEFT_NAV_REQUIRED_ANCHORS = Object.freeze([
+    '#range_block_openai', // onModelChange reads max through the DOM; parking yields NaN.
+    '#openai_reasoning_effort_block', // The assistant reads data-source after APP_READY.
+]);
+
+// `compat` only: keep these selectable while parked, for third-party scripts.
+const LEFT_NAV_COMPAT_ANCHORS = Object.freeze([
     '#openai_api-presets',
     '#completion_prompt_manager',
-    '#openai_api',
 ]);
 
 /**
@@ -259,7 +258,7 @@ function registerDrawerParking(manager, { panelId, parkedSelector, pinnedSelecto
         kind: PanelRuntimeKind.DrawerContent,
         element: host,
         visibilityMode: 'manual',
-        initialVisible: isDrawerOpen(host),
+        initialVisible: isTopLevelDrawerOpen(host),
         hydrate,
         dehydrate,
     });
@@ -270,21 +269,19 @@ function registerDrawerParking(manager, { panelId, parkedSelector, pinnedSelecto
     };
     toggle.addEventListener('click', onToggleClickCapture, true);
 
-    const classObserver = new MutationObserver(() => {
-        const open = isDrawerOpen(host);
+    const unsubscribeDrawer = subscribeDrawerState(host, () => {
+        const open = isTopLevelDrawerOpen(host);
         manager.setVisible(slotId, open);
         if (open) {
             manager.reconcile();
         }
     });
 
-    classObserver.observe(host, { attributes: true, attributeFilter: ['class'] });
-
     return {
         drawerId: typeof drawer.id === 'string' ? drawer.id : '',
         slotId,
         dispose: () => {
-            classObserver.disconnect();
+            unsubscribeDrawer();
             toggle.removeEventListener('click', onToggleClickCapture, true);
         },
     };
@@ -297,11 +294,13 @@ function registerDrawerParking(manager, { panelId, parkedSelector, pinnedSelecto
  * Controlled by `tauritavern-settings.panel_runtime_profile` (default: off).
  *
  * @param {{ manager: EmbeddedRuntimeManager }} options
+ * @returns {{ pinnedSelectors: string[] }}
  */
 export function installTopSettingsPanelParking({ manager }) {
-    const leftNavPinnedSelectors = manager.profile === 'compat'
-        ? LEFT_NAV_COMPAT_PINNED_SELECTORS
-        : [];
+    const leftNavPinnedSelectors = [
+        ...LEFT_NAV_REQUIRED_ANCHORS,
+        ...(manager.profile === 'compat' ? LEFT_NAV_COMPAT_ANCHORS : []),
+    ];
 
     const registrations = [
         registerDrawerParking(manager, {
@@ -311,10 +310,14 @@ export function installTopSettingsPanelParking({ manager }) {
             afterHydrate: () => syncLeftNavMainApiUi(),
         }),
         registerDrawerParking(manager, { panelId: 'AdvancedFormatting', parkedSelector: '.flex-container.spaceEvenly' }),
-        registerDrawerParking(manager, { panelId: 'WorldInfo', parkedSelector: '#wi-holder' }),
+        registerDrawerParking(manager, {
+            panelId: 'WorldInfo',
+            // compat parks only the entry list, which holds nearly all World Info DOM. The lorebook
+            // selects, pagination and editor buttons stay connected for the code that updates them.
+            parkedSelector: manager.profile === 'compat' ? '#world_popup_entries_list' : '#wi-holder',
+        }),
         registerDrawerParking(manager, { panelId: 'user-settings-block', parkedSelector: '#user-settings-block-content' }),
         registerDrawerParking(manager, { panelId: 'Backgrounds', parkedSelector: '#bg_tabs' }),
-        registerDrawerParking(manager, { panelId: 'PersonaManagement', parkedSelector: '#persona-management-block' }),
     ];
 
     /** @type {Array<[string, string]>} */
@@ -348,4 +351,6 @@ export function installTopSettingsPanelParking({ manager }) {
     }, true);
 
     manager.reconcile();
+
+    return { pinnedSelectors: leftNavPinnedSelectors };
 }

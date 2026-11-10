@@ -1,5 +1,16 @@
 const SUPPORTED_AGENT_RETRY_GENERATION_TYPES = new Set(['normal', 'regenerate', 'swipe']);
 
+export async function resumeAgentRun(runId, runtime = null) {
+    const agent = window.__TAURITAVERN__?.api?.agent;
+    if (!agent) throw new Error('TauriTavern Agent API is unavailable');
+    const checkpoint = await agent.readCheckpoint(runId);
+    if (checkpoint.blockedReason || checkpoint.nextStep === 'finished') {
+        throw new Error(`agent.resume_unavailable: ${checkpoint.blockedReason || 'this run has already finished'}`);
+    }
+    const script = runtime || await import('/script.js' /* webpackIgnore: true */);
+    return script.resumeAgentRunInChat({ runId, generationType: checkpoint.run.generationType, checkpoint });
+}
+
 export async function retryAgentRunFailure({
     run = null,
     events = [],

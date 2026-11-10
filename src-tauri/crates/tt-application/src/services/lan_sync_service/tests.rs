@@ -6,7 +6,7 @@ use ttsync_contract::peer::DeviceId;
 use ttsync_contract::sync::{OverwritePolicy, SyncMode};
 
 use super::pairing_link::{default_lan_permissions, device_pubkey_b64url};
-use super::ports::LanPairingApprovalRequest;
+use super::ports::{LanPairingApprovalRequest, LocalLanAddresses};
 use super::*;
 use crate::services::data_change_reconciler::DataChangeReconciler;
 use crate::services::sync_job_coordinator::{SyncJobEventPublisher, SyncJobExecutor};
@@ -215,26 +215,12 @@ impl LanServerControl for MemoryServerControl {
 
 struct NoopAddressDiscovery;
 
-#[async_trait]
 impl LanAddressDiscovery for NoopAddressDiscovery {
-    fn list_available_addresses(&self, _port: u16) -> Result<Vec<String>, DomainError> {
-        Ok(Vec::new())
-    }
-
-    fn default_advertise_address(
-        &self,
-        _port: u16,
-        _available_addresses: &[String],
-    ) -> Option<String> {
-        None
-    }
-
-    async fn routed_advertise_address(
-        &self,
-        _peer_base_url: &str,
-        _local_port: u16,
-    ) -> Result<String, DomainError> {
-        Err(DomainError::InternalError("not used".to_string()))
+    fn local_addresses(&self, _port: u16) -> Result<LocalLanAddresses, DomainError> {
+        Ok(LocalLanAddresses {
+            available: Vec::new(),
+            default: None,
+        })
     }
 }
 
@@ -265,6 +251,10 @@ struct NoopDeviceDiscovery;
 
 #[async_trait]
 impl LanDeviceDiscovery for NoopDeviceDiscovery {
+    async fn refresh_if_started(&self) -> Result<(), DomainError> {
+        Ok(())
+    }
+
     async fn set_device_name(&self, _name: &str) -> Result<(), DomainError> {
         Ok(())
     }
@@ -419,6 +409,10 @@ impl LanPairingClient for ManualPairingClient {
 
 #[async_trait]
 impl LanDeviceDiscovery for ManualPairingClient {
+    async fn refresh_if_started(&self) -> Result<(), DomainError> {
+        Ok(())
+    }
+
     async fn set_device_name(&self, _name: &str) -> Result<(), DomainError> {
         Ok(())
     }

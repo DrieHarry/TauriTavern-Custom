@@ -11,11 +11,9 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::json;
-use tokio::io::AsyncRead;
 use ttsync_contract::peer::{DeviceId, PeerGrant};
-use ttsync_core::dataset::ResolvedDatasetPolicy;
 use ttsync_core::error::SyncError;
-use ttsync_core::ports::{ManifestStore, PeerStore};
+use ttsync_core::ports::PeerStore;
 use ttsync_core::session::{SessionManager, SessionManagerConfig};
 use ttsync_http::server::{ServerState, build_transfer_router, default_status_response};
 use ttsync_http::tls::{SelfManagedTls, TlsProvider};
@@ -23,12 +21,12 @@ use ttsync_http::tls::{SelfManagedTls, TlsProvider};
 use super::LanStatusResponse;
 use crate::sync::http_client::{domain_error_to_sync, sync_error_to_domain};
 use crate::sync::lan::store::LanPeerStore;
-use crate::tt_sync::fs::scan_manifest_with_policy;
-use crate::{sync_fs, sync_transfer};
+use crate::sync::workspace::TauriTavernSyncWorkspace as LanManifestStore;
 use tt_contracts::sync::PAIRING_REJECTED_MESSAGE;
 use tt_contracts::sync::SyncOperationOptions;
 use tt_domain::errors::DomainError;
 use tt_domain::models::lan_sync::{LanPairCompleteRequest, LanPairCompleteResponse};
+use tt_ports::database::DatabaseFileAccess;
 use tt_ports::lan_sync::{LanInboundRequestHandler, LanServerEvents, LanServerInfo};
 
 const LAN_HTTPS_FEATURE_V1: &str = "lan_https_v1";
@@ -65,13 +63,14 @@ pub async fn spawn_lan_sync_server(
     store: LanPeerStore,
     inbound: Arc<dyn LanInboundRequestHandler>,
     events: Arc<dyn LanServerEvents>,
+    database: Arc<dyn DatabaseFileAccess>,
 ) -> Result<LanSyncServerHandle, DomainError> {
     install_rustls_crypto_provider();
     let identity = store.load_or_create_identity().await?;
     let tls = SelfManagedTls::load_or_create(&store.state_dir()).map_err(sync_error_to_domain)?;
     let spki_sha256 = tls.spki_sha256().to_string();
 
-    let manifest_store = Arc::new(LanManifestStore::new(sync_root));
+    let manifest_store = Arc::new(LanManifestStore::new(sync_root, database));
     let peer_store = Arc::new(LanServerPeerStore::new(store.clone()));
     let session_manager = Arc::new(SessionManager::new(SessionManagerConfig::default()));
 
@@ -173,77 +172,6 @@ fn report_server_task_failure(error: impl std::fmt::Display, events: &dyn LanSer
     let message = format!("LAN Sync server stopped unexpectedly: {error}");
     tracing::error!("{message}");
     events.report_lan_server_error(message);
-}
-
-#[derive(Clone)]
-struct LanManifestStore {
-    sync_root: PathBuf,
-}
-
-impl LanManifestStore {
-    fn new(sync_root: PathBuf) -> Self {
-        Self { sync_root }
-    }
-}
-
-impl ManifestStore for LanManifestStore {
-    fn scan(
-        &self,
-        policy: ResolvedDatasetPolicy,
-    ) -> impl std::future::Future<Output = Result<ttsync_contract::manifest::ManifestV2, SyncError>> + Send
-    {
-        let sync_root = self.sync_root.clone();
-        async move {
-            scan_manifest_with_policy(sync_root, policy)
-                .await
-                .map_err(domain_error_to_sync)
-        }
-    }
-
-    fn read_file(
-        &self,
-        path: &ttsync_contract::path::SyncPath,
-    ) -> impl std::future::Future<Output = Result<Box<dyn AsyncRead + Send + Unpin>, SyncError>> + Send
-    {
-        let sync_root = self.sync_root.clone();
-        let path = path.clone();
-        async move {
-            let full_path = sync_transfer::resolve_to_local(&sync_root, &path);
-            let file = tokio::fs::File::open(&full_path)
-                .await
-                .map_err(|error| SyncError::Io(error.to_string()))?;
-            Ok(Box::new(file) as Box<dyn AsyncRead + Send + Unpin>)
-        }
-    }
-
-    fn write_file(
-        &self,
-        path: &ttsync_contract::path::SyncPath,
-        data: &mut (dyn AsyncRead + Send + Unpin),
-        modified_ms: u64,
-    ) -> impl std::future::Future<Output = Result<(), SyncError>> + Send {
-        let sync_root = self.sync_root.clone();
-        let path = path.clone();
-        async move {
-            let full_path = sync_transfer::resolve_to_local(&sync_root, &path);
-            sync_fs::write_file_atomic(&full_path, data, modified_ms)
-                .await
-                .map_err(|error| error.into_error())
-        }
-    }
-
-    fn delete_file(
-        &self,
-        path: &ttsync_contract::path::SyncPath,
-    ) -> impl std::future::Future<Output = Result<(), SyncError>> + Send {
-        let sync_root = self.sync_root.clone();
-        let path = path.clone();
-        async move {
-            sync_fs::delete_sync_file(&sync_root, &path)
-                .await
-                .map_err(|error| error.into_error())
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -417,6 +345,12 @@ impl IntoResponse for ApiError {
             }
             DomainError::AuthenticationError(message) => (StatusCode::UNAUTHORIZED, message),
             DomainError::Cancelled(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
+            error @ DomainError::WorkspaceAccessDenied { .. } => {
+                (StatusCode::FORBIDDEN, error.to_string())
+            }
+            error @ DomainError::FileIo { .. } => {
+                (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            }
             DomainError::InternalError(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
             DomainError::RateLimited { message } => (StatusCode::TOO_MANY_REQUESTS, message),
             DomainError::Transient(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
@@ -463,18 +397,19 @@ mod tests {
     use async_trait::async_trait;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use socket2::{Domain, Protocol, Socket, Type};
     use tokio::sync::{Mutex, mpsc};
     use tt_contracts::lan_discovery::LanDiscoveryAnnouncement;
     use tt_ports::lan_sync::LanPairingClient;
     use ttsync_client::{ClientSyncEngine, ClientSyncOptions, ClientSyncTarget, NoopSyncObserver};
-    use ttsync_contract::dataset::{DATASET_POLICY_VERSION, DATASET_SCOPE_FEATURE_V1};
+    use ttsync_contract::dataset::{
+        DATASET_POLICY_VERSION, DATASET_SCOPE_FEATURE_V1, DatasetSelection,
+    };
     use ttsync_contract::manifest::ManifestV2;
     use ttsync_contract::path::SyncPath;
     use ttsync_contract::peer::Permissions;
     use ttsync_contract::sync::SyncMode;
     use ttsync_core::bundle::{FEATURE_BUNDLE_V1, FEATURE_ZSTD_V1};
-    use ttsync_core::dataset::tauri_tavern_default_selection;
+    use ttsync_core::dataset::{tauri_tavern_default_selection, tauri_tavern_full_selection};
     use uuid::Uuid;
 
     use crate::sync::http_client::{bearer_auth_value, ensure_dataset_scope_v1, new_sync_client};
@@ -628,9 +563,14 @@ mod tests {
             .await
             .expect("write HEAD");
 
-        let store = LanManifestStore::new(sync_root.clone());
+        let store = LanManifestStore::new(
+            sync_root.clone(),
+            crate::sync::workspace::empty_database_access(),
+        );
         let path = SyncPath::new("extensions/third-party/example/.git/HEAD".to_string()).unwrap();
-        store.delete_file(&path).await.expect("delete file");
+        ttsync_core::ports::ManifestStore::delete_file(&store, &path)
+            .await
+            .expect("delete file");
 
         assert!(!sync_root.join("extensions/third-party/example").exists());
         assert!(sync_root.join("extensions/third-party").exists());
@@ -644,13 +584,17 @@ mod tests {
     async fn status_is_served_over_spki_pinned_https() {
         use tt_ports::lan_sync::LanPeerRepository;
         let default_user_dir = temp_default_user_dir();
-        let store = LanPeerStore::new(default_user_dir.clone());
+        let store = LanPeerStore::new(
+            default_user_dir.clone(),
+            tt_contracts::host::HostPlatform::Linux,
+        );
         let handle = spawn_lan_sync_server(
             "127.0.0.1:0".parse().unwrap(),
             default_user_dir.clone(),
             store.clone(),
             noop_inbound(),
             recording_events(),
+            crate::sync::workspace::empty_database_access(),
         )
         .await
         .expect("spawn LAN Sync server");
@@ -704,10 +648,13 @@ mod tests {
             assert!(store.set_device_name(&invalid).await.is_err());
         }
         store.set_device_name("书房 Mac").await.unwrap();
-        let reloaded = LanPeerStore::new(default_user_dir.clone())
-            .load_or_create_identity()
-            .await
-            .unwrap();
+        let reloaded = LanPeerStore::new(
+            default_user_dir.clone(),
+            tt_contracts::host::HostPlatform::Linux,
+        )
+        .load_or_create_identity()
+        .await
+        .unwrap();
         assert_eq!(reloaded.device_name, "书房 Mac");
         assert_eq!(reloaded.device_id, before.device_id);
         assert_eq!(reloaded.ed25519_seed, before.ed25519_seed);
@@ -718,7 +665,7 @@ mod tests {
             let device = pairing.probe_device(&base_url, pin).await.unwrap();
             assert_eq!(device.device_name, "书房 Mac");
             assert_eq!(device.device_id, before.device_id);
-            assert_eq!(device.platform.as_deref(), Some(std::env::consts::OS));
+            assert_eq!(device.platform.as_deref(), Some("linux"));
             assert_eq!(device.spki_sha256, handle.spki_sha256);
         }
         assert!(
@@ -735,7 +682,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pair_complete_exchanges_identity_over_pinned_https() {
         let default_user_dir = temp_default_user_dir();
-        let store = LanPeerStore::new(default_user_dir.clone());
+        let store = LanPeerStore::new(
+            default_user_dir.clone(),
+            tt_contracts::host::HostPlatform::Linux,
+        );
         let identity = store
             .load_or_create_identity()
             .await
@@ -749,23 +699,19 @@ mod tests {
             completions: Mutex::new(completions),
         });
         let events = recording_events();
-        // Reserve a non-listening port so the stale candidate fails without a timing race.
-        let unavailable = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-            .expect("reserve stale address");
-        unavailable
-            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+        // The stale candidate must fail at once while keeping its port reserved.
+        let stale = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
             .expect("bind stale address");
-        let stale_address = unavailable
-            .local_addr()
-            .expect("stale address")
-            .as_socket()
-            .unwrap();
+        let stale_address = stale.local_addr().expect("stale address");
+        tokio::spawn(async move { while stale.accept().await.is_ok() {} });
         let handle = spawn_lan_sync_server(
             "127.0.0.1:0".parse().unwrap(),
             default_user_dir.clone(),
             store.clone(),
             inbound.clone(),
             events.clone(),
+            crate::sync::workspace::empty_database_access(),
         )
         .await
         .expect("spawn LAN Sync server");
@@ -794,7 +740,7 @@ mod tests {
             tokio::pin!(request);
             tokio::select! {
                 started = starts.recv() => started.expect("inbound pairing started"),
-                _ = &mut request => panic!("pairing finished before the inbound handler completed"),
+                result = &mut request => panic!("pairing finished before the inbound handler completed: {result:?}"),
             }
             assert_eq!(events.pairings.load(Ordering::SeqCst), 0);
             finish.send(Ok(())).expect("complete inbound pairing");
@@ -808,10 +754,7 @@ mod tests {
         assert!(response.granted_permissions.mirror_delete);
         assert!(!response.granted_permissions.write);
         assert_eq!(response.server_device_name, identity.device_name);
-        assert_eq!(
-            response.server_device_platform.as_deref(),
-            Some(std::env::consts::OS)
-        );
+        assert_eq!(response.server_device_platform.as_deref(), Some("linux"));
 
         {
             let requests = inbound.requests.lock().expect("pairing request lock");
@@ -846,7 +789,7 @@ mod tests {
                     )
                     .await
                     .expect_err("reject wrong device identity before pairing");
-                assert!(matches!(error, DomainError::AuthenticationError(_)));
+                assert!(matches!(error, DomainError::AuthenticationError(_)), "{error:?}");
             } => {}
         }
         assert_eq!(inbound.requests.lock().unwrap().len(), 1);
@@ -885,7 +828,7 @@ mod tests {
         .await
         .expect("write source file");
 
-        let store = LanPeerStore::new(sync_root.clone());
+        let store = LanPeerStore::new(sync_root.clone(), tt_contracts::host::HostPlatform::Linux);
         let peer_device_id =
             DeviceId::new("550e8400-e29b-41d4-a716-446655440001".to_string()).unwrap();
         let peer_seed = URL_SAFE_NO_PAD.encode([3u8; 32]);
@@ -919,6 +862,7 @@ mod tests {
             store,
             noop_inbound(),
             recording_events(),
+            crate::sync::workspace::empty_database_access(),
         )
         .await
         .expect("spawn LAN Sync server");
@@ -1005,15 +949,52 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(content_encoding, "zstd");
 
+        // Run records are opaque sync files, including incomplete or invalid history.
+        let agent_files: [(&str, &[u8]); 4] = [
+            (
+                "_tauritavern/agent-workspaces/index/runs/run-history.json",
+                b"{invalid json",
+            ),
+            (
+                "_tauritavern/agent-workspaces/chats/workspace/runs/run-history/run.json",
+                br#"{"status":"calling_model"}"#,
+            ),
+            (
+                "_tauritavern/agent-workspaces/chats/workspace/runs/run-history/output/main.md",
+                b"Agent output.",
+            ),
+            (
+                "_tauritavern/agent-workspaces/chats/workspace/runs/run-orphan/events.jsonl",
+                b"{}\n",
+            ),
+        ];
+        for (relative, bytes) in agent_files {
+            let path = sync_root.join(relative);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .expect("create Agent artifact directory");
+            tokio::fs::write(path, bytes)
+                .await
+                .expect("write Agent artifact");
+        }
+
         let target_root = temp_default_user_dir();
         tokio::fs::create_dir_all(&target_root)
             .await
             .expect("create target root");
-        let workspace = Arc::new(TauriTavernSyncWorkspace::new(target_root.clone()));
-        let mut options =
-            ClientSyncOptions::new(SyncMode::Incremental, tauri_tavern_default_selection());
+        let workspace = Arc::new(TauriTavernSyncWorkspace::new(
+            target_root.clone(),
+            crate::sync::workspace::empty_database_access(),
+        ));
+        let mut options = ClientSyncOptions::new(
+            SyncMode::Incremental,
+            DatasetSelection::new(
+                DATASET_POLICY_VERSION,
+                vec!["agent.workspace_outputs".to_string()],
+            ),
+        );
         options.require_bundle_zstd = true;
-        let report = ClientSyncEngine::new(
+        let engine = ClientSyncEngine::new(
             client,
             workspace,
             ClientSyncTarget {
@@ -1021,16 +1002,39 @@ mod tests {
                 ed25519_seed_b64url: peer_seed,
             },
             "LAN Sync peer",
-        )
-        .pull(options, &NoopSyncObserver)
-        .await
-        .expect("shared client pull");
-        assert_eq!(report.summary.files_total, 1);
+        );
+        let report = engine
+            .pull(options.clone(), &NoopSyncObserver)
+            .await
+            .expect("pull only Agent outputs");
         assert_eq!(report.local_applied.files_written, 1);
+        assert!(
+            !target_root
+                .join("_tauritavern/agent-workspaces/chats/workspace/runs/run-history/run.json")
+                .exists()
+        );
+
+        options.selection = tauri_tavern_full_selection();
+        options.mode = SyncMode::Mirror;
+        let report = engine
+            .pull(options, &NoopSyncObserver)
+            .await
+            .expect("mirror completes the partial Agent history");
+        // The existing output stays in the manifest and does not need another transfer.
+        assert_eq!(report.summary.files_total, agent_files.len());
+        assert_eq!(report.local_applied.files_written, agent_files.len());
+        assert_eq!(report.summary.files_deleted, 0);
+
         let bundle_bytes = tokio::fs::read(target_root.join("default-user/chats/hello.json"))
             .await
             .expect("read bundle file");
         assert_eq!(&bundle_bytes, br#"{"hello":true}"#);
+        for (relative, expected) in agent_files {
+            let bytes = tokio::fs::read(target_root.join(relative))
+                .await
+                .expect("read transferred Agent artifact");
+            assert_eq!(bytes, expected, "{relative}");
+        }
 
         handle.shutdown();
         let _ = tokio::fs::remove_dir_all(target_root).await;

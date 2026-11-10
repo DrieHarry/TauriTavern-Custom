@@ -6,7 +6,7 @@ use tokio::fs;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::chat_directory_identity::sanitize_chat_dir_key;
-use crate::file_system::unique_temp_path;
+use crate::file_system::BACKUP_TIMESTAMP_FORMAT;
 use tt_domain::errors::DomainError;
 use tt_domain::models::chat::{normalize_chat_file_name, normalize_chat_file_stem};
 use tt_domain::models::filename::sanitize_filename;
@@ -166,10 +166,6 @@ impl FileChatRepository {
             .invalidate_all();
     }
 
-    pub(super) fn temp_payload_path(path: &Path) -> PathBuf {
-        unique_temp_path(path)
-    }
-
     pub(super) fn normalize_jsonl_file_stem(file_name: &str) -> Result<String, DomainError> {
         normalize_chat_file_stem(file_name)
             .ok_or_else(|| DomainError::InvalidData("Invalid chat file name".to_string()))
@@ -185,12 +181,7 @@ impl FileChatRepository {
             .ok_or_else(|| DomainError::InvalidData("Invalid chat file name".to_string()))
     }
 
-    /// Build a timestamp that is safe to use in file names on all platforms.
-    fn backup_timestamp(at: DateTime<Local>) -> String {
-        at.format("%Y%m%d-%H%M%S").to_string()
-    }
-
-    /// Keeps SillyTavern's readable backup key while preserving Unicode letters and numbers.
+    /// Preserves Unicode while keeping the existing ASCII backup key format.
     pub(super) fn sanitize_backup_name_for_sillytavern(input: &str) -> String {
         let mut sanitized = String::with_capacity(input.len());
 
@@ -243,7 +234,11 @@ impl FileChatRepository {
 
         let mut result = String::with_capacity(lowered.len().min(MAX_SANITIZED_BYTES));
         for ch in lowered.chars() {
-            let output = if ch.is_alphanumeric() { ch } else { '_' };
+            let output = if ch.is_ascii() && !ch.is_ascii_alphanumeric() {
+                '_'
+            } else {
+                ch
+            };
             if result.len() + output.len_utf8() > MAX_SANITIZED_BYTES {
                 break;
             }
@@ -265,13 +260,8 @@ impl FileChatRepository {
         format!(
             "{}{}.jsonl",
             Self::backup_file_prefix(character_name),
-            Self::backup_timestamp(at)
+            at.format(BACKUP_TIMESTAMP_FORMAT)
         )
-    }
-
-    #[cfg(test)]
-    pub(super) fn backup_file_name(character_name: &str) -> String {
-        Self::backup_file_name_at(character_name, Local::now())
     }
 
     pub(super) fn backup_temp_path(&self) -> PathBuf {

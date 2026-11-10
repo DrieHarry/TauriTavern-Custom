@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use tauri::AppHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::infrastructure::paths::RuntimePaths;
@@ -13,12 +12,13 @@ use tt_application::services::asset_service::AssetService;
 use tt_application::services::avatar_service::AvatarService;
 use tt_application::services::background_service::BackgroundService;
 use tt_application::services::character_service::CharacterService;
+use tt_application::services::chat_commit_service::ChatCommitService;
 use tt_application::services::chat_completion_service::ChatCompletionService;
 use tt_application::services::chat_history_coordinator::ChatHistoryCoordinator;
-use tt_application::services::chat_payload_commit_service::ChatPayloadCommitService;
 use tt_application::services::chat_service::ChatService;
 use tt_application::services::content_service::ContentService;
 use tt_application::services::data_archive_service::DataArchiveService;
+use tt_application::services::database_service::DatabaseService;
 use tt_application::services::extension_service::ExtensionService;
 use tt_application::services::extension_store_service::ExtensionStoreService;
 use tt_application::services::group_chat_service::GroupChatService;
@@ -27,7 +27,6 @@ use tt_application::services::image_metadata_service::ImageMetadataService;
 use tt_application::services::lan_sync_service::LanSyncService;
 use tt_application::services::llm_connection_service::LlmConnectionService;
 use tt_application::services::mcp_service::McpService;
-use tt_application::services::native_regex_service::NativeRegexService;
 use tt_application::services::preset_service::PresetService;
 use tt_application::services::prompt_assembly_service::PromptAssemblyService;
 use tt_application::services::provider_metadata_service::ProviderMetadataService;
@@ -53,7 +52,7 @@ use tt_application::services::world_info_service::WorldInfoService;
 use tt_domain::errors::DomainError;
 use tt_domain::ios_policy::IosPolicyActivationReport;
 
-use super::{StartupProfile, composition};
+use super::{HostEnvironment, StartupProfile, composition};
 
 pub struct AppState {
     pub(crate) services: AppServices,
@@ -82,7 +81,7 @@ pub(crate) struct AppServices {
     pub(crate) chat_service: Arc<ChatService>,
     pub(crate) group_chat_service: Arc<GroupChatService>,
     pub(crate) chat_history_coordinator: Arc<ChatHistoryCoordinator>,
-    pub(crate) chat_payload_commit_service: Arc<ChatPayloadCommitService>,
+    pub(crate) chat_commit_service: Arc<ChatCommitService>,
     pub(crate) user_service: Arc<UserService>,
     pub(crate) settings_service: Arc<SettingsService>,
     pub(crate) user_directory_service: Arc<UserDirectoryService>,
@@ -122,13 +121,13 @@ pub(crate) struct AppServices {
     pub(crate) tt_sync_service: Arc<TtSyncService>,
     pub(crate) sync_automation_service: Arc<SyncAutomationService>,
     pub(crate) data_archive_service: Arc<DataArchiveService>,
+    pub(crate) database_service: Arc<DatabaseService>,
     pub(crate) update_service: Arc<UpdateService>,
-    pub(crate) native_regex_service: Arc<NativeRegexService>,
 }
 
 impl AppState {
     pub(crate) async fn new(
-        app_handle: AppHandle,
+        environment: HostEnvironment,
         runtime_paths: RuntimePaths,
         startup_profile: StartupProfile,
     ) -> Result<Self, DomainError> {
@@ -140,8 +139,13 @@ impl AppState {
 
         let data_directory =
             composition::initialize_data_directory(&runtime_paths.data_root).await?;
-        let services =
-            composition::build_services(&app_handle, &data_directory, &startup_profile).await?;
+        let services = composition::build_services(
+            &environment,
+            &runtime_paths.app_root,
+            &data_directory,
+            &startup_profile,
+        )
+        .await?;
 
         tracing::info!("Application initialized successfully");
 

@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
-use tt_adapter_http::{HttpClientPool, HttpClientProfile};
+use tt_adapter_http::{HttpClientPool, HttpClientProfile, upstream};
 use tt_domain::errors::DomainError;
 
 use super::HttpChatCompletionRepository;
@@ -20,7 +20,8 @@ const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 struct CachedAccessToken {
     value: String,
-    refresh_at: Instant,
+    // Google judges expiry by wall time, which keeps running while the device sleeps.
+    refresh_at: SystemTime,
 }
 
 #[derive(Deserialize)]
@@ -65,14 +66,14 @@ async fn get_service_account_access_token_at(
         let cache = access_token_cache().read().await;
         cache
             .get(&cache_key)
-            .filter(|token| token.refresh_at > Instant::now())
+            .filter(|token| token.refresh_at > SystemTime::now())
             .cloned()
     };
     if let Some(cached) = cached {
         return Ok(cached.value);
     }
 
-    // ponytail: concurrent misses may refresh twice; add per-credential singleflight only if
+    // Concurrent misses may refresh twice; add per-credential singleflight only if
     // OAuth traffic becomes measurable.
     let service_account_key = serde_json::from_str::<ServiceAccountKey>(service_account_json)
         .map_err(|error| {
@@ -98,7 +99,7 @@ async fn get_service_account_access_token_at(
         Duration::from_secs(response.expires_in).saturating_sub(TOKEN_REFRESH_MARGIN);
     let cached = CachedAccessToken {
         value: response.access_token,
-        refresh_at: Instant::now() + refresh_after,
+        refresh_at: SystemTime::now() + refresh_after,
     };
     access_token_cache()
         .write()
@@ -159,12 +160,7 @@ async fn request_access_token(
         ])
         .send()
         .await
-        .map_err(|error| {
-            HttpChatCompletionRepository::map_transport_error(
-                "Vertex AI service account access token request failed",
-                error,
-            )
-        })?;
+        .map_err(upstream::request_failure)?;
 
     if !response.status().is_success() {
         return Err(HttpChatCompletionRepository::map_error_response(

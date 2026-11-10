@@ -7,7 +7,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use serde_json::Value;
 
-use tt_adapter_http::{HttpClientPool, HttpClientProfile};
+use tt_adapter_http::{HttpClientPool, HttpClientProfile, upstream};
 use tt_domain::errors::DomainError;
 use tt_domain::models::endpoint_url::append_endpoint_path;
 use tt_ports::repositories::chat_completion_repository::{
@@ -19,16 +19,21 @@ use tt_ports::repositories::chat_completion_repository::{
 mod aws_bedrock;
 mod claude;
 mod cohere;
+mod context_overflow;
 mod gemini;
 mod gemini_interactions;
 mod makersuite;
+#[cfg(test)]
+mod makersuite_tests;
 mod normalizers;
 mod openai;
 mod openai_responses;
+mod pollinations;
 mod response_body;
 mod vertexai;
 pub(crate) mod vertexai_auth;
 mod workers_ai;
+mod xai;
 
 #[derive(Debug, Clone, Copy)]
 struct PromptCachePerformanceUsage {
@@ -70,13 +75,6 @@ impl SseEventAccumulator {
         }
 
         Ok(())
-    }
-
-    fn finish<F: FnMut(&[u8]) -> Result<(), DomainError>>(
-        &mut self,
-        on_event: &mut F,
-    ) -> Result<(), DomainError> {
-        self.dispatch(on_event)
     }
 
     fn dispatch<F: FnMut(&[u8]) -> Result<(), DomainError>>(
@@ -250,10 +248,7 @@ impl HttpChatCompletionRepository {
         provider_name: &str,
         error_context: &str,
     ) -> Result<reqwest::Response, DomainError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|error| Self::map_transport_error(error_context, error))?;
+        let response = request.send().await.map_err(upstream::request_failure)?;
 
         if !response.status().is_success() {
             return Err(Self::map_error_response(provider_name, response, error_context).await);
@@ -278,9 +273,28 @@ impl HttpChatCompletionRepository {
         body: &str,
         default_message: &str,
     ) -> DomainError {
-        let message = extract_error_message(body, default_message);
+        let body = body.trim();
+        let parsed = serde_json::from_str::<Value>(body).ok();
+        let error = parsed.as_ref().and_then(response_body::provider_error);
+        let message = parsed
+            .as_ref()
+            .and_then(|value| match error {
+                Some(error) => Some(response_body::provider_error_message(error, value)),
+                None => value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+            .unwrap_or_else(|| {
+                if body.is_empty() {
+                    default_message
+                } else {
+                    body
+                }
+                .to_string()
+            });
 
-        match status {
+        let status_error = |message: String| match status {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 DomainError::AuthenticationError(message)
             }
@@ -297,23 +311,16 @@ impl HttpChatCompletionRepository {
                 "{provider_name} endpoint failed with status {}: {message}",
                 status.as_u16()
             )),
-        }
-    }
+        };
 
-    fn map_transport_error(label: &str, error: reqwest::Error) -> DomainError {
-        let failure = crate::http_error::reqwest_transport_failure(&error);
-        tracing::warn!(
-            operation = label,
-            code = %failure.code,
-            category = %failure.category,
-            endpoint = failure.endpoint.as_deref().unwrap_or(""),
-            timeout = error.is_timeout(),
-            connect = error.is_connect(),
-            body = error.is_body(),
-            request = error.is_request(),
-            "upstream transport request failed",
-        );
-        DomainError::upstream_failure(failure)
+        match status {
+            StatusCode::PAYLOAD_TOO_LARGE => context_overflow::context_overflow_error(message),
+            StatusCode::BAD_REQUEST => {
+                let error = error.map_or_else(|| body.to_owned(), Value::to_string);
+                context_overflow::context_overflow_or(error, message, status_error)
+            }
+            _ => status_error(message),
+        }
     }
 
     async fn stream_sse_response(
@@ -407,22 +414,10 @@ impl HttpChatCompletionRepository {
         let endpoint = response.url().clone();
 
         loop {
-            let chunk = response.chunk().await.map_err(|error| {
-                let failure = crate::http_error::reqwest_body_failure(&error, Some(&endpoint));
-                tracing::warn!(
-                    provider = provider_name,
-                    operation = "stream",
-                    code = %failure.code,
-                    category = %failure.category,
-                    endpoint = failure.endpoint.as_deref().unwrap_or(""),
-                    timeout = error.is_timeout(),
-                    connect = error.is_connect(),
-                    body = error.is_body(),
-                    request = error.is_request(),
-                    "upstream stream read failed",
-                );
-                DomainError::upstream_failure(failure)
-            })?;
+            let chunk = response
+                .chunk()
+                .await
+                .map_err(|error| upstream::body_failure(error, &endpoint))?;
 
             let Some(chunk) = chunk else {
                 break;
@@ -432,13 +427,17 @@ impl HttpChatCompletionRepository {
             Self::forward_sse_events(&mut buffer, &mut accumulator, &mut on_event)?;
         }
 
-        if !buffer.is_empty() {
-            Self::forward_sse_events(&mut buffer, &mut accumulator, &mut on_event)?;
-            Self::forward_sse_line(buffer.as_slice(), &mut accumulator, &mut on_event)?;
-            buffer.clear();
+        // An event cut off by the end of the stream is never dispatched (SSE).
+        let discarded_bytes = buffer.len() + accumulator.data.len();
+        if discarded_bytes > 0 {
+            tracing::warn!(
+                provider = provider_name,
+                operation = "stream",
+                endpoint = upstream::sanitize_endpoint(&endpoint),
+                discarded_bytes,
+                "upstream stream ended mid-event",
+            );
         }
-
-        accumulator.finish(&mut on_event)?;
         Ok(())
     }
 
@@ -470,19 +469,6 @@ impl HttpChatCompletionRepository {
         }
 
         Ok(())
-    }
-
-    fn forward_sse_line<F: FnMut(&[u8]) -> Result<(), DomainError>>(
-        line: &[u8],
-        accumulator: &mut SseEventAccumulator,
-        on_event: &mut F,
-    ) -> Result<(), DomainError> {
-        let mut line = line;
-        if line.last().is_some_and(|byte| *byte == b'\r') {
-            line = &line[..line.len() - 1];
-        }
-
-        accumulator.on_line(line, on_event)
     }
 }
 
@@ -586,6 +572,12 @@ fn provider_transport_source(
     source: ChatCompletionSource,
     endpoint_path: &str,
 ) -> Result<ChatCompletionSource, DomainError> {
+    if source == ChatCompletionSource::Custom
+        && matches!(endpoint_path, "/generateContent" | "/streamGenerateContent")
+    {
+        return Ok(ChatCompletionSource::Makersuite);
+    }
+
     if source != ChatCompletionSource::OpenCode {
         return Ok(source);
     }
@@ -629,6 +621,8 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
                 .await
             }
             ChatCompletionSource::WorkersAi => workers_ai::list_models(self, config).await,
+            ChatCompletionSource::Pollinations => pollinations::list_models(self, config).await,
+            ChatCompletionSource::Xai => xai::list_models(self, config).await,
             ChatCompletionSource::Cohere => cohere::list_models(self, config).await,
             ChatCompletionSource::NanoGpt => {
                 openai::list_models_with_path(self, config, source_name, "/models?detailed=true")
@@ -701,7 +695,9 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
                 | ChatCompletionSource::SiliconFlow
                 | ChatCompletionSource::WorkersAi
                 | ChatCompletionSource::Zai
-                | ChatCompletionSource::MiniMax,
+                | ChatCompletionSource::MiniMax
+                | ChatCompletionSource::Xai
+                | ChatCompletionSource::Pollinations,
                 _,
             ) => openai::generate(self, config, endpoint_path, payload, source_name)
                 .await
@@ -802,7 +798,9 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
                 | ChatCompletionSource::SiliconFlow
                 | ChatCompletionSource::WorkersAi
                 | ChatCompletionSource::Zai
-                | ChatCompletionSource::MiniMax,
+                | ChatCompletionSource::MiniMax
+                | ChatCompletionSource::Xai
+                | ChatCompletionSource::Pollinations,
                 _,
             ) => {
                 openai::generate_stream(
@@ -939,7 +937,9 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
                 | ChatCompletionSource::SiliconFlow
                 | ChatCompletionSource::WorkersAi
                 | ChatCompletionSource::Zai
-                | ChatCompletionSource::MiniMax,
+                | ChatCompletionSource::MiniMax
+                | ChatCompletionSource::Xai
+                | ChatCompletionSource::Pollinations,
                 "/chat/completions",
             ) => {
                 openai::generate_with_deltas(
@@ -962,26 +962,6 @@ impl ChatCompletionRepository for HttpChatCompletionRepository {
     async fn close_provider_session(&self, session_id: &str) {
         self.openai_responses_ws_sessions.close(session_id).await;
     }
-}
-
-fn extract_error_message(body: &str, default_message: &str) -> String {
-    let body = body.trim();
-    if body.is_empty() {
-        return default_message.to_string();
-    }
-
-    if let Ok(value) = serde_json::from_str::<Value>(body)
-        && let Some(message) = value
-            .pointer("/error/message")
-            .or_else(|| value.get("message"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    {
-        return message.to_string();
-    }
-
-    body.to_string()
 }
 
 #[cfg(test)]
@@ -1101,30 +1081,71 @@ mod tests {
     }
 
     #[test]
-    fn error_status_classification_marks_retryable_provider_failures() {
-        let rate_limited = HttpChatCompletionRepository::map_error_status(
-            "OpenAI",
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            r#"{"error":{"message":"slow down"}}"#,
-            "Generation request failed",
-        );
-        assert!(matches!(rate_limited, DomainError::RateLimited { .. }));
-
-        let gateway_timeout = HttpChatCompletionRepository::map_error_status(
-            "OpenAI",
-            reqwest::StatusCode::BAD_GATEWAY,
-            "upstream unavailable",
-            "Generation request failed",
-        );
-        assert!(matches!(gateway_timeout, DomainError::Transient(_)));
-
-        let bad_request = HttpChatCompletionRepository::map_error_status(
-            "OpenAI",
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"bad payload"}}"#,
-            "Generation request failed",
-        );
-        assert!(matches!(bad_request, DomainError::InvalidData(_)));
+    fn error_status_classification_preserves_recovery_semantics() {
+        for (status, body, overflow) in [
+            (
+                400,
+                "prompt is too long: 213462 tokens > 200000 maximum",
+                true,
+            ),
+            (
+                400,
+                "input length and `max_tokens` exceed context limit: 190000 + 32768 > 200000",
+                true,
+            ),
+            (
+                400,
+                "Your input exceeds the context window of this model",
+                true,
+            ),
+            (
+                400,
+                "This model's maximum context length is 131072 tokens. However, you requested 140000 tokens",
+                true,
+            ),
+            (
+                400,
+                "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)",
+                true,
+            ),
+            (
+                400,
+                r#"{"error":{"code":"context_length_exceeded","message":"invalid request"}}"#,
+                true,
+            ),
+            (400, r#"{"message":"prompt is too long"}"#, true),
+            (413, "<html>Request Entity Too Large</html>", true),
+            (
+                400,
+                "Request payload size exceeds the limit: 20971520 bytes.",
+                true,
+            ),
+            (400, "Invalid value for temperature", false),
+            (400, "rate limit: too many tokens", false),
+            (
+                429,
+                "ThrottlingException: Too many tokens, please wait before trying again.",
+                false,
+            ),
+            (502, "upstream unavailable", false),
+        ] {
+            let error = HttpChatCompletionRepository::map_error_status(
+                "Provider",
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                body,
+                "Generation request failed",
+            );
+            assert_eq!(
+                matches!(&error, DomainError::InvalidData(message) if message.starts_with("model.context_overflow:")),
+                overflow,
+                "{status}: {body}: {error}"
+            );
+            match status {
+                429 => assert!(matches!(error, DomainError::RateLimited { .. })),
+                502 => assert!(matches!(error, DomainError::Transient(_))),
+                _ => assert!(matches!(error, DomainError::InvalidData(_))),
+            }
+        }
     }
 
     #[test]
@@ -1190,25 +1211,19 @@ mod tests {
         assert!(buffer.is_empty());
     }
 
-    #[test]
-    fn forward_sse_events_can_flush_pending_event_at_end_of_stream() {
-        let mut events = Vec::<Vec<u8>>::new();
-        let mut buffer = b"data: tail\n".to_vec();
+    #[tokio::test]
+    async fn consume_sse_response_discards_an_event_cut_off_by_end_of_stream() {
+        for body in ["data: a\n\ndata: b\n", "data: a\n\ndata: b"] {
+            let response = reqwest::Response::from(http::Response::new(body));
+            let mut events = Vec::<Vec<u8>>::new();
+            HttpChatCompletionRepository::consume_sse_response("test", response, |event| {
+                events.push(event.to_vec());
+                Ok(())
+            })
+            .await
+            .unwrap();
 
-        let mut on_event = |event: &[u8]| {
-            events.push(event.to_vec());
-            Ok(())
-        };
-        let mut accumulator = super::SseEventAccumulator::default();
-        HttpChatCompletionRepository::forward_sse_events(
-            &mut buffer,
-            &mut accumulator,
-            &mut on_event,
-        )
-        .unwrap();
-
-        accumulator.finish(&mut on_event).unwrap();
-
-        assert_eq!(events, [b"tail".to_vec()]);
+            assert_eq!(events, [b"a".to_vec()], "{body:?}");
+        }
     }
 }

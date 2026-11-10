@@ -45,12 +45,15 @@ export type SyncScopeHandle = {
 
 const DATASET_META: Record<string, DatasetMeta> = {
     'settings.core': { label: 'Core settings' },
+    'settings.appearance': { label: 'Appearance & theme state' },
+    'settings.presets': { label: 'Current presets & prompts' },
+    'settings.layout': { label: 'Current layout' },
     'secrets.api_keys': { label: 'API keys', tone: 'sensitive' },
     'chat.character.history': { label: 'Character chats' },
     'chat.group.metadata': { label: 'Group metadata' },
     'chat.group.history': { label: 'Group chats' },
     'character.cards': { label: 'Character cards' },
-    'character.avatars': { label: 'User avatars' },
+    'character.avatars': { label: 'Personas' },
     'world.info': { label: 'World info' },
     'preset.openai': { label: 'OpenAI presets' },
     'preset.novelai': { label: 'NovelAI presets' },
@@ -75,6 +78,7 @@ const DATASET_META: Record<string, DatasetMeta> = {
     'extensions.third_party': { label: 'Third-party extensions' },
     'extensions.sources': { label: 'Extension sources' },
     'extensions.store': { label: 'Extension store' },
+    'extensions.databases': { label: 'TriviumDB databases', tone: 'large' },
     'agent.profiles': { label: 'Agent profiles' },
     'agent.llm_connections': { label: 'Agent LLM connections' },
     'agent.skills': { label: 'Agent skills' },
@@ -97,6 +101,9 @@ const DATASET_GROUPS: DatasetGroup[] = [
         icon: 'fa-sliders',
         datasetIds: [
             'settings.core',
+            'settings.appearance',
+            'settings.presets',
+            'settings.layout',
             'chat.character.history',
             'chat.group.metadata',
             'chat.group.history',
@@ -144,6 +151,7 @@ const DATASET_GROUPS: DatasetGroup[] = [
             'extensions.third_party',
             'extensions.sources',
             'extensions.store',
+            'extensions.databases',
         ],
     },
     {

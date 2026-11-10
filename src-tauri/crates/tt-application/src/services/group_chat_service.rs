@@ -7,7 +7,7 @@ use crate::dto::chat_dto::{
     ChatSearchResultDto, DeleteGroupChatDto, ImportGroupChatDto, RenameGroupChatDto,
     RestoreGroupChatBackupDto,
 };
-use crate::dto::chat_history_dto::{ChatHistoryLocator, CurrentCommitReason};
+use crate::dto::chat_history_dto::ChatHistoryLocator;
 use crate::errors::ApplicationError;
 use crate::services::agent_workspace_lifecycle_service::AgentWorkspaceLifecycleService;
 use crate::services::chat_file_validation::validate_chat_file_name;
@@ -100,20 +100,6 @@ impl GroupChatService {
             .group_chat_repository
             .get_group_chat_metadata(chat_id)
             .await?)
-    }
-
-    pub async fn set_group_chat_metadata_extension(
-        &self,
-        chat_id: &str,
-        namespace: &str,
-        value: Value,
-    ) -> Result<(), ApplicationError> {
-        self.group_chat_repository
-            .set_group_chat_metadata_extension(chat_id, namespace, value)
-            .await?;
-        self.note_current_committed(chat_id, CurrentCommitReason::Mutation)
-            .await;
-        Ok(())
     }
 
     pub async fn get_group_chat_store_json(
@@ -301,6 +287,10 @@ impl GroupChatService {
     /// Delete a group chat payload file.
     pub async fn delete_group_chat(&self, dto: DeleteGroupChatDto) -> Result<(), ApplicationError> {
         validate_chat_file_name(&dto.id, "Group chat id")?;
+        let _run_guard = self
+            .agent_workspace_lifecycle_service
+            .lock_run_lifecycle()
+            .await;
 
         let target = AgentWorkspaceLifecycleService::group_target(&dto.id)?;
         self.agent_workspace_lifecycle_service
@@ -314,7 +304,7 @@ impl GroupChatService {
             .invalidate(&group_locator(&dto.id))
             .await;
         self.agent_workspace_lifecycle_service
-            .delete_chat_workspace(&target)
+            .delete_chat_workspace_locked(&target)
             .await?;
         Ok(())
     }
@@ -366,12 +356,6 @@ impl GroupChatService {
             .restore_group_chat_backup(&dto.backup_name)
             .await
             .map_err(Into::into)
-    }
-
-    async fn note_current_committed(&self, chat_id: &str, reason: CurrentCommitReason) {
-        self.chat_history_coordinator
-            .note_current_committed(group_locator(chat_id), reason)
-            .await;
     }
 }
 

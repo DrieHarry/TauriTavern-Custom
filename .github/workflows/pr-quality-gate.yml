@@ -31,24 +31,19 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libdbus-1-dev libwebkit2gtk-4.1-dev librsvg2-dev pkg-config
+            libdbus-1-dev libwebkit2gtk-4.1-dev librsvg2-dev pkg-config valgrind
 
-      - name: Install latest stable Rust and Clippy
+      - name: Install latest stable Rust, Clippy and rustfmt
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
-
-      - name: Cache Rust build artifacts
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "src-tauri -> target"
+          components: clippy, rustfmt
 
       - name: Setup pnpm and Node.js
         uses: pnpm/setup@v2
@@ -59,16 +54,19 @@ jobs:
 
       - name: Setup uv
         if: runner.os == 'Linux'
-        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        uses: astral-sh/setup-uv@v10.0.0
         with:
           version: latest-known
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Verify generated Flatpak dependency sources
+      - name: Verify Flatpak dependency source generation
         if: runner.os == 'Linux'
-        run: pnpm run flatpak:sources:check
+        run: pnpm run flatpak:sources
+
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps --only-shell chromium webkit
 
       - name: Run checks and tests
         run: pnpm run check
@@ -90,7 +88,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install latest stable Rust target
         uses: dtolnay/rust-toolchain@stable
@@ -120,11 +118,6 @@ jobs:
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$toolchain/aarch64-linux-android24-clang"
             echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--sysroot=$sysroot"
           } >> "$GITHUB_ENV"
-
-      - name: Cache Rust build artifacts
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "src-tauri -> target"
 
       - name: Check ${{ matrix.name }} Rust target
         run: >-

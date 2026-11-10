@@ -3,13 +3,20 @@
 //! This is the readable startup script for the native shell. It intentionally
 //! stays explicit instead of using a DI container: startup order is part of the
 //! Tauri/frontend contract and should be easy to audit in one pass.
+//!
+//! Setup never fails because of user data. Settings and policy derived from it
+//! load in backend initialization, whose failures reach the page through
+//! `BackendReadiness` instead of aborting the shell before a window exists.
 
 use std::sync::Arc;
 
-use crate::app::{BackendReadiness, StartupProfile, spawn_initialization};
+use crate::app::{BackendReadiness, SafeMode, StartupProfile, spawn_initialization};
+use crate::infrastructure::agent_extension_tools::AgentExtensionTools;
 use crate::infrastructure::logging::llm_api_logs::LlmApiLogStore;
-use tauri::Manager;
+use tauri::{AppHandle, Manager};
 use tt_adapter_http::HttpClientPool;
+use tt_adapter_storage_core::commit_stage::PageGeneration;
+use tt_application::services::host_resource_service::HostResourceService;
 use tt_domain::errors::DomainError;
 use tt_domain::ios_policy::IosPolicyScope;
 
@@ -23,31 +30,26 @@ pub(super) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
 
     // 2. Publish lightweight host services that do not depend on user settings.
     // AppState construction later reuses the same HTTP pool via managed state.
-    let http_client_pool = Arc::new(HttpClientPool::new(crate::product::USER_AGENT));
-    app.manage(http_client_pool.clone());
+    app.manage(Arc::new(AgentExtensionTools::default()));
+    app.manage(Arc::new(PageGeneration::default()));
+    app.manage(Arc::new(HttpClientPool::new(crate::product::USER_AGENT)));
     super::resources::install_bundled_templates(app, &app_handle);
 
-    #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+    #[cfg(desktop)]
     // Desktop window-state needs the resolved data root and must be installed
     // before the main window exists. The main window restores state manually.
     super::window::install_window_state_plugin(&app_handle, &runtime_paths.data_root)?;
 
     // 3. Bring up observability before emitting user-visible startup diagnostics.
-    let observability = super::observability::install(app, &app_handle, &runtime_paths)?;
+    super::observability::install(app, &app_handle, &runtime_paths)?;
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(desktop)]
     super::observability::emit_pending_runtime_migration_error(&runtime_paths);
 
     tracing::debug!("Starting TauriTavern application");
 
-    // 4. Load the one startup settings/policy snapshot. Runtime settings changes
-    // still go through SettingsService; startup-only effects use this snapshot.
-    let startup_profile = StartupProfile::load(&runtime_paths.data_root)?;
-    apply_startup_profile(
-        &startup_profile,
-        &http_client_pool,
-        &observability.llm_api_logs,
-    );
+    // Before anything reads user data, which this launch may reset.
+    app.manage(Arc::new(SafeMode::register_launch(&runtime_paths.app_root)));
 
     let backend_readiness = Arc::new(BackendReadiness::new());
     if !app.manage(backend_readiness.clone()) {
@@ -56,46 +58,32 @@ pub(super) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
         )));
     }
 
-    // 5. Resource state depends on StartupProfile settings, and must be managed
-    // before the first webview can request browser-visible assets.
-    let host_resource_service = super::resources::install_runtime_resources(
-        app,
-        &app_handle,
-        &runtime_paths,
-        &startup_profile,
-    )?;
+    // 4. Resource state must be managed before the first webview can request
+    // browser-visible assets.
+    let host_resource_service =
+        super::resources::install_runtime_resources(app, &app_handle, &runtime_paths)?;
     let _main_window = super::window::create_main_window(app, host_resource_service)?;
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(all(desktop, not(windows)))]
     super::shutdown::install_window_close_handler(&_main_window);
 
     #[cfg(target_os = "windows")]
     // Windows tray owns close-to-tray window behavior and keeps its managed state
     // alive for runtime settings updates.
-    super::window::install_windows_tray(
-        &app_handle,
-        &_main_window,
-        startup_profile.tauritavern_settings.close_to_tray_on_close,
-    )?;
+    super::window::install_windows_tray(&app_handle, &_main_window)?;
 
-    // 6. Heavy AppState construction stays off the shell critical path. The
-    // initializer manages AppState and emits app-ready/app-error as before.
-    spawn_initialization(
-        app_handle,
-        runtime_paths,
-        startup_profile,
-        backend_readiness,
-    );
+    // 5. Backend initialization loads user settings and builds AppState off the
+    // shell critical path.
+    spawn_initialization(app_handle, runtime_paths, backend_readiness);
     Ok(())
 }
 
-fn apply_startup_profile(
-    startup_profile: &StartupProfile,
-    http_client_pool: &HttpClientPool,
-    llm_api_log_store: &LlmApiLogStore,
-) {
+/// Applies the startup snapshot to host state managed before the window existed.
+/// Settings commands apply later changes.
+pub(crate) fn apply_startup_profile(app_handle: &AppHandle, startup_profile: &StartupProfile) {
     let tauritavern_settings = &startup_profile.tauritavern_settings;
     let ios_policy = &startup_profile.ios_policy;
+    let http_client_pool = app_handle.state::<Arc<HttpClientPool>>();
 
     if ios_policy.scope == IosPolicyScope::Ios
         && tauritavern_settings.request_proxy.enabled
@@ -114,6 +102,16 @@ fn apply_startup_profile(
         );
     }
 
-    // Apply the remaining startup-only effect from the same settings snapshot.
-    llm_api_log_store.apply_settings(tauritavern_settings.dev.effective_llm_api_keep());
+    app_handle
+        .state::<Arc<LlmApiLogStore>>()
+        .apply_settings(tauritavern_settings.dev.effective_llm_api_keep());
+    app_handle
+        .state::<Arc<HostResourceService>>()
+        .set_avatar_persona_original_images_enabled(
+            tauritavern_settings.avatar_persona_original_images_enabled,
+        );
+    #[cfg(target_os = "windows")]
+    app_handle
+        .state::<Arc<crate::presentation::windows_tray::WindowsTrayState>>()
+        .set_close_to_tray_on_close(tauritavern_settings.close_to_tray_on_close);
 }

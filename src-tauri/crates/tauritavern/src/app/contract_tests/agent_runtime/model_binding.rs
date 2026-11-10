@@ -6,7 +6,13 @@ use tt_ports::repositories::settings_repository::SettingsRepository;
 #[tokio::test]
 async fn agent_model_binding_uses_the_named_proxy_without_copying_credentials() {
     let root = temp_root("agent-proxy-binding");
-    let settings = Arc::new(FileSettingsRepository::new(root.join("default-user")));
+    let settings = Arc::new(FileSettingsRepository::new(
+        root.join("default-user"),
+        UserSettings::default(),
+        Default::default(),
+        Arc::default(),
+        4 * 1024 * 1024,
+    ));
     let service = LlmConnectionService::new(
         Arc::new(FileLlmConnectionRepository::new(
             root.join("llm-connections"),
@@ -29,7 +35,7 @@ async fn agent_model_binding_uses_the_named_proxy_without_copying_credentials() 
         ("https://proxy.example/v1beta", "first-password"),
         ("https://new-proxy.example/v1beta", "updated-password"),
     ] {
-        settings.save_user_settings(&UserSettings { data: json!({
+        settings.save_user_settings(UserSettings { data: json!({
             "proxies": [
                 {"name": "Unrelated proxy", "url": "https://other.example", "password": "other"},
                 {"name": "Team proxy", "url": url, "password": password}
@@ -53,7 +59,7 @@ async fn agent_model_binding_uses_the_named_proxy_without_copying_credentials() 
     }
 
     settings
-        .save_user_settings(&UserSettings {
+        .save_user_settings(UserSettings {
             data: json!({"proxies": []}),
         })
         .await

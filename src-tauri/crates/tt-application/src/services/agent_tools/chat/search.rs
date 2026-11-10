@@ -8,9 +8,7 @@ use super::{
     parse_role, raw_total_messages, role_as_str, visible_total_messages,
 };
 use crate::errors::ApplicationError;
-use crate::services::agent_tools::common::{
-    object_args, optional_usize_arg, required_trimmed_string_arg, tool_error,
-};
+use crate::services::agent_tools::common::{optional_usize_arg, required_trimmed_string_arg};
 use crate::services::agent_tools::dispatcher::AgentToolEffect;
 use tt_domain::errors::DomainError;
 use tt_domain::frozen_macros::FrozenMacros;
@@ -51,23 +49,14 @@ pub(in crate::services::agent_tools) async fn search(
     group_chat_repository: &dyn GroupChatRepository,
     run_id: &str,
     call: &ToolInvocation,
+    args: &Map<String, Value>,
     macros: &Arc<FrozenMacros>,
 ) -> Result<(AgentToolResult, AgentToolEffect), ApplicationError> {
-    let Some(args) = object_args(call) else {
-        return Ok((
-            tool_error(
-                call,
-                "tool.invalid_arguments",
-                "arguments must be an object",
-            ),
-            AgentToolEffect::None,
-        ));
-    };
     let query = match required_trimmed_string_arg(args, "query") {
         Some(query) => query.to_string(),
         None => {
             return Ok((
-                tool_error(call, "tool.invalid_arguments", "query is required"),
+                AgentToolResult::error(call, "tool.invalid_arguments", "query is required"),
                 AgentToolEffect::None,
             ));
         }
@@ -76,7 +65,7 @@ pub(in crate::services::agent_tools) async fn search(
         Ok(query) => query,
         Err(message) => {
             return Ok((
-                tool_error(call, "tool.invalid_arguments", &message),
+                AgentToolResult::error(call, "tool.invalid_arguments", &message),
                 AgentToolEffect::None,
             ));
         }
@@ -84,18 +73,27 @@ pub(in crate::services::agent_tools) async fn search(
 
     search_query.frozen_macros = Some(macros.clone());
     let run = run_repository.load_run(run_id).await?;
-    if run.input_message_count.is_some() {
-        let raw_total =
-            match raw_total_messages(chat_repository, group_chat_repository, &run.chat_ref).await {
-                Ok(total) => total,
-                Err(DomainError::NotFound(message)) => {
-                    return Ok((
-                        tool_error(call, "chat.not_found", &chat_unavailable_message(&message)),
-                        AgentToolEffect::None,
-                    ));
-                }
-                Err(error) => return Err(error.into()),
-            };
+    if run.chat_target()?.input_message_count.is_some() {
+        let raw_total = match raw_total_messages(
+            chat_repository,
+            group_chat_repository,
+            &run.chat_target()?.chat_ref,
+        )
+        .await
+        {
+            Ok(total) => total,
+            Err(DomainError::NotFound(message)) => {
+                return Ok((
+                    AgentToolResult::error(
+                        call,
+                        "chat.not_found",
+                        &chat_unavailable_message(&message),
+                    ),
+                    AgentToolEffect::None,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
         let visible_total = visible_total_messages(&run, raw_total)?;
         let Some(bounded_query) = constrain_search_query(search_query, raw_total, visible_total)
         else {
@@ -103,7 +101,7 @@ pub(in crate::services::agent_tools) async fn search(
         };
         search_query = bounded_query;
     }
-    let hits = match &run.chat_ref {
+    let hits = match &run.chat_target()?.chat_ref {
         AgentChatRef::Character {
             character_id,
             file_name,
@@ -122,7 +120,7 @@ pub(in crate::services::agent_tools) async fn search(
         Ok(hits) => hits,
         Err(DomainError::NotFound(message)) => {
             return Ok((
-                tool_error(call, "chat.not_found", &chat_unavailable_message(&message)),
+                AgentToolResult::error(call, "chat.not_found", &chat_unavailable_message(&message)),
                 AgentToolEffect::None,
             ));
         }
@@ -135,21 +133,16 @@ pub(in crate::services::agent_tools) async fn search(
         .map(|hit| format!("chat:current#{}", hit.index))
         .collect::<Vec<_>>();
 
-    Ok((
-        AgentToolResult {
-            call_id: call.call_id.clone(),
-            tool_id: call.tool_id.clone(),
-            content,
-            structured: structured_value(ChatSearchStructured {
-                query: search_query.query.as_str(),
-                hits: hits.iter().map(structured_hit).collect(),
-            }),
-            is_error: false,
-            error_code: None,
-            resource_refs,
-        },
-        AgentToolEffect::None,
-    ))
+    let mut result = AgentToolResult::ok(
+        call,
+        content,
+        structured_value(ChatSearchStructured {
+            query: search_query.query.as_str(),
+            hits: hits.iter().map(structured_hit).collect(),
+        }),
+    );
+    result.resource_refs = resource_refs;
+    Ok((result, AgentToolEffect::None))
 }
 
 fn constrain_search_query(
@@ -193,18 +186,14 @@ fn constrain_search_query(
 
 fn empty_result(call: &ToolInvocation, query: &str) -> (AgentToolResult, AgentToolEffect) {
     (
-        AgentToolResult {
-            call_id: call.call_id.clone(),
-            tool_id: call.tool_id.clone(),
-            content: render_content(query, &[]),
-            structured: structured_value(ChatSearchStructured {
+        AgentToolResult::ok(
+            call,
+            render_content(query, &[]),
+            structured_value(ChatSearchStructured {
                 query,
                 hits: Vec::new(),
             }),
-            is_error: false,
-            error_code: None,
-            resource_refs: Vec::new(),
-        },
+        ),
         AgentToolEffect::None,
     )
 }

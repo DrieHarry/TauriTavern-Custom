@@ -1,143 +1,200 @@
 use std::sync::Arc;
+use tt_ports::workspace_fs::WorkspaceWriteGuard;
 
 use serde_json::{Value, json};
 #[cfg(feature = "test-support")]
 use tokio::sync::watch;
 
 use super::artifacts::build_agent_manifest;
-use super::commit_ledger::RunCommitLedger;
+use super::continuation::{InvocationFrame, InvocationStep, RunExecutionState};
 use super::error_payload::{run_failure_payload, run_partial_success_payload};
 use super::invocation::model_session_id;
 use super::loop_runner::AgentLoopExit;
-use super::prompt_snapshot::{
-    frozen_macros_from_snapshot, prepare_agent_tool_request, request_summary,
-};
+use super::prompt_snapshot::AgentPromptRequest;
+use super::prompt_snapshot::{request_summary, runtime_context_from_snapshot};
+use super::session_context::CompactionTrigger;
 use super::tool_snapshot::tool_snapshot_summary;
-use super::{AgentCancelReceiver, AgentRuntimeService, PreparedInvocation};
-use crate::dto::chat_completion_dto::ChatCompletionGenerateRequestDto;
+use super::{AgentCancelReceiver, AgentRuntimeService, PreparedInvocation, RootInvocationInput};
 use crate::errors::ApplicationError;
 use crate::services::agent_profile_service::ensure_profile_model_configured;
 use tt_domain::models::agent::profile::{AgentModelBindingMode, ResolvedAgentProfile};
 use tt_domain::models::agent::{
-    AgentInvocationExitPolicy, AgentInvocationStatus, AgentRunEventLevel, AgentRunStatus,
-    ROOT_AGENT_INVOCATION_ID, WorkspacePath,
+    AgentInvocationStatus, AgentRunEventLevel, AgentRunStatus, WorkspacePath,
 };
-use tt_domain::models::skill::SkillIndexEntry;
 
 impl AgentRuntimeService {
     pub(super) async fn execute_agent_loop_run(
         self: Arc<Self>,
-        run_id: String,
-        prompt_snapshot: Value,
-        request: ChatCompletionGenerateRequestDto,
-        resolved_profile: ResolvedAgentProfile,
-        effective_skills: Vec<SkillIndexEntry>,
+        input: RootInvocationInput,
         mut cancel: AgentCancelReceiver,
     ) {
-        let mut commit_ledger = RunCommitLedger::default();
+        let run_id = input.run_id.clone();
+        let mut state = RunExecutionState::default();
         let result = self
-            .execute_agent_loop_run_body(
-                &run_id,
-                prompt_snapshot,
-                request,
-                resolved_profile,
-                effective_skills,
-                &mut commit_ledger,
-                &mut cancel,
-            )
+            .execute_agent_loop_run_body(input, &mut state, &mut cancel)
             .await;
-
-        self.finalize_agent_loop_run_result(&run_id, &commit_ledger, &result)
-            .await;
-        self.close_model_session_after_run(run_id);
+        self.finish_execution(&run_id, state, result).await;
     }
 
-    async fn finalize_agent_loop_run_result(
+    pub(super) async fn execute_resumed_run(
+        self: Arc<Self>,
+        run_id: String,
+        mut state: RunExecutionState,
+        mut cancel: AgentCancelReceiver,
+    ) {
+        let result = async {
+            let handle = self.active_run_handle(&run_id).await?;
+            for frame in state.foreground.iter_mut().chain(&mut state.children) {
+                if !matches!(
+                    frame.progress.step,
+                    InvocationStep::Exited(AgentLoopExit::Transferred { .. })
+                ) {
+                    self.reopen_invocation(frame).await?;
+                }
+            }
+            for child in state.children.drain(..) {
+                handle.scheduler.submit_resumed(child)?;
+            }
+            self.execute_active_invocation_chain(&mut state, &mut cancel)
+                .await
+        }
+        .await;
+        self.finish_execution(&run_id, state, result).await;
+    }
+
+    async fn finish_execution(
         &self,
         run_id: &str,
-        commit_ledger: &RunCommitLedger,
-        result: &Result<(), ApplicationError>,
+        state: RunExecutionState,
+        result: Result<(), ApplicationError>,
     ) {
-        match result {
-            Ok(()) => {}
-            Err(ApplicationError::Cancelled(message)) => {
-                let _ = self
-                    .close_guidance_mailbox_for_run(
-                        run_id,
-                        "run_cancelled_before_next_model_request",
-                        AgentRunEventLevel::Info,
-                    )
-                    .await;
-                let _ = self.cancel_unfinished_child_tasks(run_id).await;
-                let _ = self
-                    .finish_invocation(
-                        run_id,
-                        ROOT_AGENT_INVOCATION_ID,
-                        AgentInvocationStatus::Cancelled,
-                    )
-                    .await;
-                self.clear_pending_host_requests_for_run(run_id).await;
-                let _ = self
-                    .transition_status(run_id, AgentRunStatus::Cancelled)
-                    .await;
-                let _ = self
-                    .event(
-                        run_id,
-                        AgentRunEventLevel::Info,
-                        "run_cancelled",
-                        json!({ "message": message }),
-                    )
-                    .await;
-                self.active_runs.write().await.remove(run_id);
-            }
-            Err(error) => {
-                let guidance_discard_reason = if commit_ledger.is_empty() {
-                    "run_failed_before_next_model_request"
-                } else {
-                    "run_partial_success_before_next_model_request"
-                };
-                let _ = self
-                    .close_guidance_mailbox_for_run(
-                        run_id,
-                        guidance_discard_reason,
-                        AgentRunEventLevel::Warn,
-                    )
-                    .await;
-                let _ = self.cancel_unfinished_child_tasks(run_id).await;
-                let _ = self
-                    .finish_invocation(
-                        run_id,
-                        ROOT_AGENT_INVOCATION_ID,
-                        AgentInvocationStatus::Failed,
-                    )
-                    .await;
-                self.clear_pending_host_requests_for_run(run_id).await;
-                if commit_ledger.is_empty() {
-                    let _ = self.transition_status(run_id, AgentRunStatus::Failed).await;
-                    let _ = self
-                        .event(
-                            run_id,
-                            AgentRunEventLevel::Error,
-                            "run_failed",
-                            run_failure_payload(error),
-                        )
-                        .await;
-                } else {
-                    let _ = self
-                        .transition_status(run_id, AgentRunStatus::PartialSuccess)
-                        .await;
-                    let _ = self
-                        .event(
-                            run_id,
-                            AgentRunEventLevel::Warn,
-                            "run_partial_success",
-                            run_partial_success_payload(error, commit_ledger),
-                        )
-                        .await;
-                }
+        if let Err(error) = self
+            .finalize_agent_loop_run_result(run_id, state, result.as_ref().err(), None)
+            .await
+        {
+            tracing::error!(target: tt_contracts::observability::USER_VISIBLE_ERROR,
+                "Agent run {run_id} could not save its final execution state: {error}");
+            let handle = self.active_runs.read().await.get(run_id).cloned();
+            let has_pending = if let Some(handle) = handle {
+                handle.pending_checkpoint.lock().await.is_some()
+            } else {
+                false
+            };
+            if !has_pending {
                 self.active_runs.write().await.remove(run_id);
             }
         }
+    }
+
+    pub(super) async fn finalize_agent_loop_run_result(
+        &self,
+        run_id: &str,
+        mut state: RunExecutionState,
+        error: Option<&ApplicationError>,
+        presentation: Option<Value>,
+    ) -> Result<(), ApplicationError> {
+        let handle = self.active_run_handle(run_id).await?;
+        match handle.scheduler.stop_and_join().await {
+            Ok(children) => state.children.extend(children),
+            Err(error) => state.blocked_reason = Some(error.to_string()),
+        }
+        handle.live_projection.send_replace(Default::default());
+        state.guidance = handle.guidance_mailbox.close_and_drain().await;
+        self.close_model_sessions_after_run(run_id).await?;
+        self.clear_pending_host_requests_for_run(run_id).await;
+        let (status, invocation_status, level, event_type, payload) = match error {
+            None => (
+                AgentRunStatus::Completed,
+                AgentInvocationStatus::Completed,
+                AgentRunEventLevel::Info,
+                "run_completed",
+                Value::Null,
+            ),
+            Some(ApplicationError::Cancelled(message)) => (
+                AgentRunStatus::Cancelled,
+                AgentInvocationStatus::Cancelled,
+                AgentRunEventLevel::Info,
+                "run_cancelled",
+                json!({ "message": message }),
+            ),
+            Some(error) if state.commits.is_empty() => (
+                AgentRunStatus::Failed,
+                AgentInvocationStatus::Failed,
+                AgentRunEventLevel::Error,
+                "run_failed",
+                run_failure_payload(error),
+            ),
+            Some(error) => (
+                AgentRunStatus::PartialSuccess,
+                AgentInvocationStatus::Failed,
+                AgentRunEventLevel::Warn,
+                "run_partial_success",
+                run_partial_success_payload(error, &state.commits),
+            ),
+        };
+        if let Some(frame) = &state.foreground {
+            if let Some(error) = error
+                && let Some(task_id) = frame.prepared.delegation_task_id.as_deref()
+            {
+                let task_status = if invocation_status == AgentInvocationStatus::Cancelled {
+                    tt_domain::models::agent::AgentTaskStatus::Cancelled
+                } else {
+                    tt_domain::models::agent::AgentTaskStatus::Failed
+                };
+                self.transition_child_task(
+                    run_id,
+                    task_id,
+                    task_status,
+                    None,
+                    Some(error.to_string()),
+                )
+                .await?;
+            }
+            self.finish_invocation(run_id, &frame.prepared.invocation.id, invocation_status)
+                .await?;
+        }
+        let _publication = self.run_lifecycle_lock.lock().await;
+        let mut run = self.run_repository.load_run(run_id).await?;
+        run.status = status;
+        run.updated_at = chrono::Utc::now();
+        if run.target.session_id().is_some() {
+            self.run_repository.save_run(&run).await?;
+            self.event(
+                run_id,
+                AgentRunEventLevel::Info,
+                "status_changed",
+                json!({ "status": status }),
+            )
+            .await?;
+            self.event(run_id, level, event_type, payload).await?;
+            self.active_runs.write().await.remove(run_id);
+            return Ok(());
+        }
+        self.event(
+            run_id,
+            AgentRunEventLevel::Info,
+            "status_changed",
+            json!({ "status": status }),
+        )
+        .await?;
+        // The host may observe the terminal event immediately. Hold this slot until the
+        // checkpoint is ready so its presentation acknowledgement cannot race capture.
+        let mut pending = handle.pending_checkpoint.lock().await;
+        let terminal = self.event(run_id, level, event_type, payload).await?;
+        *pending = Some(super::checkpoint::RunCheckpoint::new(
+            run,
+            terminal.seq,
+            state,
+            handle.stream_override,
+            presentation,
+        ));
+        if !handle.host_presentation {
+            self.persist_checkpoint(pending.as_ref().expect("checkpoint was captured"))
+                .await?;
+            pending.take();
+            self.active_runs.write().await.remove(run_id);
+        }
+        Ok(())
     }
 
     #[cfg(feature = "test-support")]
@@ -145,86 +202,82 @@ impl AgentRuntimeService {
         self: &Arc<Self>,
         run_id: &str,
         prompt_snapshot: Value,
-        request: ChatCompletionGenerateRequestDto,
         resolved_profile: ResolvedAgentProfile,
         cancel: &mut AgentCancelReceiver,
     ) -> Result<(), ApplicationError> {
-        let mut commit_ledger = RunCommitLedger::default();
+        let request = super::prompt_snapshot::request_from_prompt_snapshot(&prompt_snapshot)?;
+        let mut state = RunExecutionState::default();
         let run = self.run_repository.load_run(run_id).await?;
-        let scope_order = super::skill_scope::skill_scope_order_for_profile(
-            &resolved_profile,
-            &run.skill_scope_refs,
-        )?;
-        let effective_skills = self
-            .skill_service
-            .resolve_effective_skills(&scope_order, &resolved_profile.skills)
-            .await?;
+        let effective_skills = match &run.target {
+            tt_domain::models::agent::AgentRunTarget::Chat(chat) => {
+                let scope_order = super::skill_scope::skill_scope_order_for_profile(
+                    &resolved_profile,
+                    &chat.skill_scope_refs,
+                )?;
+                self.skill_service
+                    .resolve_effective_skills(&scope_order, &resolved_profile.skills)
+                    .await?
+            }
+            tt_domain::models::agent::AgentRunTarget::Session { .. } => {
+                self.resolve_session_skills(&resolved_profile).await?
+            }
+        };
         let (cancel_sender, _) = watch::channel(false);
         self.active_runs.write().await.insert(
             run_id.to_string(),
             Arc::new(super::scheduler::ActiveRunHandle::new(
                 self,
-                run_id.to_string(),
+                &run,
+                self.workspace_repository.open_filesystem(run_id).await?,
                 cancel_sender,
                 None,
+                false,
             )),
         );
         let result = self
             .execute_agent_loop_run_body(
-                run_id,
-                prompt_snapshot,
-                request,
-                resolved_profile,
-                effective_skills,
-                &mut commit_ledger,
+                RootInvocationInput {
+                    run_id: run_id.to_owned(),
+                    prompt_snapshot,
+                    request,
+                    resolved_profile,
+                    effective_skills,
+                    session: None,
+                },
+                &mut state,
                 cancel,
             )
             .await;
-        self.finalize_agent_loop_run_result(run_id, &commit_ledger, &result)
-            .await;
-        self.close_model_session_after_run(run_id.to_string());
+        self.finalize_agent_loop_run_result(run_id, state, result.as_ref().err(), None)
+            .await?;
         result
     }
 
-    fn close_model_session_after_run(&self, run_id: String) {
-        let model_gateway = Arc::clone(&self.model_gateway);
-        let invocation_repository = Arc::clone(&self.invocation_repository);
-        tokio::spawn(async move {
-            let session_ids = match invocation_repository.list_invocations(&run_id).await {
-                Ok(invocations) if !invocations.is_empty() => invocations
-                    .iter()
-                    .map(|invocation| model_session_id(&run_id, &invocation.id))
-                    .collect::<Vec<_>>(),
-                Ok(_) => vec![model_session_id(&run_id, ROOT_AGENT_INVOCATION_ID)],
-                Err(error) => {
-                    tracing::warn!(
-                        "Failed to list agent invocations while closing model sessions for run {}: {}",
-                        run_id,
-                        error
-                    );
-                    vec![model_session_id(&run_id, ROOT_AGENT_INVOCATION_ID)]
-                }
-            };
-            for session_id in session_ids {
-                model_gateway.close_session(&session_id).await;
-            }
-        });
+    async fn close_model_sessions_after_run(&self, run_id: &str) -> Result<(), ApplicationError> {
+        let invocations = self.invocation_repository.list_invocations(run_id).await?;
+        for invocation in invocations {
+            self.model_gateway
+                .close_session(&model_session_id(run_id, &invocation.id))
+                .await;
+        }
+        Ok(())
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "run bootstrap boundary keeps input snapshot, profile, skills, ledger, and cancellation explicit"
-    )]
     async fn execute_agent_loop_run_body(
         &self,
-        run_id: &str,
-        prompt_snapshot: Value,
-        request: ChatCompletionGenerateRequestDto,
-        resolved_profile: ResolvedAgentProfile,
-        effective_skills: Vec<SkillIndexEntry>,
-        commit_ledger: &mut RunCommitLedger,
+        input: RootInvocationInput,
+        state: &mut RunExecutionState,
         cancel: &mut AgentCancelReceiver,
     ) -> Result<(), ApplicationError> {
+        let RootInvocationInput {
+            run_id,
+            prompt_snapshot,
+            mut request,
+            resolved_profile,
+            effective_skills,
+            session,
+        } = input;
+        let run_id = run_id.as_str();
         let run = self
             .transition_status(run_id, AgentRunStatus::InitializingWorkspace)
             .await?;
@@ -238,7 +291,7 @@ impl AgentRuntimeService {
             "workspace_initialized",
             json!({
                 "workspaceId": run.workspace_id,
-                "stableChatId": run.stable_chat_id,
+                "target": run.target,
             }),
         )
         .await?;
@@ -270,19 +323,23 @@ impl AgentRuntimeService {
                 "agent.resolved_skills_serialize_failed: {error}"
             ))
         })?;
-        self.workspace_repository
+        self.workspace_files(run_id)
+            .await?
             .write_text(
-                run_id,
                 &WorkspacePath::parse("input/resolved_skills.json")?,
                 &resolved_skills,
+                WorkspaceWriteGuard::Unchecked,
             )
             .await?;
 
+        let accepts_images = request.accepts_images;
         let prepared_tools = self
             .prepare_invocation_tools(
                 &resolved_profile,
-                AgentInvocationExitPolicy::RunFinishAllowed,
+                run.target.tool_scope(),
+                root_invocation.exit_policy,
                 root_invocation.id.as_str(),
+                accepts_images,
             )
             .await?;
         let tool_snapshot = prepared_tools.snapshot;
@@ -290,18 +347,19 @@ impl AgentRuntimeService {
         let visible_tools = prepared_tools.model_tools;
         let tool_diagnostics = prepared_tools.diagnostics;
         let tool_snapshot_path = self.persist_tool_snapshot(run_id, &tool_snapshot).await?;
-        let mut request = request;
         self.resolve_model_binding(run_id, &resolved_profile, &mut request)
             .await?;
         self.ensure_not_cancelled(cancel)?;
-        let request = prepare_agent_tool_request(
-            request,
-            &visible_tools,
-            tool_turn.choice().clone(),
-            &run.stable_chat_id,
-            run_id,
-            root_invocation.id.as_str(),
-        )?;
+        let request = self
+            .prepare_invocation_model_request(
+                request,
+                &root_invocation,
+                &resolved_profile,
+                &effective_skills,
+                &visible_tools,
+                tool_turn.choice().clone(),
+            )
+            .await?;
         self.transition_status(run_id, AgentRunStatus::AssemblingContext)
             .await?;
         self.event(
@@ -315,7 +373,6 @@ impl AgentRuntimeService {
                 "toolSnapshotPath": tool_snapshot_path.as_str(),
                 "toolTurn": &tool_turn,
                 "toolDiagnostics": &tool_diagnostics,
-                "maxRounds": resolved_profile.tools.max_rounds,
                 "contextPolicy": &resolved_profile.context,
                 "modelRetry": {
                     "maxRetries": resolved_profile.run.model_retry.max_retries,
@@ -326,162 +383,117 @@ impl AgentRuntimeService {
         .await?;
         self.ensure_not_cancelled(cancel)?;
 
-        self.execute_active_invocation_chain(
-            PreparedInvocation {
-                frozen_macros: frozen_macros_from_snapshot(&prompt_snapshot)?,
+        let frame = state
+            .foreground
+            .insert(InvocationFrame::new(PreparedInvocation {
+                runtime_context: runtime_context_from_snapshot(&prompt_snapshot)?,
                 invocation: root_invocation,
                 delegation_task_id: None,
                 profile: resolved_profile,
                 tool_snapshot,
                 tool_turn,
                 request,
+                accepts_images,
                 effective_skills,
-            },
-            commit_ledger,
-            cancel,
-        )
-        .await?;
-        self.ensure_not_cancelled(cancel)?;
-
-        Ok(())
+                session,
+            }));
+        if let Some(session) = &frame.prepared.session
+            && session.manual_compaction
+        {
+            let tokens = self
+                .context_tokens(
+                    &frame.prepared.request,
+                    &session.tokenizer_model,
+                    None,
+                    frame.prepared.accepts_images,
+                )
+                .await?;
+            self.compact_session_context(
+                &frame.prepared,
+                session,
+                frame.progress.round,
+                CompactionTrigger::Manual,
+                tokens,
+                cancel,
+            )
+            .await?;
+            return Ok(());
+        }
+        self.execute_active_invocation_chain(state, cancel).await
     }
 
     async fn execute_active_invocation_chain(
         &self,
-        mut prepared: PreparedInvocation,
-        commit_ledger: &mut RunCommitLedger,
+        state: &mut RunExecutionState,
         cancel: &mut AgentCancelReceiver,
     ) -> Result<(), ApplicationError> {
         loop {
-            let exit = match self
-                .run_tool_loop(&mut prepared, commit_ledger, cancel)
-                .await
-            {
-                Ok(Some(exit)) => exit,
-                Ok(None) => {
-                    let error = ApplicationError::ValidationError(format!(
-                        "agent.max_tool_rounds_exceeded: workspace.finish or agent.handoff was not called within {} rounds",
-                        prepared.profile.tools.max_rounds
-                    ));
-                    self.mark_active_invocation_failed(
-                        prepared.invocation.run_id.as_str(),
-                        prepared.invocation.id.as_str(),
-                        prepared.delegation_task_id.as_deref(),
-                        &error,
-                    )
-                    .await?;
-                    return Err(error);
-                }
-                Err(error) => {
-                    self.mark_active_invocation_failed(
-                        prepared.invocation.run_id.as_str(),
-                        prepared.invocation.id.as_str(),
-                        prepared.delegation_task_id.as_deref(),
-                        &error,
-                    )
-                    .await?;
-                    return Err(error);
-                }
-            };
-
+            let frame = state.foreground.as_mut().ok_or_else(|| {
+                ApplicationError::InternalError(
+                    "agent.continuation_missing: run has no foreground invocation".to_string(),
+                )
+            })?;
+            let exit = self
+                .run_tool_loop(frame, &mut state.commits, cancel)
+                .await?;
             match exit {
+                AgentLoopExit::Replied => return Ok(()),
                 AgentLoopExit::Finished => {
-                    if let Err(error) = self
-                        .finish_run(
-                            prepared.invocation.run_id.as_str(),
-                            prepared.invocation.id.as_str(),
-                            prepared.delegation_task_id.as_deref(),
-                            commit_ledger,
-                            cancel,
-                        )
-                        .await
-                    {
-                        self.mark_active_invocation_failed(
-                            prepared.invocation.run_id.as_str(),
-                            prepared.invocation.id.as_str(),
-                            prepared.delegation_task_id.as_deref(),
-                            &error,
-                        )
-                        .await?;
-                        return Err(error);
-                    }
+                    self.ensure_not_cancelled(cancel)?;
+                    let run_id = frame.prepared.invocation.run_id.as_str();
+                    state.children.extend(
+                        self.active_run_handle(run_id)
+                            .await?
+                            .scheduler
+                            .stop_and_join()
+                            .await?,
+                    );
+                    self.finish_run(
+                        run_id,
+                        frame.prepared.delegation_task_id.as_deref(),
+                        &state.commits,
+                        &mut state.published_state,
+                        state.previous_published_state_id.as_deref(),
+                        cancel,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 AgentLoopExit::Transferred {
                     task_id,
                     new_invocation_id,
                 } => {
-                    if let Some(incoming_task_id) = prepared.delegation_task_id.as_deref() {
+                    if let Some(incoming) = frame.prepared.delegation_task_id.as_deref() {
                         self.transition_child_task(
-                            prepared.invocation.run_id.as_str(),
-                            incoming_task_id,
+                            &frame.prepared.invocation.run_id,
+                            incoming,
                             tt_domain::models::agent::AgentTaskStatus::Completed,
                             None,
                             None,
                         )
                         .await?;
                     }
-                    let next_prepared = match self
+                    // The handoff already exists. Keep this frame until its successor is
+                    // fully prepared, rather than dispatching the handoff tool again.
+                    let prepared = self
                         .prepare_handoff_invocation(
-                            prepared.invocation.run_id.as_str(),
-                            task_id.as_str(),
-                            new_invocation_id.as_str(),
+                            &frame.prepared.invocation.run_id,
+                            &task_id,
+                            &new_invocation_id,
                             cancel,
                         )
-                        .await
-                    {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
-                            self.mark_active_invocation_failed(
-                                prepared.invocation.run_id.as_str(),
-                                new_invocation_id.as_str(),
-                                Some(task_id.as_str()),
-                                &error,
-                            )
-                            .await?;
-                            return Err(error);
-                        }
-                    };
-                    prepared = next_prepared;
+                        .await?;
+                    state.foreground = Some(InvocationFrame::new(prepared));
                 }
             }
         }
-    }
-
-    async fn mark_active_invocation_failed(
-        &self,
-        run_id: &str,
-        invocation_id: &str,
-        incoming_handoff_task_id: Option<&str>,
-        error: &ApplicationError,
-    ) -> Result<(), ApplicationError> {
-        let was_cancelled = matches!(error, ApplicationError::Cancelled(_));
-        let task_status = if was_cancelled {
-            tt_domain::models::agent::AgentTaskStatus::Cancelled
-        } else {
-            tt_domain::models::agent::AgentTaskStatus::Failed
-        };
-        let invocation_status = if was_cancelled {
-            AgentInvocationStatus::Cancelled
-        } else {
-            AgentInvocationStatus::Failed
-        };
-        if let Some(task_id) = incoming_handoff_task_id {
-            self.transition_child_task(run_id, task_id, task_status, None, Some(error.to_string()))
-                .await?;
-        }
-        if invocation_id != ROOT_AGENT_INVOCATION_ID {
-            self.finish_invocation(run_id, invocation_id, invocation_status)
-                .await?;
-        }
-        Ok(())
     }
 
     pub(super) async fn resolve_model_binding(
         &self,
         run_id: &str,
         profile: &ResolvedAgentProfile,
-        request: &mut ChatCompletionGenerateRequestDto,
+        request: &mut AgentPromptRequest,
     ) -> Result<(), ApplicationError> {
         match profile.model.mode {
             AgentModelBindingMode::CurrentPromptSnapshot => {

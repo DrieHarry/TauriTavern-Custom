@@ -1,3 +1,7 @@
+import { getMountedCodeMirrorEditor, mountCodeMirrorEditor } from './tauri/codemirror-editor.js';
+import { translate } from './i18n.js';
+import { subscribeAgentRunState } from './tauritavern/agent/agent-run-controller.js';
+
 const EXPAND_BUTTON_ID = 'send_textarea_expand';
 const EDITOR_DIALOG_ID = 'tt-chat-input-editor';
 const EDITOR_TITLE_ID = 'tt-chat-input-editor-title';
@@ -85,7 +89,6 @@ function createEditorDialog(sourceTextarea) {
     const dialog = document.createElement('dialog');
     dialog.id = EDITOR_DIALOG_ID;
     dialog.className = 'tt-chat-input-editor';
-    dialog.setAttribute('data-tt-mobile-surface', 'fullscreen-window');
     dialog.setAttribute('aria-labelledby', EDITOR_TITLE_ID);
 
     const surface = document.createElement('div');
@@ -144,17 +147,18 @@ function createEditorDialog(sourceTextarea) {
  * @param {object} deps
  * @param {HTMLTextAreaElement} deps.sendTextArea
  * @param {() => Promise<void>|void} deps.sendMessage
- * @param {() => boolean} deps.isMobile
+ * @param {(text: string) => boolean} deps.canSubmitGuidance
+ * @param {() => boolean} deps.isMobileHost
  */
-export function installChatInputFullscreenEditor({ sendTextArea, sendMessage, isMobile }) {
+export function installChatInputFullscreenEditor({ sendTextArea, sendMessage, canSubmitGuidance, isMobileHost }) {
     if (!(sendTextArea instanceof HTMLTextAreaElement)) {
         throw new Error('sendTextArea must be an HTMLTextAreaElement');
     }
     if (typeof sendMessage !== 'function') {
         throw new Error('sendMessage must be a function');
     }
-    if (typeof isMobile !== 'function') {
-        throw new Error('isMobile must be a function');
+    if (typeof isMobileHost !== 'function') {
+        throw new Error('isMobileHost must be a function');
     }
 
     const inputHost = requireInputHost(sendTextArea);
@@ -167,9 +171,20 @@ export function installChatInputFullscreenEditor({ sendTextArea, sendMessage, is
 
     const { dialog, textarea, collapseButton, sendButton } = createEditorDialog(sendTextArea);
 
+    const syncSendAction = () => {
+        getMountedCodeMirrorEditor(textarea)?.flush();
+        const label = canSubmitGuidance(textarea.value) ? 'Submit guidance' : 'Send a message';
+        sendButton.title = translate(label);
+        sendButton.setAttribute('aria-label', translate(label));
+        sendButton.dataset.i18n = `[title]${label};[aria-label]${label}`;
+    };
+    textarea.addEventListener('input', syncSendAction);
+    subscribeAgentRunState(() => { if (dialog.open) syncSendAction(); });
+
     let pendingButtonFrame = 0;
     let pendingSourceFocus = false;
     let closingReason = '';
+    let editorMount = null;
 
     const setExpandButtonVisible = (visible) => {
         expandButton.hidden = !visible;
@@ -192,12 +207,13 @@ export function installChatInputFullscreenEditor({ sendTextArea, sendMessage, is
     };
 
     const commitEditorValue = () => {
+        getMountedCodeMirrorEditor(textarea)?.flush({ selection: true });
         if (sendTextArea.value !== textarea.value) {
             sendTextArea.value = textarea.value;
             sendTextArea.dispatchEvent(new Event('input', { bubbles: true }));
         }
 
-        sendTextArea.setSelectionRange(textarea.selectionStart, textarea.selectionEnd);
+        sendTextArea.setSelectionRange(textarea.selectionStart, textarea.selectionEnd, textarea.selectionDirection);
         queueButtonVisibilityUpdate();
     };
 
@@ -208,6 +224,7 @@ export function installChatInputFullscreenEditor({ sendTextArea, sendMessage, is
 
         pendingSourceFocus = focusSource;
         closingReason = reason;
+        editorMount?.abort();
         dialog.close();
     };
 
@@ -217,61 +234,70 @@ export function installChatInputFullscreenEditor({ sendTextArea, sendMessage, is
         await sendMessage();
     };
 
-    const openEditor = () => {
+    const openEditor = async () => {
+        if (dialog.open) return;
         if (typeof dialog.showModal !== 'function') {
             throw new Error('HTML dialog modal API is required for the chat input fullscreen editor.');
         }
 
         textarea.value = sendTextArea.value;
         textarea.placeholder = sendTextArea.placeholder;
+        syncSendAction();
 
-        if (!dialog.open) {
-            dialog.showModal();
-        }
-
+        dialog.showModal();
         textarea.focus();
-        textarea.setSelectionRange(sendTextArea.selectionStart, sendTextArea.selectionEnd);
+        textarea.setSelectionRange(sendTextArea.selectionStart, sendTextArea.selectionEnd, sendTextArea.selectionDirection);
+        editorMount = new AbortController();
+        await mountCodeMirrorEditor(textarea, { signal: editorMount.signal, onChange: syncSendAction });
     };
 
     expandButton.addEventListener('click', (event) => {
         event.preventDefault();
-        openEditor();
+        void openEditor().catch(error => {
+            console.error('Failed to initialize the fullscreen chat editor', error);
+            toastr.error(String(error));
+        });
     });
 
     collapseButton.addEventListener('click', () => {
-        closeEditor({ focusSource: !isMobile(), reason: 'collapse' });
+        closeEditor({ focusSource: !isMobileHost(), reason: 'collapse' });
     });
 
     sendButton.addEventListener('click', () => {
         void sendFromEditor();
     });
 
-    textarea.addEventListener('keydown', (event) => {
+    // Capture before CodeMirror handles Mod-Enter as an editor command.
+    dialog.addEventListener('keydown', (event) => {
+        const origin = event.composedPath()[0];
+        if (origin !== textarea && !origin.closest('.cm-content')) return;
         if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && !event.isComposing) {
             event.preventDefault();
+            event.stopPropagation();
             void sendFromEditor();
-            return;
         }
-
-        if (event.key === 'Escape') {
-            event.preventDefault();
-            closeEditor({ focusSource: !isMobile(), reason: 'cancel' });
-        }
-    });
+    }, { capture: true });
 
     dialog.addEventListener('keydown', (event) => {
         event.stopPropagation();
+        if (event.key === 'Escape' && !event.defaultPrevented && !event.isComposing) {
+            event.preventDefault();
+            closeEditor({ focusSource: !isMobileHost(), reason: 'cancel' });
+        }
     });
 
     dialog.addEventListener('cancel', (event) => {
         event.preventDefault();
-        closeEditor({ focusSource: !isMobile(), reason: 'cancel' });
+        closeEditor({ focusSource: !isMobileHost(), reason: 'cancel' });
     });
 
     dialog.addEventListener('close', () => {
+        editorMount?.abort();
         if (closingReason !== 'send') {
             commitEditorValue();
         }
+        getMountedCodeMirrorEditor(textarea)?.destroy();
+        editorMount = null;
 
         closingReason = '';
         if (pendingSourceFocus) {

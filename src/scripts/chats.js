@@ -1,11 +1,13 @@
 // Move chat functions here from script.js (eventually)
 
+import { getEditorName } from './dom-handlers.js';
 import { Popper, css, DOMPurify } from '../lib.js';
 import {
     addCopyToCodeBlocks,
     appendMediaToMessage,
     characters,
     chat,
+    replaceChatContents,
     eventSource,
     event_types,
     getCurrentChatId,
@@ -733,7 +735,7 @@ async function openGlobalStylesPreferenceDialog() {
     const currentPreferenceRadio = currentValue ? allowedRadio : forbiddenRadio;
     template.find(currentPreferenceRadio).prop('checked', true);
 
-    await callGenericPopup(template, POPUP_TYPE.TEXT, '', { wide: false, large: false });
+    await callGenericPopup(template, POPUP_TYPE.TEXT, '', { label: template.find('h3')[0], wide: false, large: false });
 
     // Re-render the notes if the preference changed
     const newValue = preference.get();
@@ -764,6 +766,7 @@ async function checkForCreatorNotesStyles() {
         const template = $(await renderTemplateAsync('globalStylesPopup'));
         template.find('textarea').val(styleContents);
         const confirmResult = await callGenericPopup(template, POPUP_TYPE.CONFIRM, '', {
+            label: template.find('h3')[0],
             wide: false,
             large: false,
             okButton: t`Just to Creator's Notes`,
@@ -841,7 +844,7 @@ async function openExternalMediaOverridesDialog() {
         template.find('#forbid_media_override_global').prop('checked', true);
     }
 
-    callGenericPopup(template, POPUP_TYPE.TEXT, '', { wide: false, large: false });
+    callGenericPopup(template, POPUP_TYPE.TEXT, '', { label: template.find('h4')[0], wide: false, large: false });
 }
 
 export function getCurrentEntityId() {
@@ -1877,7 +1880,7 @@ export function restoreNeutralChat() {
     }
 
     const { chat: neutralChatData, chat_metadata: neutralChatMetadata } = JSON.parse(neutralChat);
-    chat.splice(0, chat.length, ...neutralChatData);
+    replaceChatContents(neutralChatData);
     updateChatMetadata(neutralChatMetadata, true);
     sessionStorage.removeItem(NEUTRAL_CHAT_KEY);
 }
@@ -2168,7 +2171,7 @@ export function initChatUtilities() {
                 const metadata = messages.shift()?.chat_metadata || {};
                 messages.unshift(getSystemMessageByType(system_message_types.ASSISTANT_NOTE));
                 await clearChat();
-                chat.splice(0, chat.length, ...messages);
+                replaceChatContents(messages);
                 updateChatMetadata(metadata, true);
                 await printMessages();
             } catch (error) {
@@ -2244,6 +2247,8 @@ export function initChatUtilities() {
         wrapper.classList.add('flexFlowColumn', 'justifyCenter', 'alignitemscenter');
         const textarea = document.createElement('textarea');
         textarea.dataset.for = broId;
+        const editorName = getEditorName(bro[0]);
+        textarea.setAttribute('aria-label', editorName);
         if (bro[0].dataset.macros !== undefined) {
             textarea.dataset.macros = bro[0].dataset.macros;
             textarea.dataset.macrosAutocomplete = 'always'; // Always show autocomplete in expanded editor
@@ -2256,10 +2261,10 @@ export function initChatUtilities() {
         textarea.addEventListener('input', function () {
             if (contentEditable) {
                 bro[0].innerText = textarea.value;
-                bro.trigger('input');
             } else {
-                bro.val(textarea.value).trigger('input');
+                bro.val(textarea.value);
             }
+            bro[0].dispatchEvent(new Event('input', { bubbles: true }));
         });
         wrapper.appendChild(textarea);
 
@@ -2293,7 +2298,7 @@ export function initChatUtilities() {
             });
         }
 
-        await callGenericPopup(wrapper, POPUP_TYPE.TEXT, '', { wide: true, large: true });
+        await callGenericPopup(wrapper, POPUP_TYPE.TEXT, '', { label: editorName, wide: true, large: true });
     });
 
     $(document).on('click', 'body .mes .mes_text', function () {

@@ -1,21 +1,18 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::fs::{self, File};
+use tokio::fs;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tt_domain::errors::DomainError;
-use tt_domain::models::chat::parse_message_timestamp_value;
 
 use crate::chat_directory_identity::{self, SharedChatAliasStore};
-use crate::file_system::list_files_with_extension;
+use crate::file_system::{list_files_with_extension, scan_parallelism};
 
 use super::super::FileChatRepository;
 use super::index::ChatStatsCacheEntry;
 use super::projection;
-use super::{ChatFileDescriptor, SummaryCache, summary_cache_key};
-
-const MAX_CONCURRENT_READS: usize = 8;
+use super::{ChatFileDescriptor, SummaryCache, directory_date};
 
 impl FileChatRepository {
     pub async fn calculate_character_chat_stats(
@@ -40,7 +37,7 @@ impl FileChatRepository {
         character_names: Vec<String>,
     ) -> Result<Vec<(String, Result<(u64, i64), DomainError>)>, DomainError> {
         let mut results = Vec::with_capacity(character_names.len());
-        let semaphore = Arc::new(Semaphore::new(Self::chat_stats_parallelism()));
+        let semaphore = Arc::new(Semaphore::new(scan_parallelism()));
         let mut jobs = JoinSet::new();
 
         for character_name in character_names {
@@ -136,59 +133,23 @@ impl FileChatRepository {
             ))
         })?;
         let signature = Self::file_signature_from_metadata(&metadata);
-        let cache_key = summary_cache_key(&descriptor.path);
 
         {
             let mut cache = summary_cache.lock().await;
-            cache.ensure_loaded()?;
-            if let Some(entry) = cache.get_stats(&cache_key, signature) {
+            cache.ensure_loaded().await;
+            if let Some(entry) = cache.get_stats(&descriptor.path, signature) {
                 return Ok(entry);
             }
         }
 
-        let mut file = File::open(&descriptor.path).await.map_err(|error| {
-            DomainError::InternalError(format!(
-                "Failed to open chat file {:?}: {error}",
-                descriptor.path
-            ))
-        })?;
-        let signature =
-            Self::file_signature_from_metadata(&file.metadata().await.map_err(|error| {
-                DomainError::InternalError(format!(
-                    "Failed to read chat metadata {:?}: {error}",
-                    descriptor.path
-                ))
-            })?);
-        {
-            let mut cache = summary_cache.lock().await;
-            cache.ensure_loaded()?;
-            if let Some(entry) = cache.get_stats(&cache_key, signature) {
-                return Ok(entry);
-            }
-        }
-
-        let send_date =
-            projection::read_last_raw_date(&mut file, &descriptor.path, signature.size).await?;
-        let parsed_date = parse_message_timestamp_value(send_date.as_ref());
+        let send_date = projection::read_last_raw_date(&descriptor.path).await?;
         let entry = ChatStatsCacheEntry {
             signature,
-            date: if parsed_date > 0 {
-                parsed_date
-            } else {
-                signature.modified_millis
-            },
+            date: directory_date(send_date.as_ref(), signature.modified_millis),
         };
 
         let mut cache = summary_cache.lock().await;
-        cache.ensure_loaded()?;
-        cache.set_stats(cache_key, entry.clone());
+        cache.set_stats(&descriptor.path, entry.clone());
         Ok(entry)
-    }
-
-    pub(in crate::repositories::file_chat_repository) fn chat_stats_parallelism() -> usize {
-        std::thread::available_parallelism()
-            .map(|value| value.get())
-            .unwrap_or(4)
-            .clamp(1, MAX_CONCURRENT_READS)
     }
 }

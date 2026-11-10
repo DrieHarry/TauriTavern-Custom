@@ -160,6 +160,19 @@ function SettingsApp({
                 </SettingRow>
 
                 <SettingRow
+                    label={tr('Load historical swipes on demand')}
+                    helpTopic="coldSwipes"
+                    helpTitle={tr('Learn more')}
+                    onHelp={showHelp}
+                >
+                    <ToggleSwitch
+                        checked={draft.coldSwipesEnabled}
+                        ariaLabel={tr('Load historical swipes on demand')}
+                        onChange={checked => controller.updateDraft('coldSwipesEnabled', checked)}
+                    />
+                </SettingRow>
+
+                <SettingRow
                     label={tr('CodeMirror Editor')}
                     helpTopic="codeMirrorEditor"
                     helpTitle={tr('Learn more')}
@@ -172,21 +185,15 @@ function SettingsApp({
                     />
                 </SettingRow>
 
-                <SettingRow label={tr('Rust Regex Backend')}>
-                    <ToggleSwitch
-                        checked={draft.nativeRegexBackendEnabled}
-                        ariaLabel={tr('Rust Regex Backend')}
-                        onChange={checked => controller.updateDraft('nativeRegexBackendEnabled', checked)}
-                    />
-                </SettingRow>
-
                 <small className="tt-settings-section-note">{tr('Requires reload to apply.')}</small>
             </SettingsSection>
 
             <SettingsSection title={tr('Chat Backups')} icon="fa-clock-rotate-left">
                 <SettingRow
                     label={tr('Automatic Chat Backups')}
-                    hint={tr('Create a backup automatically when an eligible chat save completes.')}
+                    helpTopic="automaticChatBackups"
+                    helpTitle={tr('Create a backup automatically when an eligible chat save completes.')}
+                    onHelp={showHelp}
                 >
                     <ToggleSwitch
                         checked={draft.chatBackups.automaticEnabled}
@@ -219,7 +226,9 @@ function SettingsApp({
 
                 <SettingRow
                     label={tr('Backups per character or group')}
-                    hint={tr('Maximum backups sharing the same character or group name.')}
+                    helpTopic="backupsPerCharacterOrGroup"
+                    helpTitle={tr('Maximum backups sharing the same character or group name.')}
+                    onHelp={showHelp}
                 >
                     <input
                         className="text_pole tt-settings-input"
@@ -327,6 +336,19 @@ function SettingsApp({
                         checked={draft.avatarPersonaOriginalImagesEnabled}
                         ariaLabel={tr('Enable Character/User Avatar Original Images')}
                         onChange={checked => controller.updateDraft('avatarPersonaOriginalImagesEnabled', checked)}
+                    />
+                </SettingRow>
+
+                <SettingRow
+                    label={tr('OLED Pure Black Background')}
+                    helpTopic="oledBackground"
+                    helpTitle={tr('Use pure black backgrounds and hide wallpaper on this device, keeping theme text and accent colors.')}
+                    onHelp={showHelp}
+                >
+                    <ToggleSwitch
+                        checked={draft.oledBackgroundEnabled}
+                        ariaLabel={tr('OLED Pure Black Background')}
+                        onChange={checked => controller.updateDraft('oledBackgroundEnabled', checked)}
                     />
                 </SettingRow>
 

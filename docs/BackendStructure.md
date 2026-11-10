@@ -62,7 +62,8 @@ src-tauri/
     ├── tt-adapter-storage-userdata
     ├── tt-adapter-media
     ├── tt-adapter-extension
-    ├── tt-adapter-quickjs
+    ├── tt-adapter-workspace-shell
+    ├── tt-adapter-triviumdb
     ├── tt-adapter-sync
     └── tt-adapter-archive
 ```
@@ -77,15 +78,16 @@ src-tauri/
 | `tt-ports` | repository / gateway / runtime trait、Host Resource opened-source port |
 | `tt-application` | 用例服务、业务编排、任务协调、policy 执行 |
 | `tt-adapter-http` | 共享 HTTP client pool/profile/helper |
-| `tt-adapter-mcp` | RMCP client、Streamable HTTP lifecycle、bounded response、tools/list pagination 与 tool validation |
+| `tt-adapter-mcp` | RMCP client、协议版本策略与 Streamable HTTP lifecycle、tools/list pagination 与 tool validation |
 | `tt-adapter-provider-http` | LLM、SearXNG、SD、Translate、TTS、embedding、provider metadata 的 HTTP repository |
+| `tt-adapter-triviumdb` | 按命名空间管理 TriviumDB、阻塞执行、原生查询与持久化 |
 | `tt-adapter-vector` | Vector 的 ACID 本地索引与本地 embedding runtime；不承载 provider HTTP |
 | `tt-adapter-tokenization` | tokenizer concrete repository |
-| `tt-adapter-storage-core` | `DataDirectory`、基础文件系统 helper、chat/settings/user/theme/secret/quick reply/prompt cache/asset/llm connection/extension-store |
+| `tt-adapter-storage-core` | `DataDirectory`、基础文件系统与格式 helper、chat/settings/user/theme/secret/quick reply/prompt cache/asset/llm connection/extension-store |
 | `tt-adapter-storage-userdata` | character、world info、agent workspace、agent profile、skill local package store、PNG card metadata |
-| `tt-adapter-media` | avatar/background/user media/image metadata、browser-visible host resource file store |
+| `tt-adapter-media` | persona/avatar/background/user media/image metadata、browser-visible host resource file store |
 | `tt-adapter-extension` | third-party extension 发现、安装、版本检查、更新、分支查询/切换、删除与移动；Gitoxide smart HTTP 与 embedded worktree |
-| `tt-adapter-quickjs` | QuickJS Runtime/Context、内存 ESM 与 JavaScript binding；只接触逻辑模块、JSON、内存 workspace snapshot/delta |
+| `tt-adapter-workspace-shell` | Bashkit（含 jq/Python）与 QuickJS 执行；受限 `WorkspaceFs` 适配 |
 | `tt-adapter-sync` | LAN Sync、TT-Sync v2 runtime、stores、client/server、sync jobs |
 | `tt-adapter-archive` | data archive import/export executor、archive path safety |
 
@@ -138,7 +140,7 @@ tt-adapter-media            -> tt-adapter-storage-core
 
 ## 5. 上游兼容契约
 
-TauriTavern 不复刻 SillyTavern 1.18.0 的 Node/Express 实现细节。它复刻的是上游前端、扩展、脚本和角色卡能观察到的契约：
+TauriTavern 不复刻 SillyTavern 的 Node/Express 实现细节。它复刻的是上游前端、扩展、脚本和角色卡能观察到的契约：
 
 - 同源 URL、HTTP method、状态码、请求体解析、JSON/text/stream 响应形状。
 - 上传字段名和资源路径，例如 `/characters/*`、`/User Avatars/*`、`/backgrounds/*`、`/assets/*`、`/user/images/*`、`/user/files/*`、`/scripts/extensions/third-party/*`。
@@ -181,7 +183,8 @@ src-tauri/crates/tauritavern/src/
 │   └── startup_profile.rs # 启动期 settings / policy snapshot
 ├── presentation/          # Tauri commands、CommandError、web resource adapter
 ├── infrastructure/        # Tauri-bound infrastructure
-└── platform/              # iOS/UIKit、macOS/WebView、native UI glue
+├── platform/              # 宿主身份、iOS/UIKit、macOS/WebView、native UI glue
+└── perf.rs, perf/         # 后端性能重放（`perf` feature，见 CurrentState/PerfBaseline.md）
 ```
 
 ### 6.1 Host shell
@@ -196,6 +199,8 @@ src-tauri/crates/tauritavern/src/
 
 这里可以触碰 `tauri::AppHandle`、window、plugin、platform API。这里不写业务用例。
 
+setup 不会因用户数据失败。宿主设置与 iOS 策略的启动快照（`app/startup_profile.rs`）在异步初始化中读取，失败经 `BackendReadiness` 显示在启动失败对话框，外壳不会在窗口出现前退出。
+
 ### 6.2 Composition root
 
 `app/composition/*` 是唯一可以同时知道 application service 与 concrete adapter 的地方。
@@ -206,6 +211,7 @@ src-tauri/crates/tauritavern/src/
 - service 不直接构造 concrete adapter。
 - adapter 不调用 application service。
 - `AppState` 只持有长期运行的 service 包、lifecycle handle 和启动期策略快照，不作为全局 service locator 下沉到 application 或 adapter。
+- composition 不接触 `AppHandle`。宿主提供的东西由 `app/host/environment.rs` 汇集成 `HostEnvironment` 传入；后端性能重放用同一套 composition，换上自己的 `HostEnvironment`。
 
 ### 6.3 Host-bound infrastructure
 
@@ -222,6 +228,17 @@ src-tauri/crates/tauritavern/src/
 
 新的 Tauri-free repository 不应再放回 host infrastructure。
 
+### 6.4 平台事实
+
+编译目标只在 host crate 读取：`platform/identity.rs` 的 `HOST_IDENTITY`（`HostPlatform` + `HostKind`，类型在 `tt-contracts::host`）是唯一来源，同时注入前端（见 `docs/FrontendHostContract.md` §2.2）。
+
+- `HostKind` 取 Tauri 的 `desktop` / `mobile` 编译别名，与命令和插件的门控一致。OpenHarmony 的 `target_os` 是 `linux`，以 `target_env = "ohos"` 区分。
+- host 内外壳类别用 `cfg(desktop)` / `cfg(mobile)`，系统 API 用 `target_os` / `target_env`。`Cargo.toml` 的 target 依赖表看不到这两个别名，是唯一需要写完整平台组合的地方。
+- 非 host crate 不读平台（`desktop` / `mobile` 在那里恒为假），cfg 只用于依赖或系统 API 能否编译；行为差异由 composition root 注入事实（如 `HostKind`）或数值（如 IPC 帧预算）。
+- 为每个平台选择实现时，`match` 列出全部平台、不写通配；某个平台独有的处理用正向条件。
+
+`pnpm run check:platform` 检查各 crate 源码是否遵守以上约束，报错指向本节。
+
 ## 7. Adapter 边界
 
 adapter 是外层细节，但不是可以任意堆放的 common bucket。一个 adapter crate 应当对应一个清晰的 bounded context 或一组稳定变化原因。
@@ -232,8 +249,9 @@ adapter 是外层细节，但不是可以任意堆放的 common bucket。一个 
 - `tt-adapter-storage-userdata` 承载长期用户数据仓储，例如角色卡、世界书、Agent workspace/profile、Skill package。它关心 data root / user data 语义，而不是泛泛的“文件”。
 - `tt-adapter-extension` 承载 third-party extension 发现、安装、版本检查、更新、分支查询/切换、删除与移动，以及 Git transport、repository 与 worktree 物化边界。扩展仓库不是普通 user data JSON。
 - `tt-adapter-media` 承载浏览器可见的 avatar/background/user media 资源契约。
-- `tt-adapter-quickjs` 只承载 JavaScript 执行语义与内存 binding；Skill、Workspace policy、持久化和 journal 仍由 application 拥有。
+- `tt-adapter-workspace-shell` 通过 `WorkspaceShell` 提供执行，经 `WorkspaceFs` 访问文件；权限、Skill 绑定、冻结宏投影与发布策略由 application 拥有。
 - `tt-adapter-provider-http`、`tt-adapter-mcp` 和 `tt-adapter-tokenization` 可以复用 `tt-adapter-http`，但协议/provider 规则不能下沉到通用 HTTP helper。
+- `tt-adapter-http` 构建出站 client 时统一设置传输规则：产品 UA、平台 TLS、每个请求新建连接、解析结果 IPv4 优先。profile 只增加超时、重定向等差异。传输失败也只在这里（`upstream`）分类。
 - `tt-adapter-sync` 与 `tt-adapter-archive` 是独立运行时/执行器边界，Tauri UI glue 仍留在 host。
 
 如果一个新 adapter 只是为了两个调用点提前抽象，先不要建 crate。等它有明确 bounded context、独立依赖成本或稳定变化原因时再拆。
@@ -261,6 +279,7 @@ adapter 是外层细节，但不是可以任意堆放的 common bucket。一个 
 | 新 Tauri command | `tauritavern/src/presentation/commands` | 调 service，不直接操作仓储细节 |
 | 新 service/adapter 装配 | `tauritavern/src/app/composition` | 显式构造，避免 DI 容器或自动注册魔法 |
 | 需要 AppHandle/WebView/plugin/platform API | `tauritavern/src/app`、`infrastructure` 或 `platform` | 不下沉到 adapter |
+| 按平台区分的行为 | `tauritavern/src/app/composition` 注入 | 非 host crate 不读平台，见 §6.4 |
 | data root/default-user 的基础文件仓储 | `tt-adapter-storage-core` | chat/settings/user/theme/secret 等基础存储 |
 | 角色卡、世界书、Agent workspace/profile、Skill package | `tt-adapter-storage-userdata` | skill 是 local package store，不是普通 JSON repo |
 | 第三方扩展安装、更新、发现 | `tt-adapter-extension` | 不归入 storage-userdata |
@@ -268,9 +287,9 @@ adapter 是外层细节，但不是可以任意堆放的 common bucket。一个 
 | LLM/SearXNG/SD/Translate/TTS/provider metadata/embedding HTTP | `tt-adapter-provider-http` | 复用 `tt-adapter-http` |
 | Vector 索引与本地 embedding runtime | `tt-adapter-vector` | 独立持久化/推理依赖，不下沉到 storage-core |
 | 通用 HTTP pool/profile/helper | `tt-adapter-http` | 不放 provider 业务规则 |
-| LAN/TT Sync runtime | `tt-adapter-sync` | Tauri event/UI adapter 留 host composition |
+| LAN/TT Sync runtime | `tt-adapter-sync` | Tauri event/UI adapter 在 host `infrastructure/sync_host.rs`，经 `HostEnvironment` 交给 composition |
 | Data Archive import/export executor | `tt-adapter-archive` | Tauri picker/share 留 host infrastructure |
-| Skill JavaScript 内存执行 | `tt-adapter-quickjs` | 不接触物理路径、Workspace repository 或平台领域模型 |
+| 工作区 Shell、jq、Python 与 JavaScript 执行 | `tt-adapter-workspace-shell` | 依赖 `WorkspaceShell` / `WorkspaceFs` port，复用调用方的文件范围；不接触物理路径 |
 
 ## 10. 添加后端能力的最小流程
 
@@ -303,7 +322,7 @@ adapter 是外层细节，但不是可以任意堆放的 common bucket。一个 
 - `OpenAI Settings`
 - `TextGen Settings`
 
-TauriTavern 用户数据中的私有状态放在 `_tauritavern` 下，例如 agent workspace、agent profiles、skills、prompt cache、legacy extension source metadata、LLM connections。能够授予宿主权限的安全状态不属于用户数据：自定义端点 grant 存在 `app_root/security`，不会随可切换的 `data_root`、备份或导入迁移。
+TauriTavern 用户数据中的私有状态放在 `_tauritavern` 下，例如 agent workspace、agent profiles、skills、prompt cache、legacy extension source metadata、LLM connections。能够授予宿主权限的安全状态不属于用户数据：自定义端点 grant 存在 `app_root/security`，不会随可切换的 `data_root`、备份或导入迁移。[安全模式](CurrentState/SafeMode.md)的启动记录 `app_root/safe-mode.json` 同样属于安装：setup 在读取任何用户数据之前计入本次启动，由它决定本次启动是询问还是执行安全模式。
 
 权威代码入口：
 
@@ -311,9 +330,13 @@ TauriTavern 用户数据中的私有状态放在 `_tauritavern` 下，例如 age
 - `src-tauri/crates/tt-domain/src/models/user_directory.rs`
 - 桌面数据目录选择现状见 `docs/CurrentState/DataDirectorySelection.md`
 
-文件写入 helper 用 `persist_*` 表示文件同步后发布，用 `_blocking` 表示阻塞执行版本。`replace_file` / `replace_file_blocking` 只严格 rename 已完成写入的临时文件；`persist_file` / `persist_file_blocking` 接收原写入句柄，执行 `sync_all` 后关闭并 rename，不重新打开路径。调用方必须先 flush 自己的 buffered writer，临时文件与目标必须位于同一文件系统。设置使用 `persist_json_file`，启动时使用 `persist_json_file_blocking`；普通 `write_json_file` 保留不强制同步的原子写入，供缓存等现有调用方使用。失败向上传播，不退回覆盖复制或先删除目标再重试。
+设置分区与迁移归 `tt-adapter-storage-core` 的设置仓储，前端 API 保持完整设置对象。分区文件保存写入时的 JSON 原文：仓储只展开分区路由、修复与 Persona 用到的字段，其余内容（主要是扩展数据）按原文搬运；字节不变的文件不重写。同步约定见 [Sync](CurrentState/Sync.md#独立设置范围)。
 
-文件同步只在完整提交时执行。当前不包含 rename 后的父目录同步，因此不承诺目录项在所有平台、文件系统上的断电持久性；文件同步失败发生在发布前。跨 adapter 的单次写入直接使用相同的标准库/Tokio 顺序，不为文件 helper 增加 storage-core 仓储依赖。
+设置快照沿用上游的设置备份布局：`default-user/backups/settings_<handle>_<时间>.json`，保留最新 50 份，与聊天备份同属 `backups` 同步数据集；旧版写在 `snapshots/` 的快照在启动时迁入。
+
+设置保存复用共享字节提交；领域层定义修复规则，应用层协调保存、恢复及 Persona 独立确认。revision 是各分区原文哈希的哈希，由仓储根据存储的文件计算，提交时只重新哈希有变化的分区；它只用来发现页面加载之后来自别处的修改。仓储与归档共用文件清单和修复规则，读取及归档投影不回写源数据。
+
+文件写入以单文件原子发布为边界，持久化写入在发布前同步文件；失败不回退为覆盖复制。具体保证见[文件系统实现](../src-tauri/crates/tt-adapter-storage-core/src/file_system.rs)。跨 adapter 不为复用文件 helper 引入仓储依赖。
 
 ## 12. 专题文档导航
 
@@ -348,6 +371,7 @@ pnpm run check:rust-boundaries
 
 ```bash
 pnpm run test:rust
+pnpm run test:perf
 pnpm run check:rust:dev
 cargo test --manifest-path src-tauri/Cargo.toml -p <affected-crate> <focused-test>
 ```
@@ -372,3 +396,7 @@ pnpm run test:contracts
 - 不要把 Tauri command 名当作扩展公共 API。
 - 不要用 IPC/base64 替代浏览器原生子资源语义。
 - 不要静默降级上游契约。字段无法保真、provider metadata 无法表达、目录状态不可恢复时，应显式失败。
+
+### 移动窗口背景边界
+
+`tt-contracts::window_layout` 定义窗口快照、抽屉栏条目与背景请求。主 WebView 布局、系统栏政策、原生抽屉栏、条带显示与过期结果的丢弃属于 `tauritavern::platform` 的 shell glue。`tt-adapter-media::window_backdrop` 负责 Tauri-free 的资源读取、解码与条带裁切，复用 Host Resource Store。流程见 [CurrentState/MobileStyleAdaptation.md](CurrentState/MobileStyleAdaptation.md)。

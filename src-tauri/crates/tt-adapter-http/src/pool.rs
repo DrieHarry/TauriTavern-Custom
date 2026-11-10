@@ -17,7 +17,7 @@ use crate::restricted_endpoint::{
 };
 
 pub const CHAT_COMPLETION_CONNECT_TIMEOUT: Duration = Duration::from_secs(3 * 60);
-pub const CHAT_COMPLETION_NON_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub const CHAT_COMPLETION_NON_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 pub const TOKENIZER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const TOKENIZER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub const PROVIDER_METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -382,11 +382,8 @@ fn build_profile_client(
         HttpClientProfile::Tts => builder
             .connect_timeout(TTS_CONNECT_TIMEOUT)
             .timeout(TTS_REQUEST_TIMEOUT),
-        // Match RMCP's default client: idle reuse can stall on delayed ACK when a prior body
-        // was not fully consumed.
         HttpClientProfile::Mcp => builder
             .redirect(Policy::none())
-            .pool_max_idle_per_host(0)
             .connect_timeout(MCP_CONNECT_TIMEOUT),
     };
 
@@ -755,6 +752,36 @@ mod tests {
                 .unwrap()
         );
         trusted_handle.join().expect("trusted TLS server");
+    }
+
+    #[tokio::test]
+    async fn next_request_survives_a_connection_that_died_while_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind origin");
+        let url = format!("http://{}", listener.local_addr().expect("origin address"));
+        let origin = thread::spawn(move || {
+            let (mut first, _peer) = listener.accept().expect("accept first request");
+            read_request_head(&first).expect("read first request");
+            first
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("write first response");
+            let dead = thread::spawn(move || {
+                let _ = first.read(&mut [0; 1]);
+            });
+
+            let (mut second, _peer) = listener.accept().expect("accept second request");
+            read_request_head(&second).expect("read second request");
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write second response");
+            dead.join().expect("dead connection thread");
+        });
+        let client = pool()
+            .client(HttpClientProfile::ChatCompletionStream)
+            .unwrap();
+
+        client.get(&url).send().await.unwrap();
+        client.get(&url).send().await.unwrap();
+        origin.join().expect("origin thread");
     }
 
     #[tokio::test]

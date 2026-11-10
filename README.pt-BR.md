@@ -22,6 +22,8 @@
 
 </div>
 
+<p align="center"><sub>Agradecemos a <a href="https://github.com/shiyue137">@shiyue137</a> por criar o logo do TauriTavern 💛</sub></p>
+
 ## Baixar
 
 <div align="center">
@@ -35,6 +37,7 @@
 [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat-square)](https://tauritavern.github.io/en/downloads/platforms/)
 [![Android](https://img.shields.io/badge/Android-3DDC84?logo=android&logoColor=white&style=flat-square)](https://tauritavern.github.io/en/downloads/platforms/)
 [![iOS TestFlight](https://img.shields.io/badge/iOS-TestFlight-0D96F6?logo=apple&logoColor=white&style=flat-square)](https://testflight.apple.com/join/gpqAdeTm)
+[![HarmonyOS Beta](https://img.shields.io/badge/HarmonyOS-Beta-000000?logo=harmonyos&logoColor=white&style=flat-square)](https://tauritavern.github.io/en/downloads/platforms/)
 
 [Todas as plataformas](https://tauritavern.github.io/en/downloads/platforms/) · [Versões no GitHub](https://github.com/Darkatse/TauriTavern/releases)
 
@@ -87,7 +90,7 @@ O script identifica seu sistema e escolhe o método de instalação adequado. El
 **Versão estável**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Darkatse/TauriTavern/main/scripts/install-linux.sh | sh
+curl -fsSL https://get.tauritavern.com/linux.sh | sh
 ```
 
 **Nix / NixOS**
@@ -121,7 +124,7 @@ As compilações para Windows, macOS e dispositivos móveis estão disponíveis 
 **Linux**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Darkatse/TauriTavern/main/scripts/install-linux.sh \
+curl -fsSL https://get.tauritavern.com/linux.sh \
   | sh -s -- --channel canary
 ```
 
@@ -137,10 +140,14 @@ nix profile add github:Darkatse/TauriTavern/Canary#canary
 > **iOS**: instale pelo [teste público no TestFlight](https://testflight.apple.com/join/gpqAdeTm). É necessário ter o iOS 15.0 ou mais recente. O iOS 15.0–16.3 tem suporte limitado; o suporte completo começa no iOS 16.4. As compilações estão sujeitas às regras e limitações do TestFlight.
 >
 > **Versão portátil para Windows**: requer o WebView2 Runtime instalado no sistema.
+>
+> **HarmonyOS (beta)**: o HAP das releases é para o HarmonyOS NEXT. Assine com seu próprio certificado para instalar; recomendamos o [Auto-Installer](https://github.com/likuai2010/auto-installer/). Até agora, foi testado apenas no emulador.
+>
+> **Se o aplicativo não abrir**: feche e abra o TauriTavern 5 vezes seguidas em até 3 minutos; ele vai perguntar se você quer entrar no modo seguro.
 
 ## O que é o TauriTavern
 
-O TauriTavern transforma o [SillyTavern](https://github.com/SillyTavern/SillyTavern) em um aplicativo nativo. O frontend mantém a experiência do projeto original e está sincronizado com a versão 1.18.0, enquanto o backend foi reescrito de Node.js para Rust com Tauri v2.
+O TauriTavern transforma o [SillyTavern](https://github.com/SillyTavern/SillyTavern) em um aplicativo nativo. O frontend mantém a experiência do projeto original e está sincronizado com a versão 1.19.0, enquanto o backend foi reescrito de Node.js para Rust com Tauri v2.
 
 Não é preciso instalar o Node.js nem usar a linha de comando: basta baixar e executar. Seus cartões de personagem, chats, predefinições, Informações do Mundo e extensões de frontend continuam compatíveis com o SillyTavern.
 
@@ -148,13 +155,13 @@ Não é preciso instalar o Node.js nem usar a linha de comando: basta baixar e e
 
 ## Principais recursos
 
-- 🖥️ **Cinco plataformas nativas**: Windows, macOS, Linux, Android e iOS com a mesma experiência de uso
-- 🎭 **Compatibilidade com o SillyTavern**: o frontend está sincronizado com a versão 1.18.0, incluindo formatos de dados e estrutura de diretórios compatíveis
+- 🖥️ **Cinco plataformas nativas**: Windows, macOS, Linux, Android e iOS com a mesma experiência de uso; o suporte nativo ao HarmonyOS está em beta
+- 🎭 **Compatibilidade com o SillyTavern**: o frontend está sincronizado com a versão 1.19.0, incluindo formatos de dados e estrutura de diretórios compatíveis
 - 🧩 **Ecossistema de extensões do frontend**: o Git nativo integrado permite instalar, atualizar e trocar de branch pela própria interface (plugins de backend exclusivos para Node.js não são compatíveis)
 - 🔄 **Sincronização entre dispositivos**: pareamento criptografado pela rede local ou envio automático pelo TT-Sync v2 remoto
 - 🤖 **Agent Framework**: chamadas de ferramentas, Skills, subagentes e linha do tempo de execução; o desenvolvimento continua
 - 📦 **Migração direta**: scripts de exportação do SillyTavern e importação dentro do aplicativo
-- ⚡ **Otimizações de desempenho**: inicialização em etapas e carregamento em janelas mantêm a interface responsiva mesmo em conversas longas
+- ⚡ **Otimizações de desempenho**: inicialização em etapas e virtualização do DOM do chat mantêm a interface fluida mesmo em conversas muito longas
 - 🔒 **Seus dados permanecem com você**: tudo fica armazenado no dispositivo, com um modo portátil opcional
 
 ## Capturas de tela
@@ -197,11 +204,13 @@ pnpm run ios:dev       # modo de desenvolvimento para iOS
 
 **Tauri Pilot (desenvolvimento de frontend com agentes de IA)**
 
-O projeto inclui o plugin [Tauri Pilot](https://github.com/mpiton/tauri-pilot) e suas permissões somente para desenvolvimento. Com ele, um agente de IA pode inspecionar e operar o WebView para desktop por meio de snapshots de acessibilidade. Os comandos normais de desenvolvimento e as compilações de lançamento não ativam esse recurso.
+O projeto inclui o plugin [Tauri Pilot](https://github.com/mpiton/tauri-pilot) e suas permissões somente para desenvolvimento. Com ele, um agente de IA pode inspecionar e operar o WebView no desktop, no Android e no Simulador do iOS por meio de snapshots de acessibilidade. Os comandos normais de desenvolvimento e as compilações de lançamento não ativam esse recurso.
 
 ```bash
 cargo install tauri-pilot-cli  # necessário apenas uma vez
-pnpm run tauri:dev:pilot
+pnpm run tauri:dev:pilot       # desktop
+pnpm run android:dev:pilot     # Android; encaminhe o socket antes, veja docs/AndroidDevelopment.md
+pnpm run ios:dev:pilot         # Simulador do iOS
 ```
 
 Depois de iniciar o aplicativo, use outro terminal para executar o fluxo básico:
@@ -238,7 +247,7 @@ Issues e Pull Requests são bem-vindos. Leia primeiro o [CONTRIBUTING.md](CONTRI
 
 ## Agradecimentos e licença
 
-O projeto foi criado a partir do [SillyTavern](https://github.com/SillyTavern/SillyTavern) e do [Tauri](https://tauri.app/). Agradecemos aos responsáveis por [Cocktail](https://github.com/Lianues/cocktail), [Tavern-Helper](https://github.com/N0VI028/JS-Slash-Runner), [LittleWhiteBox](https://github.com/RT15548/LittleWhiteBox), [MikTik](https://github.com/Darkatse/MikTik) e a [@LX2000WASD](https://github.com/LX2000WASD), que mantém o [pacote do TauriTavern para AUR](https://github.com/LX2000WASD/TauriTavern-aur).
+O projeto foi criado a partir do [SillyTavern](https://github.com/SillyTavern/SillyTavern) e do [Tauri](https://tauri.app/). Agradecemos aos responsáveis por [Cocktail](https://github.com/Lianues/cocktail), [Tavern-Helper](https://github.com/N0VI028/JS-Slash-Runner), [LittleWhiteBox](https://github.com/RT15548/LittleWhiteBox), [MikTik](https://github.com/Darkatse/MikTik), a [@LX2000WASD](https://github.com/LX2000WASD), que mantém o [pacote do TauriTavern para AUR](https://github.com/LX2000WASD/TauriTavern-aur), e a [@LeenHawk](https://github.com/LeenHawk), que portou o app para o HarmonyOS.
 
 Distribuído sob a licença [AGPL-3.0](LICENSE), da mesma família de licenças usada pelo SillyTavern.
 

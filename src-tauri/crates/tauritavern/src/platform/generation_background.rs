@@ -17,7 +17,7 @@ pub(crate) fn runtime(_app_handle: &AppHandle) -> Option<Arc<dyn GenerationBackg
             return None;
         };
         let runtime: Arc<dyn GenerationBackgroundRuntime> = state.inner().clone();
-        return Some(runtime);
+        Some(runtime)
     }
 
     #[cfg(target_os = "ios")]
@@ -27,7 +27,8 @@ pub(crate) fn runtime(_app_handle: &AppHandle) -> Option<Arc<dyn GenerationBackg
         )))
     }
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    // OHOS has no native generation-background adapter yet.
+    #[cfg(any(desktop, target_env = "ohos"))]
     None
 }
 

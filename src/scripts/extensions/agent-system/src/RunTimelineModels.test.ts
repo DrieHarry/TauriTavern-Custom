@@ -4,22 +4,15 @@ import { createTimelineDetailState } from './run-timeline-detail-state';
 import { createRunTimelineEventStore } from './run-timeline-event-store';
 import { createRunTimelineSession } from './run-timeline-session';
 import {
-    heightFromTopEdgeDrag,
-    runTimelineHeightBounds,
-} from './run-timeline-resize';
-import {
     canStartRunTimelineViewGesture,
     createRunTimelineViewGesture,
     resolveRunTimelineViewGesture,
     RUN_TIMELINE_VIEW_GESTURE_ACTION_DETAILS,
     shouldCancelRunTimelineViewGesture,
 } from './run-timeline-view-gesture';
-import { virtualizeTimelineItems } from './run-timeline-virtual-list';
 import {
     captureTimelineScrollAnchor,
-    readTimelineHeightBounds,
     restoreTimelineScrollAnchor,
-    scrollTimelineToBottom,
 } from './RunTimelineDom';
 import type { TimelineDetailReadInput, TimelineDetailSection } from './RunTimelineContract';
 
@@ -72,6 +65,17 @@ test('paging keeps all pages and stale reads cannot replace a reset session', as
     expect(session.events.map(item => item.runId)).toEqual(['new-run']);
 });
 
+test('older terminal pages cannot override a resumed run or its newest terminal', () => {
+    const session = createRunTimelineSession({ runId: 'run-1' });
+    session.receiveEvents([event(10, 'run-1', 'run_failed'), event(11, 'run-1', 'run_resumed')]);
+    expect(session.terminalEvent).toBeNull();
+    session.receiveEvents([event(2, 'run-1', 'run_cancelled')]);
+    expect(session.terminalEvent).toBeNull();
+    session.receiveEvents([event(15, 'run-1', 'run_completed')]);
+    session.receiveEvents([event(5, 'run-1', 'run_failed')]);
+    expect(session.terminalEvent?.seq).toBe(15);
+});
+
 test('detail state ignores stale async loads', async () => {
     const pending: Array<{
         input: TimelineDetailReadInput;
@@ -90,78 +94,23 @@ test('detail state ignores stale async loads', async () => {
     expect(state.sections).toEqual([{ labelKey: 'timelineResultText' }]);
 });
 
-test('virtualizer limits DOM rows without dropping model entries', () => {
-    const items = Array.from({ length: 120 }, (_, index) => ({ id: `item-${index + 1}`, rowSpan: 1 }));
-    const top = virtualizeTimelineItems(items, 0, 174);
-    expect(top.items).toHaveLength(19);
-    expect(top.items[0]?.id).toBe('item-1');
-    const middle = virtualizeTimelineItems(items, 58 * 50, 174);
-    expect(middle.items[0]?.id).toBe('item-43');
-    expect(middle.topPadding).toBe(42 * 58);
-    expect(items).toHaveLength(120);
-});
-
-test('timeline height follows input layout while ignoring the keyboard lift', () => {
-    const topBar = document.createElement('div');
-    topBar.id = 'top-bar';
-    const shell = document.createElement('div');
-    const lift = document.createElement('div');
-    const anchor = document.createElement('div');
-    const panel = document.createElement('section');
-    const header = document.createElement('header');
-    panel.append(header);
-    anchor.append(panel);
-    lift.append(anchor);
-    shell.append(lift);
-    document.body.append(topBar, shell);
-
-    let inputTop = 600;
-    let keyboardLift = 0;
-    Object.defineProperties(topBar, { offsetTop: { value: 24 }, offsetHeight: { value: 40 } });
-    Object.defineProperty(header, 'offsetHeight', { value: 38 });
-    Object.defineProperty(shell, 'offsetTop', { get: () => inputTop - keyboardLift });
-    Object.defineProperties(lift, {
-        offsetParent: { value: shell },
-        offsetTop: { get: () => keyboardLift },
-    });
-    Object.defineProperty(anchor, 'offsetParent', { value: lift });
-    try {
-        expect(readTimelineHeightBounds(panel, header).max).toBe(486);
-        keyboardLift = 300;
-        lift.style.transform = 'translateY(-300px)';
-        expect(readTimelineHeightBounds(panel, header).max).toBe(486);
-        inputTop = 420;
-        expect(readTimelineHeightBounds(panel, header).max).toBe(306);
-    } finally {
-        topBar.remove();
-        shell.remove();
-    }
-});
-
-test('scroll anchor, follow-tail, resize, and touch gesture preserve their native semantics', () => {
+test('prepending event rows preserves the scroll anchor without following the tail', () => {
     const scroller = document.createElement('div');
-    Object.defineProperties(scroller, {
-        scrollHeight: { configurable: true, value: 500 },
-        clientHeight: { configurable: true, value: 100 },
-    });
+    scroller.style.cssText = 'height: 100px; overflow-y: auto';
+    const rows = document.createElement('div');
+    rows.style.height = '500px';
+    scroller.append(rows);
+    document.body.append(scroller);
     scroller.scrollTop = 120;
     const anchor = captureTimelineScrollAnchor(scroller);
-    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 720 });
+    rows.style.height = '720px';
     let nearBottom = false;
     restoreTimelineScrollAnchor(scroller, anchor, viewport => { nearBottom = viewport.nearBottom; });
     expect(scroller.scrollTop).toBe(340);
     expect(nearBottom).toBe(false);
-    scrollTimelineToBottom(scroller, viewport => { nearBottom = viewport.nearBottom; });
-    expect(scroller.scrollTop).toBe(720);
-    expect(nearBottom).toBe(true);
+});
 
-    const bounds = runTimelineHeightBounds({ panelBottom: 800, topBoundary: 100, chromeHeight: 40 });
-    expect(bounds).toEqual({ min: 132, max: 648 });
-    expect(heightFromTopEdgeDrag({ startHeight: 300, startY: 500, currentY: 440, bounds })).toBe(360);
-    const smallBounds = runTimelineHeightBounds({ panelBottom: 200, topBoundary: 100, chromeHeight: 40 });
-    expect(smallBounds).toEqual({ min: 48, max: 48 });
-    expect(heightFromTopEdgeDrag({ startHeight: 300, startY: 500, currentY: 440, bounds: smallBounds })).toBe(48);
-
+test('touch gestures open details without intercepting vertical scrolling or text inputs', () => {
     const target = document.createElement('div');
     const pointer = (x: number, y: number, currentTarget = target) => ({
         pointerId: 7,

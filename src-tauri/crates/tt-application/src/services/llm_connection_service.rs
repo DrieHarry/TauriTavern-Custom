@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -36,6 +37,7 @@ const ALLOWED_CUSTOM_API_FORMATS: &[&str] = &[
     "openai_responses",
     "claude_messages",
     "gemini_interactions",
+    "gemini_generate_content",
 ];
 
 const ADAPTER_HINT_ENABLED: &str = "enabled";
@@ -101,6 +103,11 @@ const SOURCE_SPECIFIC_FIELD_SPECS: &[SourceSpecificFieldSpec] = &[
         kind: SourceSpecificValueKind::NonEmptyString,
     },
     SourceSpecificFieldSpec {
+        key: "pollinations_endpoint",
+        source: ChatCompletionSource::Pollinations,
+        kind: SourceSpecificValueKind::NonEmptyString,
+    },
+    SourceSpecificFieldSpec {
         key: "workers_ai_account_id",
         source: ChatCompletionSource::WorkersAi,
         kind: SourceSpecificValueKind::NonEmptyString,
@@ -160,6 +167,8 @@ pub struct ResolvedLlmModelBinding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_api_format: Option<String>,
     pub model_id: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_specific: BTreeMap<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<ResolvedLlmSecretRef>,
 }
@@ -195,6 +204,7 @@ impl ResolvedConnectionBinding {
             chat_completion_source: self.source.key().to_string(),
             custom_api_format: self.custom_api_format.clone(),
             model_id: self.model_id.clone(),
+            source_specific: self.connection.endpoint.source_specific.clone(),
             secret_ref: self.connection.auth.secret_ref.as_ref().map(|secret_ref| {
                 ResolvedLlmSecretRef {
                     key: secret_ref.key.trim().to_string(),
@@ -403,7 +413,11 @@ impl LlmConnectionService {
             }
             LlmConnectionReverseProxy::Preset { preset } => preset.trim(),
         };
-        let settings = self.settings_repository.load_user_settings().await?;
+        let settings = self
+            .settings_repository
+            .load_user_settings()
+            .await?
+            .settings;
         let saved = settings
             .data
             .get("proxies")
@@ -835,6 +849,8 @@ fn expected_secret_key(
         ChatCompletionSource::Zai => Ok(SecretKeys::ZAI),
         ChatCompletionSource::MiniMax => Ok(SecretKeys::MINIMAX),
         ChatCompletionSource::AwsBedrock => Ok(SecretKeys::AWS_BEDROCK),
+        ChatCompletionSource::Xai => Ok(SecretKeys::XAI),
+        ChatCompletionSource::Pollinations => Ok(SecretKeys::POLLINATIONS),
         ChatCompletionSource::VertexAi => unreachable!("Vertex AI handled above"),
     }
 }
@@ -849,6 +865,7 @@ fn supports_reverse_proxy(source: ChatCompletionSource) -> bool {
             | ChatCompletionSource::DeepSeek
             | ChatCompletionSource::Moonshot
             | ChatCompletionSource::Zai
+            | ChatCompletionSource::Xai
     )
 }
 
@@ -988,20 +1005,15 @@ mod tests {
         connection
             .endpoint
             .source_specific
-            .insert("opencode_endpoint".to_string(), json!("zen"));
-        connection
-            .endpoint
-            .source_specific
             .insert("opencode_api_format".to_string(), json!("gemini"));
 
-        validate_connection(&connection).expect("Zen should support Gemini");
-
-        connection
-            .endpoint
-            .source_specific
-            .insert("opencode_endpoint".to_string(), json!("go"));
-        let error = validate_connection(&connection).unwrap_err();
-        assert!(error.to_string().contains("does not support the Gemini"));
+        for endpoint in ["zen", "go"] {
+            connection
+                .endpoint
+                .source_specific
+                .insert("opencode_endpoint".to_string(), json!(endpoint));
+            validate_connection(&connection).expect("every OpenCode service should support Gemini");
+        }
     }
 
     #[test]

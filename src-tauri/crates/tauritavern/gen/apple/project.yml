@@ -38,7 +38,10 @@ targets:
     info:
       path: tauritavern_iOS/Info.plist
       properties:
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
         LSRequiresIPhoneOS: true
+        NSBonjourServices: ["_tauritavern._tcp"]
         UILaunchStoryboardName: LaunchScreen
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:
@@ -55,7 +58,7 @@ targets:
     entitlements:
       path: tauritavern_iOS/tauritavern_iOS.entitlements
       properties:
-        com.apple.developer.networking.multicast: true
+        com.apple.developer.kernel.increased-memory-limit: true
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full

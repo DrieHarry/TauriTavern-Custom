@@ -93,15 +93,12 @@ impl LanSyncService {
             None => (false, settings.port),
         };
 
-        let available_addresses = self.addresses.list_available_addresses(port)?;
-        let address = self
-            .addresses
-            .default_advertise_address(port, &available_addresses);
+        let addresses = self.addresses.local_addresses(port)?;
         Ok(LanSyncStatus {
             device_name: identity.device_name,
             running,
-            address,
-            available_addresses,
+            address: addresses.default,
+            available_addresses: addresses.available,
             port,
             sync_mode,
             manual_default_mode,
@@ -207,10 +204,10 @@ impl LanSyncService {
 
     pub async fn get_pairing_info(&self) -> Result<LanSyncPairingInfo, DomainError> {
         let server_info = self.ensure_server_running().await?;
-        let addresses = self.addresses.list_available_addresses(server_info.port)?;
         let address = self
             .addresses
-            .default_advertise_address(server_info.port, &addresses)
+            .local_addresses(server_info.port)?
+            .default
             .ok_or_else(|| {
                 DomainError::InvalidData("No available LAN sync addresses".to_string())
             })?;
@@ -223,6 +220,10 @@ impl LanSyncService {
 
     pub async fn discover_devices(&self) -> Result<Vec<LanDiscoveredDevice>, DomainError> {
         self.discovery.discover_devices().await
+    }
+
+    pub async fn refresh_discovery_if_started(&self) -> Result<(), DomainError> {
+        self.discovery.refresh_if_started().await
     }
 
     pub async fn set_device_name(&self, name: &str) -> Result<(), DomainError> {
