@@ -1,6 +1,7 @@
 // @ts-check
 
 import { isDesktopHost } from '../../../scripts/util/host-identity.js';
+import { getSillyTavernLocale } from '../adapters/st/sillytavern-i18n.js';
 import { createFileStagingService } from '../services/files/file-staging-service.js';
 import {
     normalizeOptionalNonNegativeInteger,
@@ -153,7 +154,10 @@ function createSkillApi({
     async function downloadImport(options) {
         const request = requirePlainObject(options, 'skill import download request');
         const url = requireNonEmptyString(request.url, 'skill import URL');
-        return normalizeSkillImportInput(await safeInvoke('download_skill_import_url', { url }));
+        return normalizeSkillImportInput(await safeInvoke('download_skill_import_url', {
+            url,
+            locale: getSillyTavernLocale(),
+        }));
     }
 
     async function previewImport(options) {
@@ -257,25 +261,9 @@ function createSkillApi({
 }
 
 /**
- * @param {any} context
+ * @param {TauriTavernHostApi} api
+ * @param {import('../context/types.js').TauriMainContext} context
  */
-export function installSkillApi(context) {
-    const hostWindow = /** @type {any} */ (window);
-    const hostAbi = hostWindow.__TAURITAVERN__;
-    if (!hostAbi || typeof hostAbi !== 'object') {
-        throw new Error('Host ABI __TAURITAVERN__ is missing');
-    }
-
-    const safeInvoke = context?.safeInvoke;
-    if (typeof safeInvoke !== 'function') {
-        throw new Error('Tauri main context safeInvoke is missing');
-    }
-
-    if (!hostAbi.api || typeof hostAbi.api !== 'object') {
-        hostAbi.api = {};
-    }
-
-    hostAbi.api.skill = createSkillApi({
-        safeInvoke,
-    });
+export function installSkillApi(api, context) {
+    api.skill = createSkillApi(context);
 }

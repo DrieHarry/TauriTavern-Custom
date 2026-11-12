@@ -8625,7 +8625,6 @@ dependencies = [
  "dispatch2",
  "dunce",
  "filetime",
- "futures-util",
  "image",
  "mime_guess",
  "objc2",
@@ -8659,6 +8658,7 @@ dependencies = [
  "tracing-subscriber",
  "tt-adapter-archive",
  "tt-adapter-extension",
+ "tt-adapter-external-import",
  "tt-adapter-http",
  "tt-adapter-mcp",
  "tt-adapter-media",
@@ -9277,6 +9277,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tt-adapter-external-import"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tt-adapter-http",
+ "tt-domain",
+ "tt-ports",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "tt-adapter-http"
 version = "0.1.0"
 dependencies = [
@@ -9513,7 +9531,6 @@ dependencies = [
  "chrono",
  "headers",
  "http",
- "mime_guess",
  "percent-encoding",
  "rand 0.10.3",
  "serde",

@@ -37,3 +37,4 @@ export async function resolveExistingRouteCharacterId(context, options) {
         throw error;
     }
 }
+

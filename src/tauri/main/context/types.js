@@ -11,12 +11,16 @@ export {};
  */
 
 /**
+ * A staged file its holder must release with `cleanup`.
  * @typedef {{
  *   filePath: string;
- *   error?: string;
- *   isTemporary?: boolean;
- *   cleanup?: (() => Promise<void>) | undefined;
+ *   cleanup: () => Promise<void>;
  * }} MaterializedFileInfo
+ */
+
+/**
+ * @typedef {(file: Blob, options?: { preferredName?: string; preferredExtension?: string; kind?: string }) => Promise<MaterializedFileInfo>} MaterializeUploadFileFn
+ * @typedef {(filePath: string) => MaterializedFileInfo} AdoptStagedFileFn
  */
 
 /**
@@ -63,7 +67,8 @@ export {};
  *   editCharacterFromForm: (formData: FormData, requestUrl: URL) => Promise<void>;
  *   editCharacterAvatarFromForm: (formData: FormData, requestUrl: URL) => Promise<void>;
  *   uploadAvatarFromForm: (formData: FormData, requestUrl: URL) => Promise<any>;
- *   materializeUploadFile: (file: Blob, options?: { preferredName?: string; preferredExtension?: string; kind?: string }) => Promise<MaterializedFileInfo | null>;
+ *   materializeUploadFile: MaterializeUploadFileFn;
+ *   adoptStagedFile: AdoptStagedFileFn;
  *   createChatBackupDownloadStream: (name: string) => Promise<ReadableStream<Uint8Array>>;
  *   createReadableFileStream: (filePath: string) => ReadableStream<Uint8Array> | Promise<ReadableStream<Uint8Array>>;
  * }} TauriMainContext

@@ -1,4 +1,5 @@
 // Tauri commands
+mod access_consent;
 pub mod agent_commands;
 pub mod agent_extension_tool_commands;
 mod agent_live_projection;
@@ -31,6 +32,7 @@ pub mod group_commands;
 pub mod helpers;
 pub mod image_commands;
 pub mod image_metadata_commands;
+mod import_source;
 pub mod lan_sync_commands;
 pub mod llm_connection_commands;
 pub mod mcp_commands;

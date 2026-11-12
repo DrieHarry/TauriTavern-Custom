@@ -160,6 +160,7 @@ export function extractReasoningFromData(data, {
                 case chat_completion_sources.NANOGPT:
                 case chat_completion_sources.SILICONFLOW:
                 case chat_completion_sources.ZAI:
+                case chat_completion_sources.MINIMAX:
                 case chat_completion_sources.WORKERS_AI:
                 case chat_completion_sources.CUSTOM: {
                     return data?.choices?.[0]?.message?.reasoning_content
@@ -827,6 +828,15 @@ export class PromptReasoning {
             return content.slice(this.prefixLength);
         }
         return content;
+    }
+
+    /**
+     * Returned reasoning is new thinking and starts a new paragraph: a prefix reasoning the model continues arrives in the reply text.
+     * @param {string} reasoning Reasoning returned by the continuation
+     * @returns {string} Text to append to the prefix reasoning
+     */
+    formatContinuation(reasoning) {
+        return reasoning && this.prefixReasoning ? `\n\n${reasoning}` : reasoning;
     }
 }
 
@@ -1523,6 +1533,27 @@ export function parseReasoningFromString(str, { strict = true } = {}, template =
         console.error('[Reasoning] Error parsing reasoning block', error);
         return null;
     }
+}
+
+/**
+ * Unlike parseReasoningFromString, whitespace around the template tags is ignored, and an unclosed block makes
+ * the rest of the prefill reasoning, its end kept as written because the model continues from there.
+ * @param {string} prefill Prefill text
+ * @returns {ParsedReasoning|null} null when the prefill does not open with a reasoning block
+ */
+export function parsePrefillReasoning(prefill) {
+    const prefix = (power_user.reasoning.prefix || '').trim();
+    const suffix = (power_user.reasoning.suffix || '').trim();
+    const text = prefill.trimStart();
+    if (!prefix || !suffix || !text.startsWith(prefix)) {
+        return null;
+    }
+
+    const body = text.slice(prefix.length);
+    const end = body.indexOf(suffix);
+    return end === -1
+        ? { reasoning: body.trimStart(), content: '' }
+        : { reasoning: body.slice(0, end).trim(), content: body.slice(end + suffix.length).trimStart() };
 }
 
 /**

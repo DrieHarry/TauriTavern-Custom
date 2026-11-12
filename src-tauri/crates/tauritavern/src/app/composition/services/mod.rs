@@ -8,9 +8,10 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::app::{AppServices, StartupProfile};
-use crate::infrastructure::apis::http_external_import_downloader::HttpExternalImportDownloader;
+use tt_adapter_external_import::{HttpExternalImportDownloader, SiteImportContentResolver};
 use tt_adapter_mcp::RmcpMcpGateway;
 use tt_adapter_storage_core::file_system::DataDirectory;
+use tt_adapter_storage_userdata::PngCharacterCardEmbedder;
 use tt_adapter_triviumdb::TriviumDatabaseBackend;
 use tt_adapter_workspace_shell::WorkspaceShellEngine;
 use tt_application::services::asset_service::AssetService;
@@ -26,6 +27,7 @@ use tt_application::services::database_service::DatabaseService;
 use tt_application::services::extension_service::ExtensionService;
 use tt_application::services::extension_store_service::ExtensionStoreService;
 use tt_application::services::external_import_service::ExternalImportDownloader;
+use tt_application::services::external_import_service::ImportSourceAccessService;
 use tt_application::services::group_chat_service::GroupChatService;
 use tt_application::services::group_service::GroupService;
 use tt_application::services::image_metadata_service::ImageMetadataService;
@@ -79,6 +81,10 @@ pub(super) async fn build(
     let content_service = Arc::new(ContentService::new(
         repositories.content_repository.clone(),
         external_import_downloader.clone(),
+        Arc::new(SiteImportContentResolver::new(
+            external_import_downloader.clone(),
+        )),
+        Arc::new(PngCharacterCardEmbedder),
     ));
     let asset_service = Arc::new(AssetService::new(
         repositories.asset_repository.clone(),
@@ -121,6 +127,10 @@ pub(super) async fn build(
             user_endpoint_runtime,
         )
         .await,
+    );
+    let import_source_access_service = Arc::new(
+        ImportSourceAccessService::initialize(repositories.import_source_grant_repository.clone())
+            .await,
     );
     let mcp_gateway = Arc::new(RmcpMcpGateway::new(http_client_pool));
     let mcp_service = Arc::new(McpService::new(
@@ -293,6 +303,7 @@ pub(super) async fn build(
         chat_completion_service,
         llm_connection_service,
         user_endpoint_access_service,
+        import_source_access_service,
         mcp_service,
         provider_metadata_service,
         searxng_search_service,
