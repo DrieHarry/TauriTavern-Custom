@@ -42,24 +42,36 @@ export async function buildAgentPromptSnapshotSeed(input = {}) {
         agentContextPolicy,
         agentSystemPrompt,
     });
-    const messages = generateData?.prompt;
-    assertMessagesReady(messages);
-    assertNoExternalToolTurns(messages);
     const frozenRunInputSnapshot = normalizeFrozenRunInputSnapshot(generateData.frozenRunInputSnapshot);
 
     return {
-        currentPromptSnapshotSeed: {
+        currentPromptSnapshotSeed: createCurrentPromptSnapshotSeed(generateData, {
             generationType,
             contextPolicy: agentContextPolicy,
-            messages: structuredClone(messages),
-            jsonSchema: generateOptions.jsonSchema ?? null,
-            worldInfoActivation: frozenRunInputSnapshot.worldInfoActivation ?? null,
-        },
+            jsonSchema: generateOptions.jsonSchema,
+            frozenRunInputSnapshot,
+        }),
         frozenRunInputSnapshot,
         generationIntent: {
             source: LEGACY_DRY_RUN_SOURCE,
             generationType,
         },
+    };
+}
+
+/**
+ * @param {any} generateData After GENERATE_AFTER_DATA.
+ * @param {{ generationType: string; contextPolicy: any; jsonSchema?: any; frozenRunInputSnapshot: any }} input
+ */
+export function createCurrentPromptSnapshotSeed(generateData, { generationType, contextPolicy, jsonSchema, frozenRunInputSnapshot }) {
+    assertMessagesReady(generateData?.prompt);
+    return {
+        generationType,
+        contextPolicy,
+        messages: generateData.prompt,
+        toolData: generateData.toolData ?? null,
+        jsonSchema: jsonSchema ?? null,
+        worldInfoActivation: frozenRunInputSnapshot.worldInfoActivation ?? null,
     };
 }
 
@@ -107,6 +119,7 @@ export async function prepareCurrentPromptPayload(input) {
             jsonSchema: seed.jsonSchema ?? null,
             agentMode: true,
             macroContext,
+            toolData: seed.toolData,
         },
     ));
 
@@ -169,23 +182,6 @@ async function captureAgentDryRun(script, generationType, generateOptions) {
 /** @param {any} messages */
 function assertMessagesReady(messages) {
     if (!Array.isArray(messages)) {
-        throw new Error('agent.prompt_snapshot_messages_required: dryRun did not produce chat-completion messages');
-    }
-}
-
-/** @param {any[]} messages */
-function assertNoExternalToolTurns(messages) {
-    if (!Array.isArray(messages)) {
-        return;
-    }
-
-    const hasToolTurn = messages.some((message) => {
-        const role = String(message?.role || '').toLowerCase();
-        return role === 'tool'
-            || (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0);
-    });
-
-    if (hasToolTurn) {
-        throw new Error('agent.external_tool_turns_unsupported: prompt snapshot already contains tool turns');
+        throw new Error('agent.prompt_snapshot_messages_required: Generate did not produce chat-completion messages');
     }
 }

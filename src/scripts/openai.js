@@ -32,7 +32,6 @@ import {
 import { getGroupNames, selected_group } from './group-chats.js';
 import { extension_prompt_roles, extension_prompt_types } from './extension-prompts.js';
 import { allowlistSettingAllows, getActiveIosPolicyCapabilities } from './tauritavern/ios-policy.js';
-import { toAgentModelMessage } from './tauritavern/agent/agent-model-messages.js';
 import { projectToolTurns } from './tauritavern/tool-turn-projection.js';
 import { canReplayProviderMetadata, getChatCompletionRequestContext } from './tauritavern/provider-replay.js';
 import { applyParamOmissions, getEffectiveGenerationSettings } from './tauri/generation-params/omission.js';
@@ -51,6 +50,7 @@ import {
     getRelativePromptById,
     isPromptInjectionPosition,
 } from './prompt-injections.js';
+import { PromptEntryError, TOOL_DEFINITION_ROLE, toolDefinitionFromEntry } from './prompt-entry-fields.js';
 
 import { forceCharacterEditorTokenize, getCustomStoppingStrings, persona_description_positions, power_user } from './power-user.js';
 import { parsePrefillReasoning } from './reasoning.js';
@@ -1410,10 +1410,12 @@ async function populationInjectionPrompts(prompts, messages, extensionPrompts = 
         'assistant': extension_prompt_roles.ASSISTANT,
     };
 
-    const injectedDepths = prompts.filter(prompt => prompt.content).map(prompt => prompt.injection_depth);
+    const producesMessage = prompt => Boolean(prompt.content || prompt.fields);
+    const injectedDepths = prompts.filter(producesMessage).map(prompt => prompt.injection_depth);
+    let injectionGroup = 0;
     for (const i of getInChatInjectionDepths(normalizePromptAssemblyExtensionPrompts(extensionPrompts), injectedDepths)) {
         // Get prompts for current depth
-        const depthPrompts = prompts.filter(prompt => prompt.injection_depth === i && prompt.content);
+        const depthPrompts = prompts.filter(prompt => prompt.injection_depth === i && producesMessage(prompt));
 
         const roleMessages = [];
         const separator = '\n';
@@ -1441,7 +1443,7 @@ async function populationInjectionPrompts(prompts, messages, extensionPrompts = 
             const roles = ['system', 'user', 'assistant'];
             for (const role of roles) {
                 const rolePrompts = orderPrompts
-                    .filter(prompt => prompt.role === role)
+                    .filter(prompt => prompt.role === role && !prompt.fields)
                     .map(x => x.content)
                     .join(separator);
 
@@ -1454,6 +1456,15 @@ async function populationInjectionPrompts(prompts, messages, extensionPrompts = 
                 if (jointPrompt && jointPrompt.length) {
                     roleMessages.push({ 'role': role, 'content': jointPrompt, injected: true });
                 }
+            }
+
+            // Reverse for chronological list order; the group has an atomic budget.
+            const entries = orderPrompts.filter(prompt => prompt.fields);
+            if (entries.length) {
+                for (const { identifier, role, content, fields } of entries.reverse()) {
+                    roleMessages.push({ identifier, role, content, fields, injected: true, injectionGroup });
+                }
+                injectionGroup += 1;
             }
         }
 
@@ -1610,6 +1621,20 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
             continue;
         }
 
+        if (chatPrompt.injectionGroup !== undefined) {
+            // Do not re-expand macros in already serialized arguments.
+            const entries = [];
+            for (; chatPool[index]?.injectionGroup === chatPrompt.injectionGroup; index += 1) {
+                entries.push(chatPool[index]);
+            }
+            const group = await Promise.all(entries.map(entry => Message.fromPromptAsync(entry, assemblyTokenHandler)));
+            if (!chatCompletion.canAffordAll(group)) {
+                break;
+            }
+            for (const message of group) chatCompletion.insertAtStart(message, 'chatHistory');
+            continue;
+        }
+
         if (Array.isArray(chatPrompt.invocations)) {
             // We do not want to mutate the prompt
             const prompt = new Prompt(chatPrompt);
@@ -1731,7 +1756,7 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
         const batch = [];
         for (; index < chatPool.length && batch.length < tokenPrefetchChunkSize; index += 1) {
             const candidate = chatPool[index];
-            if (Array.isArray(candidate.invocations) || Array.isArray(candidate.agentMessages)) {
+            if (Array.isArray(candidate.invocations) || Array.isArray(candidate.agentMessages) || candidate.injectionGroup !== undefined) {
                 break;
             }
 
@@ -1892,6 +1917,16 @@ function removeAgentOnlyPrompts(prompts) {
 }
 
 /**
+ * @param {import('./PromptManager.js').PromptCollection} prompts
+ * @returns {object[]}
+ */
+function takeToolDefinitions(prompts) {
+    const definitions = prompts.collection.filter(prompt => prompt.role === TOOL_DEFINITION_ROLE);
+    prompts.collection = prompts.collection.filter(prompt => prompt.role !== TOOL_DEFINITION_ROLE);
+    return definitions.map(toolDefinitionFromEntry);
+}
+
+/**
  * Materializes the resolved Agent System Prompt at the PromptManager-controlled position.
  *
  * @param {import('./PromptManager.js').PromptCollection} prompts - PromptCollection containing all prompts.
@@ -2019,11 +2054,11 @@ async function populateChatCompletion(prompts, chatCompletion, { bias, quietProm
     const activePromptManager = assemblyRuntime.promptManager;
     const settings = assemblyRuntime.settings;
     const assemblyTokenHandler = assemblyRuntime.tokenHandler;
-    let toolData = quietToolRequest?.toolData ?? null;
 
     if (!agentMode) {
         removeAgentOnlyPrompts(prompts);
     }
+    const toolDefinitions = takeToolDefinitions(prompts);
 
     // Helper function for preparing a prompt, that already exists within the prompt collection, for completion
     const addToChatCompletion = async (source, target = null) => {
@@ -2151,11 +2186,7 @@ async function populateChatCompletion(prompts, chatCompletion, { bias, quietProm
     }
 
     // Pre-allocation of tokens for tool data
-    if (!toolData && !agentMode && allowToolCalls && ToolManager.canAdvertiseToolCalls(type, settings)) {
-        toolData = {};
-        await ToolManager.registerFunctionToolsOpenAI(toolData);
-        legacyMcpToolRound?.mergeIntoToolData(toolData);
-    }
+    const toolData = await createToolData({ type, settings, agentMode, allowToolCalls, quietToolRequest, legacyMcpToolRound, toolDefinitions });
     if (toolData) {
         const toolMessage = [{ role: 'user', content: JSON.stringify(toolData) }];
         const toolTokens = await assemblyTokenHandler.countAsync(toolMessage);
@@ -2351,25 +2382,15 @@ async function preparePromptsForChatCompletion({ scenario, charPersonality, name
         else prompts.add(newPrompt);
     });
 
-    // Apply character-specific main prompt
-    const systemPrompt = prompts.get('main') ?? null;
-    const isSystemPromptDisabled = activePromptManager.isPromptDisabledForActiveCharacter('main');
-    if (systemPromptOverride && systemPrompt && systemPrompt.forbid_overrides !== true && !isSystemPromptDisabled) {
-        const mainOriginalContent = systemPrompt.content;
-        systemPrompt.content = systemPromptOverride;
-        const mainReplacement = activePromptManager.preparePrompt(systemPrompt, mainOriginalContent);
-        prompts.override(mainReplacement, prompts.index('main'));
-    }
-
-    // Apply character-specific jailbreak
-    const jailbreakPrompt = prompts.get('jailbreak') ?? null;
-    const isJailbreakPromptDisabled = activePromptManager.isPromptDisabledForActiveCharacter('jailbreak');
-    if (jailbreakPromptOverride && jailbreakPrompt && jailbreakPrompt.forbid_overrides !== true && !isJailbreakPromptDisabled) {
-        const jbOriginalContent = jailbreakPrompt.content;
-        jailbreakPrompt.content = jailbreakPromptOverride;
-        const jbReplacement = activePromptManager.preparePrompt(jailbreakPrompt, jbOriginalContent);
-        prompts.override(jbReplacement, prompts.index('jailbreak'));
-    }
+    // Re-evaluate raw fields, never expanded macro results; {{original}} applies only to content.
+    const applyCharacterOverride = (identifier, override) => {
+        const prompt = prompts.get(identifier);
+        if (!override || !prompt || prompt.forbid_overrides === true || activePromptManager.isPromptDisabledForActiveCharacter(identifier)) return;
+        const replacement = activePromptManager.preparePrompt({ ...activePromptManager.getPromptById(identifier), content: override }, prompt.content);
+        prompts.override(replacement, prompts.index(identifier));
+    };
+    applyCharacterOverride('main', systemPromptOverride);
+    applyCharacterOverride('jailbreak', jailbreakPromptOverride);
 
     return prompts;
 }
@@ -2489,6 +2510,9 @@ export async function prepareOpenAIMessages({
             assemblyRuntime.showToasts && toastr.error(t`Mandatory prompts exceed the context size.`);
             chatCompletion.log('Mandatory prompts exceed the context size.');
             activePromptManager.error = t`Not enough free tokens for mandatory prompts. Raise your token limit or disable custom prompts.`;
+        } else if (error instanceof PromptEntryError) {
+            dryRun === false && assemblyRuntime.showToasts && toastr.error(error.message);
+            activePromptManager.error = error.message;
         } else if (error instanceof InvalidCharacterNameError) {
             assemblyRuntime.showToasts && toastr.warning(t`An error occurred while counting tokens: Invalid character name`);
             chatCompletion.log('Invalid character name');
@@ -2500,7 +2524,7 @@ export async function prepareOpenAIMessages({
             chatCompletion.log(error.stack);
             chatCompletion.log('----------------------------------------------------');
         }
-        if (agentMode || quietToolRequest) {
+        if (agentMode || quietToolRequest || error instanceof PromptEntryError) {
             throw error;
         }
     } finally {
@@ -2549,7 +2573,7 @@ export function createAgentPromptSnapshot(payload, { settings, contextPolicy, wo
         },
         contextPolicy,
         ...(worldInfoActivation ? { worldInfoActivation } : {}),
-        messages: messages.map(toAgentModelMessage),
+        messages,
         generationParameters,
     };
 }
@@ -4219,12 +4243,43 @@ function getVerbosity(settings = null) {
 }
 
 /**
+ * Preset definitions change model-facing schemas, never execution permissions.
+ * @param {object} options
+ * @param {string} options.type
+ * @param {ChatCompletionSettings} options.settings
+ * @param {string|null} [options.model]
+ * @param {boolean} options.agentMode
+ * @param {boolean} options.allowToolCalls
+ * @param {import('../script.js').QuietToolRequest|null} [options.quietToolRequest]
+ * @param {object|null} [options.legacyMcpToolRound]
+ * @param {object[]} [options.toolDefinitions]
+ * @returns {Promise<object|null>}
+ */
+async function createToolData({ type, settings, model = null, agentMode, allowToolCalls, quietToolRequest = null, legacyMcpToolRound = null, toolDefinitions = [] }) {
+    let toolData = quietToolRequest ? { ...quietToolRequest.toolData } : null;
+    if (!toolData && !agentMode && allowToolCalls && ToolManager.canAdvertiseToolCalls(type, settings, model)) {
+        toolData = {};
+        await ToolManager.registerFunctionToolsOpenAI(toolData);
+        legacyMcpToolRound?.mergeIntoToolData(toolData);
+    }
+    if (toolDefinitions.length) {
+        const remaining = [...toolDefinitions];
+        const tools = (toolData?.tools ?? []).map(tool => {
+            const index = remaining.findIndex(definition => definition.function.name === tool.function?.name);
+            return index === -1 ? tool : remaining.splice(index, 1)[0];
+        });
+        toolData = { ...toolData, tools: [...tools, ...remaining] };
+    }
+    return toolData;
+}
+
+/**
  * Build the generation parameter object for an OAI request.
  * @param {ChatCompletionSettings} settings Initial chat completion settings
  * @param {string} model Model name
  * @param {string} type Request type (impersonate, quiet, continue, etc)
  * @param {ChatCompletionMessage[]} messages Array of chat completion messages
- * @param {import('../script.js').AdditionalRequestOptions & { agentMode?: boolean; macroContext?: object|null }} options Additional request options
+ * @param {import('../script.js').AdditionalRequestOptions & { agentMode?: boolean; macroContext?: object|null; toolData?: object|null }} options Additional request options
  * @returns {Promise<object>} Final generation parameters object appropriate for the chat completion source
  */
 export async function createGenerationParameters(settings, model, type, messages, { jsonSchema = null, agentMode = false, allowToolCalls = true, macroContext = null, toolData = undefined } = {}) {
@@ -4365,10 +4420,12 @@ export async function createGenerationParameters(settings, model, type, messages
         }
     }
 
+    // Undefined bypasses assembly; null means assembly produced no tool data.
+    if (toolData === undefined) {
+        toolData = await createToolData({ type, settings, model, agentMode, allowToolCalls });
+    }
     if (toolData) {
         Object.assign(generate_data, toolData);
-    } else if (toolData === undefined && !agentMode && allowToolCalls && ToolManager.canAdvertiseToolCalls(type, settings, model)) {
-        await ToolManager.registerFunctionToolsOpenAI(generate_data);
     }
 
     // Empty array will produce a validation error
@@ -4655,7 +4712,7 @@ export async function createGenerationParameters(settings, model, type, messages
  * @param {string} type Request type (impersonate, quiet, continue, etc)
  * @param {ChatCompletionMessage[]} messages Array of chat completion messages
  * @param {AbortSignal?} signal Abort signal for request cancellation
- * @param {import('../script.js').AdditionalRequestOptions} options Additional request options
+ * @param {import('../script.js').AdditionalRequestOptions & { toolData?: object|null }} options Additional request options
  * @returns {Promise<unknown>}
  * @throws {Error}
  */
@@ -5133,6 +5190,8 @@ class Message {
     reasoningContent = null;
     /** Canonical history is carried through layout without a provider-format round trip. */
     agentMessage = null;
+    /** @type {Record<string, unknown>|null} */
+    fields = null;
 
     /**
      * @constructor
@@ -5178,7 +5237,30 @@ class Message {
     }
 
     isSendable() {
-        return Boolean(this.agentMessage || this.content || this.tool_calls || this.reasoningContent || this.role === 'tool');
+        return Boolean(this.agentMessage || this.content || this.tool_calls || this.reasoningContent || this.fields || this.role === 'tool');
+    }
+
+    /**
+     * Entry tool_call_id must override the prompt identifier.
+     * @returns {object}
+     */
+    toChatMessage() {
+        if (this.agentMessage) {
+            return this.agentMessage;
+        }
+        return {
+            role: this.role,
+            content: this.content,
+            ...(this.identifier === AGENT_SYSTEM_PROMPT_IDENTIFIER && { _tauritavern_prompt_component: AGENT_SYSTEM_PROMPT_IDENTIFIER }),
+            ...(this.name && { name: this.name }),
+            ...(this.tool_calls && { tool_calls: this.tool_calls }),
+            ...(this.role === 'tool' && { tool_call_id: this.identifier }),
+            ...(this.signature && { signature: this.signature }),
+            ...(this.reasoning && { reasoning: this.reasoning }),
+            ...(this.native && { native: this.native }),
+            ...(this.reasoningContent && { reasoning_content: this.reasoningContent }),
+            ...this.fields,
+        };
     }
 
     /**
@@ -5410,8 +5492,14 @@ class Message {
      * @param {Object} prompt - The prompt object.
      * @returns {Promise<Message>} A new instance of Message.
      */
-    static fromPromptAsync(prompt, messageTokenHandler = tokenHandler) {
-        return Message.createAsync(prompt.role, prompt.content, prompt.identifier, messageTokenHandler);
+    static async fromPromptAsync(prompt, messageTokenHandler = tokenHandler) {
+        if (!prompt.fields) {
+            return Message.createAsync(prompt.role, prompt.content, prompt.identifier, messageTokenHandler);
+        }
+        const message = new Message(prompt.role, prompt.content, prompt.identifier);
+        message.fields = prompt.fields;
+        message.tokens = await messageTokenHandler.countAsync(message.toChatMessage());
+        return message;
     }
 
     /**
@@ -5451,25 +5539,9 @@ class MessageCollection {
      * @returns {Array} Array of objects with role, name, and content properties.
      */
     getChat() {
-        return this.collection.reduce((acc, message) => {
-            if (message.agentMessage) {
-                acc.push(message.agentMessage);
-            } else if (message.isSendable()) {
-                acc.push({
-                    role: message.role,
-                    content: message.content,
-                    ...(message.identifier === AGENT_SYSTEM_PROMPT_IDENTIFIER && { _tauritavern_prompt_component: AGENT_SYSTEM_PROMPT_IDENTIFIER }),
-                    ...(message.name && { name: message.name }),
-                    ...(message.tool_calls && { tool_calls: message.tool_calls }),
-                    ...(message.role === 'tool' && { tool_call_id: message.identifier }),
-                    ...(message.signature && { signature: message.signature }),
-                    ...(message.reasoning && { reasoning: message.reasoning }),
-                    ...(message.native && { native: message.native }),
-                    ...(message.reasoningContent && { reasoning_content: message.reasoningContent }),
-                });
-            }
-            return acc;
-        }, []);
+        return this.collection
+            .filter(message => message.isSendable())
+            .map(message => message.toChatMessage());
     }
 
     /**
@@ -5554,12 +5626,12 @@ export class ChatCompletion {
 
         for (let message of this.messages.collection) {
             // Force exclude empty messages
-            if (!message.agentMessage && message.role === 'system' && !message.content) {
+            if (message.role === 'system' && !message.isSendable()) {
                 continue;
             }
 
             const shouldSquash = (message) => {
-                return !message.agentMessage && !excludeList.includes(message.identifier) && message.role === 'system' && !message.name;
+                return !message.agentMessage && !message.fields && !excludeList.includes(message.identifier) && message.role === 'system' && !message.name;
             };
 
             if (shouldSquash(message)) {
@@ -5750,22 +5822,8 @@ export class ChatCompletion {
         for (let item of this.messages.collection) {
             if (item instanceof MessageCollection) {
                 chat.push(...item.getChat());
-            } else if (item instanceof Message && item.agentMessage) {
-                chat.push(item.agentMessage);
             } else if (item instanceof Message && item.isSendable()) {
-                const message = {
-                    role: item.role,
-                    content: item.content,
-                    ...(item.identifier === AGENT_SYSTEM_PROMPT_IDENTIFIER && { _tauritavern_prompt_component: AGENT_SYSTEM_PROMPT_IDENTIFIER }),
-                    ...(item.name ? { name: item.name } : {}),
-                    ...(item.tool_calls ? { tool_calls: item.tool_calls } : {}),
-                    ...(item.role === 'tool' ? { tool_call_id: item.identifier } : {}),
-                    ...(item.signature ? { signature: item.signature } : {}),
-                    ...(item.reasoning ? { reasoning: item.reasoning } : {}),
-                    ...(item.native ? { native: item.native } : {}),
-                    ...(item.reasoningContent ? { reasoning_content: item.reasoningContent } : {}),
-                };
-                chat.push(message);
+                chat.push(item.toChatMessage());
             } else {
                 this.log(`Skipping invalid or empty message in collection: ${JSON.stringify(item)}`);
             }
@@ -8571,7 +8629,7 @@ function replaysToolReasoningContent(settings, model = getChatCompletionModel(se
  */
 function moveHiddenPrefillReasoning(chatCompletion) {
     const prefill = chatCompletion.getMessages().flatten().findLast(message => message.isSendable());
-    if (prefill?.role !== 'assistant' || typeof prefill.content !== 'string'
+    if (prefill?.role !== 'assistant' || prefill.fields || typeof prefill.content !== 'string'
         || prefill.identifier === 'bias' || prefill.identifier === 'continuePrefill') {
         return;
     }
