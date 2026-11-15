@@ -248,6 +248,8 @@ ESM `/scripts/secrets.js` 的 `writeSecret`、`deleteSecret`、`readSecretState`
 
 `/api/content/importURL`、`/api/content/importUUID` 与 `/api/assets/download` 的 `character` 类别由宿主下载，响应与上游相同；名单外的来源先询问用户（[导入来源](CurrentState/UserEndpointAccess.md#导入来源)）。两条 content 路由都接受 URL 或站点 ID。
 
+`/proxy/<URL>` 是上游的 CORS 代理。`<URL>` 可以直接拼接，也可以先经 `encodeURIComponent` 编码，宿主解码一次。宿主用页面设置的方法、请求头和正文字节请求目标，只去掉宿主自己的 `X-CSRF-Token`；状态码、响应头和正文原样返回，正文边到达边读取。目标的来源首次使用时询问用户，重定向只跟随同源（[用户端点授权](CurrentState/UserEndpointAccess.md#授权与传输)）。与上游不同：直接拼接时保留查询串，正文二进制安全，不把 401 改成 400，转发响应头，不跟随跨源重定向。
+
 `/api/characters/delete` 只删除角色和请求删除的聊天，不删除世界书。界面删卡时如何清理世界书，见[角色世界书](CurrentState/CharacterIdentityContract.md#10-角色世界书)。
 
 第一方聊天读写直连内部 transport，不产生兼容路由的 Fetch 请求；外部观察应使用既有业务事件。`/api/chats/get`、`/api/chats/group/get`、`/api/chats/save`、`/api/chats/group/save` 仍供扩展调用。保存成功为 `200 { ok: true }`；integrity 冲突按错误码识别，返回 `400 { error: 'integrity' }`。
@@ -312,6 +314,13 @@ ESM `/scripts/secrets.js` 的 `writeSecret`、`deleteSecret`、`readSecretState`
 - GIF/WebP/APNG 在预览动画开启时使用 raw `/backgrounds/*`，关闭时使用 `/thumbnail?...&static=true` 的 first-frame JPEG；
 - MP4 选择器使用占位图，不为 poster 引入视频解码器；
 - active background 与 `<video>` 始终保留 raw `/backgrounds/*`，`static=true` 不得进入播放路径。
+
+头像同样区分列表与其他用途：
+
+- 第一方头像列表用 `getListThumbnailUrl()` 取地址，模板图片懒加载。开启原图设置时地址带 `list=true`，关闭时与普通 `/thumbnail` 相同，列表与聊天共用一份缓存；
+- 聊天头像、已保存的 URL（`force_avatar`、群组 `avatar_url`）、编辑页预览和扩展使用普通 `/thumbnail`。
+
+两者的选择规则见 [HostResourceCaching §5](CurrentState/HostResourceCaching.md#5-各资源表示)。
 
 禁止事项（为了保持契约稳定）：
 
