@@ -50,7 +50,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::chat_commands::restore_character_chat_backup,
         super::chat_commands::delete_chat_backup,
         super::chat_commands::clear_chat_cache,
-        super::chat_commands::get_chat_payload_path,
+        super::chat_commands::open_chat_payload_jsonl,
         super::chat_commands::open_chat_payload_json,
         super::chat_commands::get_chat_payload_tail,
         super::chat_commands::get_chat_payload_before,
@@ -60,7 +60,6 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::group_chat_commands::search_group_chats,
         super::group_chat_commands::list_group_chat_summaries,
         super::group_chat_commands::list_recent_group_chat_summaries,
-        super::group_chat_commands::get_group_chat_path,
         super::group_chat_commands::get_group_chat_payload_tail,
         super::group_chat_commands::get_group_chat_payload_before,
         super::group_chat_commands::get_group_chat_payload_before_pages,
@@ -124,7 +123,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         #[cfg(desktop)]
         super::runtime_paths_commands::get_runtime_paths,
         #[cfg(desktop)]
-        super::runtime_paths_commands::set_data_root,
+        super::runtime_paths_commands::pick_data_root,
         super::settings_commands::begin_settings_commit,
         super::settings_commands::append_settings_commit_chunk,
         super::settings_commands::finish_settings_commit,
@@ -260,11 +259,13 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         #[cfg(target_os = "android")]
         super::file_transfer_commands::stage_shared_file,
         super::file_transfer_commands::deliver_staged_file,
+        super::file_transfer_commands::download_remote_file,
+        super::file_transfer_commands::deliver_remote_file,
         super::file_staging_commands::stage_file_begin,
         super::file_staging_commands::stage_file_chunk,
         super::file_staging_commands::stage_file_finish,
         super::file_staging_commands::stage_content_from_url,
-        super::file_staging_commands::stage_file_from_url,
+        super::file_staging_commands::open_staged_file,
         super::file_staging_commands::stage_file_discard,
         // Chat payload commit commands
         super::chat_commit_commands::begin_chat_commit,
@@ -374,6 +375,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::skill_commands::download_skill_import_url,
         super::skill_commands::list_skills,
         super::skill_commands::list_skill_files,
+        #[cfg(desktop)]
+        super::skill_commands::pick_skill_import_directories,
         super::skill_commands::discover_skill_imports,
         super::skill_commands::discard_skill_import_archive,
         super::skill_commands::preview_skill_import,

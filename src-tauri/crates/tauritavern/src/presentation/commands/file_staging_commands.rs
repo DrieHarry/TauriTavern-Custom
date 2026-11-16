@@ -3,17 +3,16 @@ use std::sync::Arc;
 
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State, WebviewWindow};
+use tauri::{AppHandle, Manager, ResourceId, State, Webview, WebviewWindow};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
+use super::byte_reader_commands::ByteResource;
 use crate::app::AppState;
-use crate::infrastructure::staging::{create_staged_file, discard_file, validate_staged_path};
+use crate::infrastructure::staging::{self, create_staged_file, discard, validate_staged_path};
 use crate::platform::ipc::{SMALL_ASSET_UPLOAD_CHUNK_BYTES, UPLOAD_CHUNK_BYTES};
 use crate::presentation::commands::chunk_body::chunk_bytes_from_request;
-use crate::presentation::commands::helpers::{
-    ensure_ios_policy_allows, log_command, map_command_error,
-};
+use crate::presentation::commands::helpers::{log_command, map_command_error};
 use crate::presentation::commands::import_source::ImportSources;
 use crate::presentation::errors::CommandError;
 use tt_application::services::external_import_service::ContentKind;
@@ -21,6 +20,7 @@ use tt_application::services::external_import_service::ContentKind;
 const DEFAULT_KIND: &str = "generic";
 const HEADER_FILE_PATH: &str = "file-path";
 const HEADER_OFFSET: &str = "offset";
+const READ_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct StageFileBeginDto {
@@ -54,12 +54,6 @@ pub struct StagedContentResult {
     pub path: String,
     pub name: String,
     pub kind: ContentKind,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StageFileFromUrlResult {
-    pub file_path: String,
-    pub mime_type: Option<String>,
 }
 
 fn required_header(request: &tauri::ipc::Request<'_>, name: &str) -> Result<String, CommandError> {
@@ -195,39 +189,6 @@ pub async fn stage_file_finish(
     })
 }
 
-/// Stages a remote file the page cannot read; the frontend then delivers it like any staged file.
-#[tauri::command]
-pub async fn stage_file_from_url(
-    app: AppHandle,
-    url: String,
-    app_state: State<'_, Arc<AppState>>,
-) -> Result<StageFileFromUrlResult, CommandError> {
-    log_command("stage_file_from_url");
-    ensure_ios_policy_allows(
-        &app_state.ios_policy,
-        app_state.ios_policy.capabilities.content.external_import,
-        "content.external_import",
-    )?;
-    let path = create_staged_file(&app, "remote", "bin").await?;
-    match app_state
-        .services
-        .content_service
-        .download_external_file(&url, &path)
-        .await
-    {
-        Ok(file) => Ok(StageFileFromUrlResult {
-            file_path: path.to_string_lossy().into_owned(),
-            mime_type: file.content_type,
-        }),
-        Err(error) => {
-            if let Err(cleanup_error) = discard_file(&path).await {
-                tracing::warn!(%cleanup_error, "Failed to discard incomplete remote download");
-            }
-            Err(error.into())
-        }
-    }
-}
-
 #[tauri::command]
 pub async fn stage_content_from_url(
     app: AppHandle,
@@ -269,7 +230,7 @@ async fn stage_content(
     }
     .await;
     if result.is_err()
-        && let Err(cleanup_error) = discard_file(&download).await
+        && let Err(cleanup_error) = discard(&download).await
     {
         tracing::warn!(%cleanup_error, "Failed to discard incomplete content download");
     }
@@ -277,9 +238,21 @@ async fn stage_content(
 }
 
 #[tauri::command]
+pub async fn open_staged_file(
+    app: AppHandle,
+    webview: Webview,
+    path: String,
+) -> Result<ResourceId, CommandError> {
+    let reader = staging::open_staged_file(&app, &path).await?;
+    Ok(webview
+        .resources_table()
+        .add(ByteResource::new(reader, READ_CHUNK_BYTES)))
+}
+
+#[tauri::command]
 pub async fn stage_file_discard(app: AppHandle, file_path: String) -> Result<(), CommandError> {
     let path = validate_staged_path(&app, &file_path).await?;
-    discard_file(&path).await.map_err(CommandError::from)
+    discard(&path).await.map_err(CommandError::from)
 }
 
 #[cfg(test)]

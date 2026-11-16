@@ -19,13 +19,13 @@ function stagedFile({ path, name }) {
 
 /**
  * @param {Pick<import('../context/types.js').TauriMainContext,
- *   'safeInvoke' | 'invalidateCharacterCache' | 'adoptStagedFile' | 'createReadableFileStream'>} context
+ *   'safeInvoke' | 'invalidateCharacterCache' | 'adoptStagedFile' | 'createByteStream'>} context
  */
 function createCharacterCardsApi({
     safeInvoke,
     invalidateCharacterCache,
     adoptStagedFile,
-    createReadableFileStream,
+    createByteStream,
 }) {
     /** @param {{ multiple?: boolean }} [options] */
     async function pickFiles({ multiple = false } = {}) {
@@ -47,13 +47,13 @@ function createCharacterCardsApi({
         if (content.kind === 'character') {
             return { kind: content.kind, file: stagedFile(content) };
         }
-        const { bytes, type } = await takeUrlContent({ adoptStagedFile, createReadableFileStream }, content);
+        const { bytes, type } = await takeUrlContent({ safeInvoke, adoptStagedFile, createByteStream }, content);
         return { kind: content.kind, file: new File([bytes], content.name, { type }) };
     }
 
-    /** @param {string} uri @param {string} name */
-    async function stageSharedFile(uri, name) {
-        return stagedFile(await safeInvoke('stage_shared_file', { uri, name }));
+    /** @param {string} id @param {string} name */
+    async function stageSharedFile(id, name) {
+        return stagedFile(await safeInvoke('stage_shared_file', { id, name }));
     }
 
     /** @param {string} avatar */
