@@ -29,6 +29,7 @@ use tt_application::services::extension_service::ExtensionService;
 use tt_application::services::extension_store_service::ExtensionStoreService;
 use tt_application::services::external_import_service::ExternalImportDownloader;
 use tt_application::services::external_import_service::ImportSourceAccessService;
+use tt_application::services::generation_runtime::GenerationRuntime;
 use tt_application::services::group_chat_service::GroupChatService;
 use tt_application::services::group_service::GroupService;
 use tt_application::services::image_metadata_service::ImageMetadataService;
@@ -43,6 +44,7 @@ use tt_application::services::settings_service::{RequestProxyRuntime, SettingsSe
 use tt_application::services::skill_service::SkillService;
 use tt_application::services::sprite_service::SpriteService;
 use tt_application::services::stable_diffusion_service::StableDiffusionService;
+use tt_application::services::text_completion_service::TextCompletionService;
 use tt_application::services::theme_service::ThemeService;
 use tt_application::services::tokenization_service::TokenizationService;
 use tt_application::services::translate_service::TranslateService;
@@ -138,12 +140,21 @@ pub(super) async fn build(
         repositories.mcp_server_repository.clone(),
         mcp_gateway,
     ));
+    let generation_runtime = Arc::new(GenerationRuntime::new(
+        environment.generation_background_runtime.clone(),
+    ));
     let chat_completion_service = Arc::new(ChatCompletionService::new(
         repositories.chat_completion_repository.clone(),
         repositories.secret_repository.clone(),
         repositories.settings_repository.clone(),
         repositories.prompt_cache_repository.clone(),
-        environment.generation_background_runtime.clone(),
+        generation_runtime.clone(),
+        ios_policy.clone(),
+    ));
+    let text_completion_service = Arc::new(TextCompletionService::new(
+        repositories.text_completion_repository.clone(),
+        repositories.secret_repository.clone(),
+        generation_runtime.clone(),
         ios_policy.clone(),
     ));
     let provider_metadata_service = Arc::new(ProviderMetadataService::new(
@@ -304,7 +315,9 @@ pub(super) async fn build(
         agent_run_retention_automation_service: agent_services
             .agent_run_retention_automation_service,
         agent_runtime_service: agent_services.agent_runtime_service,
+        generation_runtime,
         chat_completion_service,
+        text_completion_service,
         llm_connection_service,
         user_endpoint_access_service,
         import_source_access_service,

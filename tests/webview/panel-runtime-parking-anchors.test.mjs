@@ -20,15 +20,21 @@ function installParking(profileName) {
     return { manager, pinnedSelectors };
 }
 
-test('compat parking keeps the OpenAI bounds and third-party anchors reachable', () => {
+test('compat parking keeps required bounds and third-party anchors reachable', () => {
     renderIndexBody();
     const { manager, pinnedSelectors } = installParking('compat');
 
     // Drawers ship closed, so installing already parked the left nav.
     expect(document.querySelector('#left-nav-panel .scrollableInner')).toBeNull();
     expect(document.getElementById('openai_max_context')).not.toBeNull();
+    expect(document.getElementById('max_context')).not.toBeNull();
+    expect(document.getElementById('amount_gen')).not.toBeNull();
+    expect(document.getElementById('temp_textgenerationwebui')).not.toBeNull();
     expect(document.getElementById('openai_api-presets')).not.toBeNull();
+    expect(document.getElementById('textgenerationwebui_api-presets')).not.toBeNull();
     expect(document.getElementById('completion_prompt_manager')).not.toBeNull();
+    expect(document.getElementById('tokenizer')).not.toBeNull();
+    expect(document.getElementById('instruct_presets')).not.toBeNull();
 
     manager.setVisible('panel:left-nav-panel', true);
     manager.reconcile();
@@ -40,13 +46,19 @@ test('compat parking keeps the OpenAI bounds and third-party anchors reachable',
     }
 });
 
-test('aggressive parking keeps the OpenAI bounds but drops the third-party anchors', () => {
+test('aggressive parking keeps required bounds but drops the third-party anchors', () => {
     renderIndexBody();
     installParking('aggressive');
 
     expect(document.querySelector('#left-nav-panel .scrollableInner')).toBeNull();
     expect(document.getElementById('openai_max_context')).not.toBeNull();
+    expect(document.getElementById('max_context')).not.toBeNull();
+    expect(document.getElementById('amount_gen')).not.toBeNull();
+    expect(document.getElementById('temp_textgenerationwebui')).not.toBeNull();
     expect(document.getElementById('openai_api-presets')).toBeNull();
+    expect(document.getElementById('textgenerationwebui_api-presets')).toBeNull();
+    expect(document.getElementById('tokenizer')).not.toBeNull();
+    expect(document.getElementById('instruct_presets')).not.toBeNull();
 });
 
 test('API connections gates keep the custom form for a saved custom source variant', () => {

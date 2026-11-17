@@ -7,6 +7,8 @@ use serde_json::{Map, Value, json};
 
 use tt_adapter_http::{HttpClientPool, HttpClientProfile, upstream};
 use tt_domain::errors::DomainError;
+use tt_domain::models::endpoint_url::HostLabel;
+use tt_domain::models::vertex_ai::vertex_ai_host;
 use tt_ports::repositories::vector_repository::{
     RemoteEmbeddingBatch, RemoteEmbeddingProtocol, RemoteEmbeddingRepository,
     RemoteEmbeddingRequest, VertexEmbeddingAuth,
@@ -28,6 +30,11 @@ impl HttpEmbeddingRepository {
 
     fn client(&self) -> Result<Client, DomainError> {
         self.http_clients.client(HttpClientProfile::Default)
+    }
+
+    fn user_endpoint_client(&self, base_url: &str) -> Result<Client, DomainError> {
+        self.http_clients
+            .user_endpoint_client(HttpClientProfile::Default, base_url)
     }
 
     async fn send_json(
@@ -52,12 +59,11 @@ impl HttpEmbeddingRepository {
     async fn embed_vertex(
         &self,
         model: String,
-        region: String,
+        region: HostLabel,
         auth: VertexEmbeddingAuth,
         texts: Vec<String>,
     ) -> Result<Vec<Vec<f32>>, DomainError> {
-        let region = normalized_region(&region);
-        let host = vertex_host(&region);
+        let host = vertex_ai_host(&region);
         let instances = texts
             .into_iter()
             .map(|content| json!({ "content": content }))
@@ -205,7 +211,10 @@ impl RemoteEmbeddingRepository for HttpEmbeddingRepository {
             }
             RemoteEmbeddingProtocol::Extras { base_url, api_key } => {
                 let url = root_path_url(&base_url, "/api/embeddings/compute", "Extras")?;
-                let mut request = self.client()?.post(url).json(&json!({ "text": texts }));
+                let mut request = self
+                    .user_endpoint_client(&base_url)?
+                    .post(url)
+                    .json(&json!({ "text": texts }));
                 if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
                     request = request.header(AUTHORIZATION, format!("Bearer {api_key}"));
                 }
@@ -267,7 +276,7 @@ impl RemoteEmbeddingRepository for HttpEmbeddingRepository {
                 if keep {
                     body.insert("keep_alive".to_string(), json!(-1));
                 }
-                let request = self.client()?.post(url).json(&body);
+                let request = self.user_endpoint_client(&base_url)?.post(url).json(&body);
                 let body = self.send_json(request, "Ollama").await?;
                 parse_embedding_array(
                     body.get("embeddings")
@@ -278,7 +287,9 @@ impl RemoteEmbeddingRepository for HttpEmbeddingRepository {
             RemoteEmbeddingProtocol::LlamaCpp { base_url, api_key } => {
                 let url = v1_embeddings_url(&base_url, "Llama.cpp")?;
                 let request = optional_bearer(
-                    self.client()?.post(url).json(&json!({ "input": texts })),
+                    self.user_endpoint_client(&base_url)?
+                        .post(url)
+                        .json(&json!({ "input": texts })),
                     api_key,
                 );
                 let body = self.send_json(request, "Llama.cpp").await?;
@@ -291,7 +302,7 @@ impl RemoteEmbeddingRepository for HttpEmbeddingRepository {
             } => {
                 let url = v1_embeddings_url(&base_url, "vLLM")?;
                 let request = optional_bearer(
-                    self.client()?
+                    self.user_endpoint_client(&base_url)?
                         .post(url)
                         .json(&json!({ "input": texts, "model": model })),
                     api_key,
@@ -302,7 +313,7 @@ impl RemoteEmbeddingRepository for HttpEmbeddingRepository {
             RemoteEmbeddingProtocol::KoboldCpp { base_url, api_key } => {
                 let url = root_path_url(&base_url, "/api/extra/embeddings", "KoboldCpp")?;
                 let request = optional_bearer(
-                    self.client()?
+                    self.user_endpoint_client(&base_url)?
                         .post(url)
                         .header(CONTENT_TYPE, "application/json")
                         .json(&json!({ "input": texts })),
@@ -526,23 +537,6 @@ fn service_account_project_id(credentials: &str) -> Result<String, DomainError> 
         })
 }
 
-fn normalized_region(region: &str) -> String {
-    let region = region.trim().to_ascii_lowercase();
-    if region.is_empty() {
-        "us-central1".to_string()
-    } else {
-        region
-    }
-}
-
-fn vertex_host(region: &str) -> String {
-    match region {
-        "global" => "https://aiplatform.googleapis.com".to_string(),
-        "us" | "eu" => format!("https://aiplatform.{region}.rep.googleapis.com"),
-        _ => format!("https://{region}-aiplatform.googleapis.com"),
-    }
-}
-
 fn invalid_url(provider: &'static str) -> impl FnOnce(url::ParseError) -> DomainError {
     move |error| DomainError::InvalidData(format!("Invalid {provider} embedding URL: {error}"))
 }
@@ -600,6 +594,47 @@ fn response_error_message(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn servers_the_page_names_need_approval() {
+        let repository =
+            HttpEmbeddingRepository::new(Arc::new(HttpClientPool::new("TauriTavern/test")));
+        let base_url = || "http://127.0.0.1:9".to_string();
+        for protocol in [
+            RemoteEmbeddingProtocol::Ollama {
+                base_url: base_url(),
+                model: "test".into(),
+                keep: false,
+            },
+            RemoteEmbeddingProtocol::LlamaCpp {
+                base_url: base_url(),
+                api_key: Some("key".into()),
+            },
+            RemoteEmbeddingProtocol::Vllm {
+                base_url: base_url(),
+                api_key: Some("key".into()),
+                model: "test".into(),
+            },
+            RemoteEmbeddingProtocol::KoboldCpp {
+                base_url: base_url(),
+                api_key: Some("key".into()),
+            },
+            RemoteEmbeddingProtocol::Extras {
+                base_url: base_url(),
+                api_key: Some("key".into()),
+            },
+        ] {
+            let request = RemoteEmbeddingRequest {
+                protocol,
+                texts: vec!["hello".into()],
+                is_query: false,
+            };
+            let Err(error) = repository.embed(request).await else {
+                panic!("an unapproved server was reached");
+            };
+            assert!(error.to_string().contains("requires approval"), "{error}");
+        }
+    }
 
     #[test]
     fn openai_embeddings_are_sorted_by_index() {

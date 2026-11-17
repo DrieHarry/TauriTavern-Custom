@@ -120,6 +120,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::settings_commands::get_tauritavern_settings,
         super::settings_commands::get_chat_backup_storage_stats,
         super::settings_commands::update_tauritavern_settings,
+        super::settings_commands::set_keys_exposure,
+        super::settings_commands::set_request_proxy,
         #[cfg(desktop)]
         super::runtime_paths_commands::get_runtime_paths,
         #[cfg(desktop)]
@@ -234,7 +236,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::lan_sync_commands::lan_sync_pair_device,
         super::lan_sync_commands::lan_sync_get_pairing_info,
         super::lan_sync_commands::lan_sync_request_pairing,
-        super::lan_sync_commands::lan_sync_confirm_pairing,
+        super::lan_sync_commands::lan_sync_review_pairing,
         super::lan_sync_commands::lan_sync_list_devices,
         super::lan_sync_commands::lan_sync_remove_device,
         super::lan_sync_commands::lan_sync_sync_from_device,
@@ -391,9 +393,18 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::chat_completion_commands::get_chat_completions_status,
         super::chat_completion_commands::generate_chat_completion,
         super::chat_completion_commands::start_chat_completion_stream,
-        super::chat_completion_commands::read_chat_completion_stream,
-        super::chat_completion_commands::close_chat_completion_stream,
-        super::chat_completion_commands::cancel_chat_completion_generation,
+        // Text completion commands
+        super::text_completion_commands::get_text_completions_status,
+        super::text_completion_commands::get_text_completions_props,
+        super::text_completion_commands::generate_text_completion,
+        super::text_completion_commands::start_text_completion_stream,
+        super::text_completion_commands::encode_text_completion_tokens,
+        super::text_completion_commands::download_ollama_model,
+        super::text_completion_commands::download_tabby_model,
+        // Generation commands shared by every API family
+        super::generation_commands::read_generation_stream,
+        super::generation_commands::close_generation_stream,
+        super::generation_commands::cancel_generation,
         // SearXNG compatibility search
         super::searxng_search_commands::search_searxng,
         // CORS proxy compatibility

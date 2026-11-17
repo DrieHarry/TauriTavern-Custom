@@ -2,18 +2,17 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{Map, Value, json};
 
 use tt_domain::errors::DomainError;
+use tt_ports::generation_stream::{GenerationCancelReceiver, GenerationStreamSender};
 use tt_ports::repositories::chat_completion_repository::{
-    ChatCompletionApiConfig, ChatCompletionCancelReceiver,
-    ChatCompletionRepositoryGenerateResponse, ChatCompletionStreamDelta,
-    ChatCompletionStreamSender,
+    ChatCompletionApiConfig, ChatCompletionRepositoryGenerateResponse, ChatCompletionStreamDelta,
 };
 
 use super::HttpChatCompletionRepository;
 use super::claude;
 use super::gemini;
 use super::normalizers;
-use super::response_body::read_upstream_json_body;
 use super::vertexai_auth;
+use crate::provider_response::{self, read_upstream_json_body};
 
 const PROVIDER_NAME: &str = "Google Vertex AI";
 const CLAUDE_PROVIDER_NAME: &str = "Google Vertex AI Claude";
@@ -64,12 +63,9 @@ async fn generate_gemini(
     let request = HttpChatCompletionRepository::apply_extra_headers(request, &config.extra_headers);
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
-    let response = HttpChatCompletionRepository::send_checked(
-        request,
-        PROVIDER_NAME,
-        "Generation request failed",
-    )
-    .await?;
+    let response =
+        provider_response::send_checked(request, PROVIDER_NAME, "Generation request failed")
+            .await?;
 
     let body = read_upstream_json_body(PROVIDER_NAME, "generate", response).await?;
 
@@ -102,12 +98,9 @@ async fn generate_claude(
     let request = HttpChatCompletionRepository::apply_extra_headers(request, &config.extra_headers);
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
-    let response = HttpChatCompletionRepository::send_checked(
-        request,
-        CLAUDE_PROVIDER_NAME,
-        "Generation request failed",
-    )
-    .await?;
+    let response =
+        provider_response::send_checked(request, CLAUDE_PROVIDER_NAME, "Generation request failed")
+            .await?;
 
     let body = read_upstream_json_body(CLAUDE_PROVIDER_NAME, "generate", response).await?;
 
@@ -127,8 +120,8 @@ pub(super) async fn generate_stream(
     config: &ChatCompletionApiConfig,
     endpoint_path: &str,
     payload: &Value,
-    sender: ChatCompletionStreamSender,
-    cancel: ChatCompletionCancelReceiver,
+    sender: GenerationStreamSender,
+    cancel: GenerationCancelReceiver,
 ) -> Result<(), DomainError> {
     if is_anthropic_raw_predict_endpoint(endpoint_path) {
         return generate_claude_stream(repository, config, endpoint_path, payload, sender, cancel)
@@ -143,8 +136,8 @@ async fn generate_gemini_stream(
     config: &ChatCompletionApiConfig,
     endpoint_path: &str,
     payload: &Value,
-    sender: ChatCompletionStreamSender,
-    cancel: ChatCompletionCancelReceiver,
+    sender: GenerationStreamSender,
+    cancel: GenerationCancelReceiver,
 ) -> Result<(), DomainError> {
     let response = send_gemini_stream_request(repository, config, endpoint_path, payload).await?;
 
@@ -179,8 +172,7 @@ async fn send_gemini_stream_request(
     let request = HttpChatCompletionRepository::apply_extra_headers(request, &config.extra_headers);
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
-    HttpChatCompletionRepository::send_checked(request, PROVIDER_NAME, "Generation request failed")
-        .await
+    provider_response::send_checked(request, PROVIDER_NAME, "Generation request failed").await
 }
 
 async fn generate_claude_stream(
@@ -188,8 +180,8 @@ async fn generate_claude_stream(
     config: &ChatCompletionApiConfig,
     endpoint_path: &str,
     payload: &Value,
-    sender: ChatCompletionStreamSender,
-    cancel: ChatCompletionCancelReceiver,
+    sender: GenerationStreamSender,
+    cancel: GenerationCancelReceiver,
 ) -> Result<(), DomainError> {
     let (model, response) =
         send_claude_stream_request(repository, config, endpoint_path, payload).await?;
@@ -204,13 +196,7 @@ async fn generate_claude_stream(
         )
         .await
     } else {
-        HttpChatCompletionRepository::stream_sse_response(
-            CLAUDE_PROVIDER_NAME,
-            response,
-            sender,
-            cancel,
-        )
-        .await
+        provider_response::stream_sse_response(CLAUDE_PROVIDER_NAME, response, sender, cancel).await
     }
 }
 
@@ -272,12 +258,9 @@ async fn send_claude_stream_request(
     let request = HttpChatCompletionRepository::apply_extra_headers(request, &config.extra_headers);
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
-    let response = HttpChatCompletionRepository::send_checked(
-        request,
-        CLAUDE_PROVIDER_NAME,
-        "Generation request failed",
-    )
-    .await?;
+    let response =
+        provider_response::send_checked(request, CLAUDE_PROVIDER_NAME, "Generation request failed")
+            .await?;
 
     Ok((model, response))
 }

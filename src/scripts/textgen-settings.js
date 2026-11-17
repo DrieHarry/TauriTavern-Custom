@@ -1072,7 +1072,9 @@ export function initTextGenSettings() {
             ];
 
             for (const key of keys) {
-                const keyValue = String($(`#${key.id}`).val()).trim();
+                // Panel Runtime parks the forms of the other types, so their inputs can be absent.
+                const rawValue = $(`#${key.id}`).val();
+                const keyValue = typeof rawValue === 'string' ? rawValue.trim() : '';
                 if (keyValue.length) {
                     await writeSecret(key.secret, keyValue);
                 }
@@ -1270,7 +1272,7 @@ export async function generateTextGenWithStreaming(generate_data, signal) {
         let logprobs = null;
         const swipes = [];
         const toolCalls = [];
-        const state = { reasoning: '' };
+        const state = { reasoning: '', usage: {} };
         while (true) {
             const { done, value } = await reader.read();
             if (done) return;
@@ -1292,6 +1294,7 @@ export async function generateTextGenWithStreaming(generate_data, signal) {
                 text += newText;
                 logprobs = parseTextgenLogprobs(newText, data.choices?.[0]?.logprobs || data?.completion_probabilities);
                 state.reasoning += data?.choices?.[0]?.reasoning ?? data?.choices?.[0]?.thinking ?? '';
+                Object.assign(state.usage, data?.timings, data?.usage);
             }
 
             yield { text, swipes, logprobs, toolCalls, state };
@@ -1555,6 +1558,7 @@ export function createTextGenGenerationData(settings, model, finalPrompt = null,
         : undefined;
 
     let params = {
+        'type': type,
         'prompt': finalPrompt,
         'model': model,
         'max_new_tokens': maxTokens,

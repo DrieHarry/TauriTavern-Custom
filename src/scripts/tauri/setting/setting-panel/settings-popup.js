@@ -1,6 +1,7 @@
 import { callGenericPopup, POPUP_RESULT, POPUP_TYPE } from '../../../popup.js';
-import { translate } from '../../../i18n.js';
-import { pickDataRoot, updateTauriTavernSettings } from '../../../../tauri-bridge.js';
+import { getCurrentLocale, translate } from '../../../i18n.js';
+import { invoke, pickDataRoot, updateTauriTavernSettings } from '../../../../tauri-bridge.js';
+import { isCommandCancelled } from '../../../util/command-error-utils.js';
 import { runTaskOrPopup, showErrorPopup } from './popup-utils.js';
 import {
     loadChatBackupStorageStats,
@@ -370,9 +371,34 @@ async function chooseDataRoot() {
     return selected;
 }
 
+async function setKeysExposure(allowed) {
+    try {
+        await invoke('set_keys_exposure', { allowed, locale: getCurrentLocale() });
+        return allowed;
+    } catch (error) {
+        if (isCommandCancelled(error)) {
+            return null;
+        }
+        throw error;
+    }
+}
+
+async function setRequestProxy(settings) {
+    try {
+        await invoke('set_request_proxy', { settings, locale: getCurrentLocale() });
+        return true;
+    } catch (error) {
+        if (isCommandCancelled(error)) {
+            return false;
+        }
+        throw error;
+    }
+}
+
 function createSettingsActions(backgroundOptions) {
     return {
         chooseDataRoot: () => runTaskOrPopup(chooseDataRoot),
+        setKeysExposure: (allowed) => runTaskOrPopup(() => setKeysExposure(allowed)),
         chooseWallpaper: (request) => runTaskOrPopup(() => chooseWallpaper(backgroundOptions, request)),
         showHelp: (topicId) => runTaskOrPopup(() => showHelpTopic(topicId)),
         manageQuickAccess: () => runTaskOrPopup(async () => {
@@ -419,6 +445,8 @@ export async function openTauriTavernSettingsPopup() {
         actions: createSettingsActions(backgroundModel.backgroundOptions),
         tr: translate,
     });
+    // Kept equal to what is saved, so a retry submits only what is still unsaved.
+    let stored = viewModel.values;
     let savedUpdate = null;
 
     try {
@@ -437,7 +465,7 @@ export async function openTauriTavernSettingsPopup() {
 
                 try {
                     const draft = appHandle.getDraft();
-                    const update = buildTauriTavernSettingsUpdate(viewModel.values, draft);
+                    const update = buildTauriTavernSettingsUpdate(stored, draft);
 
                     if (
                         update.requiresChatBackupPurgeConfirmation
@@ -453,12 +481,19 @@ export async function openTauriTavernSettingsPopup() {
                         await showChatVirtualizationCompatibility();
                     }
 
+                    if (update.requestProxy) {
+                        if (!await setRequestProxy(update.requestProxy)) {
+                            return false;
+                        }
+                        stored = { ...stored, requestProxy: update.requestProxy };
+                    }
+
                     if (update.hasChanges) {
                         const updatedSettings = await updateTauriTavernSettings(update.patch);
                         savedUpdate = { update, updatedSettings };
                     }
 
-                    if (draft.oledBackgroundEnabled !== viewModel.values.oledBackgroundEnabled) {
+                    if (draft.oledBackgroundEnabled !== stored.oledBackgroundEnabled) {
                         try {
                             setOledBackgroundEnabled(draft.oledBackgroundEnabled);
                         } catch (error) {

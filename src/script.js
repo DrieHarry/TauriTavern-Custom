@@ -333,7 +333,7 @@ import {
     getInstructStoppingSequences,
     getInstructMacroValues,
 } from './scripts/instruct-mode.js';
-import { initLocales, t, translate } from './scripts/i18n.js';
+import { getCurrentLocale, initLocales, t, translate } from './scripts/i18n.js';
 import { getFriendlyTokenizerName, getTokenCount, getTokenCountAsync, initTokenizers, saveTokenCache, warmTokenizerCache } from './scripts/tokenizers.js';
 import {
     user_avatar,
@@ -5281,7 +5281,7 @@ function cleanupGenerationAfterUnhandledError(type, dryRun) {
 
 async function prepareLegacyMcpGenerationContext() {
     try {
-        const context = await createLegacyMcpGenerationContext();
+        const context = await createLegacyMcpGenerationContext({ locale: getCurrentLocale() });
         if (context.diagnostics.length > 0) {
             toastr.warning(
                 'Some MCP tools are unavailable for this generation. Check MCP Manager and the console for details.',
@@ -6659,7 +6659,7 @@ async function GenerateInternal(type, { automatic_trigger, force_name2, quiet_pr
         let imageUrls = extractImagesFromData(data, requestContext);
         const reasoningSignature = extractReasoningSignatureFromData(data, requestContext);
         const native = data?.choices?.[0]?.message?.native ?? null;
-        const promptCache = getPromptCacheUsage(data?.usage);
+        const promptCache = getPromptCacheUsage({ ...data?.timings, ...data?.usage });
         const hasToolCalls = canPerformToolCalls && ToolManager.hasToolCalls(data);
         const providerReplay = requestContext ? { ...requestContext, text: getMessage } : null;
         kobold_horde_model = title;
@@ -9536,12 +9536,6 @@ async function applySettingsSnapshot(data, initLoaderHandle = null) {
 
         if (settings.main_api == 'poe') {
             settings.main_api = 'openai';
-        }
-
-        const iosCaps = getActiveIosPolicyCapabilities();
-        if (iosCaps && iosCaps.llm?.text_completions?.enabled === false && settings.main_api === 'textgenerationwebui') {
-            settings.main_api = 'openai';
-            globalThis.toastr?.warning?.('Text Completion is disabled by your iOS policy. Switched to Chat Completion.');
         }
 
         main_api = settings.main_api;

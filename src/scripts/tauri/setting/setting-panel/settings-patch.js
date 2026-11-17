@@ -94,7 +94,6 @@ export function buildTauriTavernSettingsUpdate(initial, draft) {
     const nextDynamicThemeDayWallpaper = String(draft.dynamicTheme?.dayWallpaper || '');
     const nextDynamicThemeNightWallpaper = String(draft.dynamicTheme?.nightWallpaper || '');
 
-    const nextAllowKeysExposure = Boolean(draft.allowKeysExposure);
     const nextAvatarPersonaOriginalImagesEnabled = Boolean(draft.avatarPersonaOriginalImagesEnabled);
     const nextPromptCacheTtl = String(draft.promptCacheTtl || '').trim();
 
@@ -137,7 +136,6 @@ export function buildTauriTavernSettingsUpdate(initial, draft) {
         || nextDynamicThemeWallpaperEnabled !== initial.dynamicTheme.wallpaperEnabled
         || nextDynamicThemeDayWallpaper !== initial.dynamicTheme.dayWallpaper
         || nextDynamicThemeNightWallpaper !== initial.dynamicTheme.nightWallpaper;
-    const hasAllowKeysExposureChange = nextAllowKeysExposure !== initial.allowKeysExposure;
     const hasAvatarPersonaOriginalImagesEnabledChange =
         nextAvatarPersonaOriginalImagesEnabled !== initial.avatarPersonaOriginalImagesEnabled;
     const hasPromptCacheTtlChange = nextPromptCacheTtl !== initial.promptCacheTtlSource;
@@ -155,11 +153,9 @@ export function buildTauriTavernSettingsUpdate(initial, draft) {
         chatBackups: hasChatBackupsChange,
         closeToTrayOnClose: hasCloseToTrayOnCloseChange,
         dynamicTheme: hasDynamicThemeChange,
-        allowKeysExposure: hasAllowKeysExposureChange,
         avatarPersonaOriginalImagesEnabled: hasAvatarPersonaOriginalImagesEnabledChange,
         promptCacheTtl: hasPromptCacheTtlChange,
         models: hasModelsChange,
-        requestProxy: hasRequestProxyChange,
     };
 
     const hasChanges = Object.values(changes).some(Boolean);
@@ -214,9 +210,6 @@ export function buildTauriTavernSettingsUpdate(initial, draft) {
             night_wallpaper: nextDynamicThemeNightWallpaper,
         };
     }
-    if (hasAllowKeysExposureChange) {
-        patch.allow_keys_exposure = nextAllowKeysExposure;
-    }
     if (hasAvatarPersonaOriginalImagesEnabledChange) {
         patch.avatar_persona_original_images_enabled = nextAvatarPersonaOriginalImagesEnabled;
     }
@@ -228,18 +221,18 @@ export function buildTauriTavernSettingsUpdate(initial, draft) {
         }
         patch.models = { claude };
     }
-    if (hasRequestProxyChange) {
-        patch.request_proxy = {
-            enabled: nextRequestProxyEnabled,
-            url: nextRequestProxyUrl,
-            bypass: nextRequestProxyBypass,
-        };
-    }
 
     return {
         hasChanges,
         patch,
         changes,
+        requestProxy: hasRequestProxyChange
+            ? {
+                enabled: nextRequestProxyEnabled,
+                url: nextRequestProxyUrl,
+                bypass: nextRequestProxyBypass,
+            }
+            : null,
         requiresChatBackupPurgeConfirmation: hasChatBackupsChange
             && !isChatBackupHistoryDisabled(initial.chatBackups)
             && isChatBackupHistoryDisabled({
@@ -269,14 +262,8 @@ export function buildTauriTavernSettingsUpdate(initial, draft) {
                 dayWallpaper: nextDynamicThemeDayWallpaper,
                 nightWallpaper: nextDynamicThemeNightWallpaper,
             },
-            allowKeysExposure: nextAllowKeysExposure,
             avatarPersonaOriginalImagesEnabled: nextAvatarPersonaOriginalImagesEnabled,
             promptCacheTtl: nextPromptCacheTtl,
-            requestProxy: {
-                enabled: nextRequestProxyEnabled,
-                url: nextRequestProxyUrl,
-                bypass: nextRequestProxyBypass,
-            },
         },
     };
 }

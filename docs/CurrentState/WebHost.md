@@ -87,8 +87,11 @@ const host = installWebHost({
 | `merge_character_card_data` | `/api/characters/merge-attributes`，随后读取更新后的 DTO |
 | `generate_chat_completion` | `/api/backends/chat-completions/generate`，非流式 JSON 响应 |
 | `get_chat_completions_status` | `/api/backends/chat-completions/status`，连接与模型列表 |
-| `start_chat_completion_stream`、`read_chat_completion_stream`、`close_chat_completion_stream` | 同一生成端点的 SSE 流，转为 `afterSeq` 会话 |
-| `cancel_chat_completion_generation` | 确认接收；非流式请求同步完成，没有可取消的请求 |
+| `get_text_completions_status` | `/api/backends/text-completions/status`，响应头 `x-supports-tokenization` 转为结果的 `supports_tokenization` |
+| `get_text_completions_props` | `/api/backends/text-completions/props` |
+| `generate_text_completion` | `/api/backends/text-completions/generate`，非流式 JSON 响应；ST 以 200 返回的 `{ error: true }` 会被拒绝 |
+| `start_chat_completion_stream`、`start_text_completion_stream`、`read_generation_stream`、`close_generation_stream` | 各自生成端点的 SSE 流，转为 `afterSeq` 会话 |
+| `cancel_generation` | 确认接收；非流式请求同步完成，没有可取消的请求 |
 | `chat_history_generation_started`、`chat_history_generation_finished` | 确认接收；Session 的聊天写入即记录，不建立原生历史仓库 |
 | `get_notification_permission_state` | `denied`：预览不拥有原生系统通知能力 |
 | `get_window_snapshot` | `null`：视口由浏览器管理 |
@@ -113,7 +116,7 @@ const host = installWebHost({
 
 **角色**。`get_bootstrap_metadata` 保留后端给出的 `shallow` 标记，浅卡片的 `json_data` 为 `null`。`get_character` 与编辑后的回读得到完整卡片，`json_data` 是 ST 返回的原始卡片文本。ST 读卡失败时仍返回 200 和一个不含 `json_data` 的空壳，Web Host 把它当作错误。完整卡片更新转回 ST 的文本表单，保留 `json_data` 中的其他字段；头像文件与裁剪不在范围内。
 
-**TT 设置**。读取时合并默认值与 `store` 文档里的设置，新增字段由默认值补上。更新遵循 Rust DTO 的 `Option` 语义：未提供或为 `null` 的普通字段保留；嵌套段落按字段更新，数组替换。`request_proxy` 是完整 DTO，整段替换；`updates.startup_popup.dismissed_release_token` 允许 `null` 清除。更新在同一任务里读取、合并并保存。
+**TT 设置**。读取时合并默认值与 `store` 文档里的设置，新增字段由默认值补上。更新遵循 Rust 更新 DTO 的 `Option` 语义：未提供或为 `null` 的普通字段保留；嵌套段落按字段更新，数组替换；`updates.startup_popup.dismissed_release_token` 允许 `null` 清除。`allow_keys_exposure` 与 `request_proxy` 只经各自的命令修改，不在更新 DTO 里，更新时忽略。更新在同一任务里读取、合并并保存。
 
 **系统扩展**。启动时写下的状态（MCP 注册、扩展存储条目）保存在 `store` 文档里，之后的启动读到的与原生相同；技能列表是全新安装的结果。工具声明确认接收；真正使用这些能力时才拒绝。
 

@@ -21,16 +21,15 @@ use serde_json::{Value, json};
 use tt_adapter_http::upstream;
 use tt_domain::errors::DomainError;
 use tt_domain::models::bedrock_model::{BedrockModelFamily, BedrockModelSpec, extract_provider};
+use tt_ports::generation_stream::{GenerationCancelReceiver, GenerationStreamSender};
 use tt_ports::repositories::chat_completion_repository::{
-    ChatCompletionApiConfig, ChatCompletionCancelReceiver,
-    ChatCompletionRepositoryGenerateResponse, ChatCompletionStreamDelta,
-    ChatCompletionStreamSender,
+    ChatCompletionApiConfig, ChatCompletionRepositoryGenerateResponse, ChatCompletionStreamDelta,
 };
 
 use super::HttpChatCompletionRepository;
 use super::claude;
 use super::normalizers;
-use super::response_body::read_upstream_json_body;
+use crate::provider_response::{self, read_upstream_json_body};
 
 mod ai21_jamba;
 mod cohere;
@@ -119,8 +118,7 @@ async fn get_control_plane_json(
 
     let error_context = format!("Failed to list Bedrock {op}");
     let response =
-        HttpChatCompletionRepository::send_checked(request, BEDROCK_PROVIDER_NAME, &error_context)
-            .await?;
+        provider_response::send_checked(request, BEDROCK_PROVIDER_NAME, &error_context).await?;
 
     read_upstream_json_body(BEDROCK_PROVIDER_NAME, op, response).await
 }
@@ -249,7 +247,7 @@ pub(super) async fn generate(
     let request = apply_bedrock_auth(request, config);
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
-    let response = HttpChatCompletionRepository::send_checked(
+    let response = provider_response::send_checked(
         request,
         BEDROCK_PROVIDER_NAME,
         "Generation request failed",
@@ -303,8 +301,8 @@ pub(super) async fn generate_stream(
     config: &ChatCompletionApiConfig,
     endpoint_path: &str,
     payload: &Value,
-    sender: ChatCompletionStreamSender,
-    cancel: ChatCompletionCancelReceiver,
+    sender: GenerationStreamSender,
+    cancel: GenerationCancelReceiver,
 ) -> Result<(), DomainError> {
     let stream_mode = stream_mode_from_endpoint(
         endpoint_path,
@@ -368,12 +366,8 @@ async fn send_eventstream_request(
     let request = apply_bedrock_auth(request, config);
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
-    HttpChatCompletionRepository::send_checked(
-        request,
-        BEDROCK_PROVIDER_NAME,
-        "Generation request failed",
-    )
-    .await
+    provider_response::send_checked(request, BEDROCK_PROVIDER_NAME, "Generation request failed")
+        .await
 }
 
 #[derive(Debug, Clone)]
@@ -475,8 +469,8 @@ fn to_stream_endpoint(endpoint_path: &str) -> Result<String, DomainError> {
 
 async fn forward_eventstream_response(
     response: reqwest::Response,
-    sender: ChatCompletionStreamSender,
-    mut cancel: ChatCompletionCancelReceiver,
+    sender: GenerationStreamSender,
+    mut cancel: GenerationCancelReceiver,
     mode: StreamMode,
 ) -> Result<(), DomainError> {
     let consume = consume_eventstream_response(response, &mode, |event| {

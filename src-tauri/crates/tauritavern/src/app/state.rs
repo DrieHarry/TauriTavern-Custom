@@ -23,6 +23,7 @@ use tt_application::services::database_service::DatabaseService;
 use tt_application::services::extension_service::ExtensionService;
 use tt_application::services::extension_store_service::ExtensionStoreService;
 use tt_application::services::external_import_service::ImportSourceAccessService;
+use tt_application::services::generation_runtime::GenerationRuntime;
 use tt_application::services::group_chat_service::GroupChatService;
 use tt_application::services::group_service::GroupService;
 use tt_application::services::image_metadata_service::ImageMetadataService;
@@ -40,6 +41,7 @@ use tt_application::services::skill_service::SkillService;
 use tt_application::services::sprite_service::SpriteService;
 use tt_application::services::stable_diffusion_service::StableDiffusionService;
 use tt_application::services::sync_automation_service::SyncAutomationService;
+use tt_application::services::text_completion_service::TextCompletionService;
 use tt_application::services::theme_service::ThemeService;
 use tt_application::services::tokenization_service::TokenizationService;
 use tt_application::services::translate_service::TranslateService;
@@ -107,7 +109,9 @@ pub(crate) struct AppServices {
     pub(crate) agent_run_history_service: Arc<AgentRunHistoryService>,
     pub(crate) agent_run_retention_automation_service: Arc<AgentRunRetentionAutomationService>,
     pub(crate) agent_runtime_service: Arc<AgentRuntimeService>,
+    pub(crate) generation_runtime: Arc<GenerationRuntime>,
     pub(crate) chat_completion_service: Arc<ChatCompletionService>,
+    pub(crate) text_completion_service: Arc<TextCompletionService>,
     pub(crate) llm_connection_service: Arc<LlmConnectionService>,
     pub(crate) user_endpoint_access_service: Arc<UserEndpointAccessService>,
     pub(crate) import_source_access_service: Arc<ImportSourceAccessService>,

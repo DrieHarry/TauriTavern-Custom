@@ -11,6 +11,7 @@ Gradle 工程跟随 Tauri CLI 的 Android 模板，当前对齐 2.12.3：Gradle 
 - `compileSdk`、`targetSdk` 为 36。targetSdk 37 起访问局域网需要 `ACCESS_LOCAL_NETWORK` 运行时权限，提升前先建立统一的本地网络权限入口。
 - 开启 configuration cache：`BuildTask` 经 `ExecOperations` 调用 CLI，执行阶段不访问 `Project`。
 - `android.builtInKotlin=false`、`android.newDsl=false` 与模板一致，因为 Tauri 与官方插件仍应用 `org.jetbrains.kotlin.android`。
+- release APK 压缩存放原生库（`useLegacyPackaging`），安装时解压：GitHub 下载按 APK 原样计算，原生库压缩后小约 40%；debug 保持不压缩，不拖慢开发构建与安装。
 - release 沿用 `proguard-android-optimize.txt`，`@JavascriptInterface` 方法由其中的默认规则保留；`proguard-rules.pro` 只补依赖缺失的规则，原因写在规则旁。
 
 ## 1. 原生内容视口与窗口背景
@@ -53,7 +54,7 @@ https://v2.tauri.app/develop/resources/#android
 
 平台策略：
 
-- Android 与 OpenHarmony：`build.rs` 发出 `embedded_resources`，只读嵌入映射；
+- Android 与 OpenHarmony：`build.rs` 发出 `embedded_resources`，只读嵌入映射；`tauri.android.conf.json` 与 `tauri.ohos.conf.json` 因此把 `bundle.resources` 置空，安装包不再复制一份资源；
 - 其他平台：走 `BaseDirectory::Resource` + fs 访问；portable 构建在磁盘未命中时回退到嵌入映射。
 
 #### C. 前后端模板读取解耦
@@ -130,17 +131,17 @@ https://v2.tauri.app/develop/resources/#android
 
 ## 6. AI 生成后台执行与通知生命周期
 
-Android AI 生成使用任务级 `dataSync` Foreground Service。Rust `ChatCompletionService` 持有生成任务与后台执行租约；WebView 只负责消费流事件，并在 Android 16+ 可用时补充非关键的 token 进度。
+Android AI 生成使用任务级 `dataSync` Foreground Service。Rust 生成运行时（`GenerationRuntime`）持有各 API 族的生成任务与后台执行租约；WebView 只负责消费流事件，并在 Android 16+ 可用时补充非关键的 token 进度。
 
 执行契约：
 
-- 第一个 Chat Completion 任务开始时，由 Rust 通过原生 Tauri plugin 启动 `AiGenerationForegroundService`；
+- 第一个生成任务开始时，由 Rust 通过原生 Tauri plugin 启动 `AiGenerationForegroundService`；
 - 并发任务通过稳定 task id 计数，共享一个 FGS；
 - 最后一个任务成功、失败或取消后立即 `stopForeground()` + `stopSelfResult()`；
 - Service 使用 `START_NOT_STICKY`，不会在没有真实生成任务时被系统复活；
 - Android 15+ `dataSync` 超时时通过 `onTimeout()` 立即释放 FGS，但不把平台保护到期升级为生成失败；
 - 应用启动本身不再启动保活服务，避免无任务时消耗 Android 的后台 FGS 配额。
-- 原生插件不可用或 FGS 启停失败只记录警告；Chat Completion 仍按真实 provider 结果继续，不阻塞应用启动或生成。
+- 原生插件不可用或 FGS 启停失败只记录警告；生成仍按真实 provider 结果继续，不阻塞应用启动或生成。
 
 当前通知槽位：
 

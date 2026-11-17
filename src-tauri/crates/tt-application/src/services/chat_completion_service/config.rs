@@ -3,14 +3,19 @@ use std::sync::Arc;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Map, Value};
+use url::Url;
 
 use crate::dto::chat_completion_dto::{
     ChatCompletionGenerateRequestDto, ChatCompletionStatusRequestDto,
 };
 use crate::errors::ApplicationError;
+use crate::services::selected_secret::{read_selected_secret, requested_secret_id};
 use tt_domain::models::claude_model::is_vertex_ai_claude_model_id;
-use tt_domain::models::endpoint_url::{append_endpoint_segments, parse_user_http_endpoint};
+use tt_domain::models::endpoint_url::{
+    HostLabel, append_endpoint_segments, parse_user_http_endpoint,
+};
 use tt_domain::models::secret::SecretKeys;
+use tt_domain::models::vertex_ai::{VERTEX_AI_GLOBAL_HOST, vertex_ai_host, vertex_ai_region};
 use tt_ports::repositories::chat_completion_repository::{
     AnthropicBetaHeaderMode, ChatCompletionApiConfig, ChatCompletionSource,
 };
@@ -24,7 +29,6 @@ const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 const CLAUDE_API_BASE: &str = "https://api.anthropic.com/v1";
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
-const VERTEXAI_GLOBAL_BASE: &str = "https://aiplatform.googleapis.com";
 const DEEPSEEK_API_BASE: &str = "https://api.deepseek.com/beta";
 const DEEPSEEK_STATUS_API_BASE: &str = "https://api.deepseek.com";
 const COHERE_STATUS_API_BASE: &str = "https://api.cohere.ai/v1";
@@ -112,7 +116,7 @@ pub(super) async fn resolve_status_api_config(
             pollinations_endpoint: dto.pollinations_endpoint.trim(),
             workers_ai_account_id: dto.workers_ai_account_id.trim(),
             aws_bedrock_region: dto.aws_bedrock_region.trim(),
-            secret_id: normalize_secret_id(dto.secret_id.as_deref()),
+            secret_id: requested_secret_id(dto.secret_id.as_deref()),
             ..Default::default()
         },
         ApiConfigPurpose::Status,
@@ -212,7 +216,8 @@ async fn resolve_api_config(
     purpose: ApiConfigPurpose,
     secret_repository: &Arc<dyn SecretRepository>,
 ) -> Result<ChatCompletionApiConfig, ApplicationError> {
-    let user_endpoint = resolve_user_configured_endpoint(source, reverse_proxy, custom_url)?;
+    let user_endpoint =
+        resolve_user_configured_endpoint(source, reverse_proxy, custom_url)?.map(String::from);
 
     match source {
         ChatCompletionSource::Custom => {
@@ -223,9 +228,13 @@ async fn resolve_api_config(
             let api_key = if uses_reverse_proxy {
                 proxy_password.to_string()
             } else {
-                read_optional_secret(secret_repository, SecretKeys::CUSTOM, hints.secret_id)
-                    .await?
-                    .unwrap_or_default()
+                read_selected_secret(
+                    secret_repository.as_ref(),
+                    SecretKeys::CUSTOM,
+                    hints.secret_id,
+                )
+                .await?
+                .unwrap_or_default()
             };
 
             Ok(ChatCompletionApiConfig {
@@ -336,7 +345,7 @@ pub(super) fn resolve_user_configured_endpoint(
     source: ChatCompletionSource,
     reverse_proxy: &str,
     custom_url: &str,
-) -> Result<Option<String>, ApplicationError> {
+) -> Result<Option<Url>, ApplicationError> {
     let reverse_proxy = reverse_proxy.trim();
     let custom_url = custom_url.trim();
     let endpoint = match source {
@@ -353,12 +362,10 @@ pub(super) fn resolve_user_configured_endpoint(
 
     let endpoint = parse_user_http_endpoint(endpoint)?;
     if source == ChatCompletionSource::VertexAi {
-        return Ok(Some(
-            append_endpoint_segments(endpoint.as_str(), &["v1"])?.to_string(),
-        ));
+        return Ok(Some(append_endpoint_segments(endpoint.as_str(), &["v1"])?));
     }
 
-    Ok(Some(endpoint.to_string()))
+    Ok(Some(endpoint))
 }
 
 pub(super) fn get_payload_string(
@@ -381,7 +388,7 @@ fn get_payload_optional_string(
 ) -> Result<Option<String>, ApplicationError> {
     match payload.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => Ok(normalize_secret_id(Some(value)).map(str::to_string)),
+        Some(Value::String(value)) => Ok(requested_secret_id(Some(value)).map(str::to_string)),
         Some(_) => Err(ApplicationError::ValidationError(format!(
             "Chat completion request field must be a string: {}",
             key
@@ -404,19 +411,14 @@ fn get_payload_bool(
     }
 }
 
-fn normalize_secret_id(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
-}
-
 async fn read_required_secret(
     secret_repository: &Arc<dyn SecretRepository>,
     secret_key: &str,
     secret_id: Option<&str>,
     source_name: &str,
 ) -> Result<String, ApplicationError> {
-    read_selected_secret(secret_repository, secret_key, secret_id)
+    read_selected_secret(secret_repository.as_ref(), secret_key, secret_id)
         .await?
-        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             let selector = secret_id
                 .map(|id| format!(" for secret_id {id}"))
@@ -426,34 +428,6 @@ async fn read_required_secret(
                 source_name, selector, secret_key
             ))
         })
-}
-
-async fn read_optional_secret(
-    secret_repository: &Arc<dyn SecretRepository>,
-    secret_key: &str,
-    secret_id: Option<&str>,
-) -> Result<Option<String>, ApplicationError> {
-    Ok(
-        read_selected_secret(secret_repository, secret_key, secret_id)
-            .await?
-            .filter(|value| !value.trim().is_empty()),
-    )
-}
-
-async fn read_selected_secret(
-    secret_repository: &Arc<dyn SecretRepository>,
-    secret_key: &str,
-    secret_id: Option<&str>,
-) -> Result<Option<String>, ApplicationError> {
-    let secret = secret_repository.read_secret(secret_key, secret_id).await?;
-    if let (Some(id), None) = (secret_id, secret.as_ref()) {
-        return Err(ApplicationError::ValidationError(format!(
-            "Secret id not found for {}: {}",
-            secret_key, id
-        )));
-    }
-
-    Ok(secret)
 }
 
 fn default_base_url(
@@ -467,7 +441,7 @@ fn default_base_url(
         ChatCompletionSource::OpenRouter => OPENROUTER_API_BASE.to_string(),
         ChatCompletionSource::Claude => CLAUDE_API_BASE.to_string(),
         ChatCompletionSource::Makersuite => GEMINI_API_BASE.to_string(),
-        ChatCompletionSource::VertexAi => VERTEXAI_GLOBAL_BASE.to_string(),
+        ChatCompletionSource::VertexAi => VERTEX_AI_GLOBAL_HOST.to_string(),
         ChatCompletionSource::DeepSeek => match purpose {
             ApiConfigPurpose::Status => DEEPSEEK_STATUS_API_BASE.to_string(),
             ApiConfigPurpose::Generate => DEEPSEEK_API_BASE.to_string(),
@@ -494,7 +468,7 @@ fn default_base_url(
             }
         }
         ChatCompletionSource::MiniMax => minimax_base_url(hints.minimax_endpoint)?.to_string(),
-        ChatCompletionSource::AwsBedrock => aws_bedrock_base_url(hints.aws_bedrock_region),
+        ChatCompletionSource::AwsBedrock => aws_bedrock_base_url(hints.aws_bedrock_region)?,
         ChatCompletionSource::Xai => XAI_API_BASE.to_string(),
         ChatCompletionSource::Pollinations => match purpose {
             ApiConfigPurpose::Status => POLLINATIONS_STATUS_API_BASE.to_string(),
@@ -604,14 +578,14 @@ fn moonshot_base_url(endpoint: &str) -> Result<&'static str, ApplicationError> {
     }
 }
 
-fn aws_bedrock_base_url(region: &str) -> String {
-    let region = region.trim();
-    let region = if region.is_empty() {
+fn aws_bedrock_base_url(region: &str) -> Result<String, ApplicationError> {
+    let region = if region.trim().is_empty() {
         AWS_BEDROCK_DEFAULT_REGION
     } else {
         region
     };
-    format!("https://bedrock-runtime.{region}.amazonaws.com")
+    let region = HostLabel::parse("AWS Bedrock region", region)?;
+    Ok(format!("https://bedrock-runtime.{region}.amazonaws.com"))
 }
 
 async fn resolve_vertexai_generate_api_config(
@@ -627,7 +601,8 @@ async fn resolve_vertexai_generate_api_config(
     if !reverse_proxy.is_empty() {
         let base_url =
             resolve_user_configured_endpoint(ChatCompletionSource::VertexAi, reverse_proxy, "")?
-                .expect("non-empty Vertex AI reverse proxy must resolve");
+                .expect("non-empty Vertex AI reverse proxy must resolve")
+                .into();
         return Ok(ChatCompletionApiConfig {
             base_url,
             user_configured_endpoint: true,
@@ -650,13 +625,12 @@ async fn resolve_vertexai_generate_api_config(
         .unwrap_or("express")
         .to_ascii_lowercase();
 
-    let region = payload
-        .get("vertexai_region")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("us-central1")
-        .to_ascii_lowercase();
+    let region = vertex_ai_region(
+        payload
+            .get("vertexai_region")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )?;
 
     let is_claude_model = payload
         .get("model")
@@ -728,15 +702,11 @@ async fn resolve_vertexai_generate_api_config(
 }
 
 /// Without a project, Vertex AI Express serves the location chosen at signup.
-fn vertexai_base_url(region: &str, project_id: Option<&str>) -> String {
+fn vertexai_base_url(region: &HostLabel, project_id: Option<&str>) -> String {
     let Some(project_id) = project_id else {
-        return format!("{VERTEXAI_GLOBAL_BASE}/v1");
+        return format!("{VERTEX_AI_GLOBAL_HOST}/v1");
     };
-    let host = match region {
-        "global" => VERTEXAI_GLOBAL_BASE.to_string(),
-        "us" | "eu" => format!("https://aiplatform.{region}.rep.googleapis.com"),
-        _ => format!("https://{region}-aiplatform.googleapis.com"),
-    };
+    let host = vertex_ai_host(region);
     format!("{host}/v1/projects/{project_id}/locations/{region}")
 }
 
@@ -834,7 +804,8 @@ mod tests {
 
     use super::super::additional_parameters::AdditionalParameters;
     use super::{
-        resolve_generate_api_config, resolve_status_api_config, resolve_user_configured_endpoint,
+        Url, resolve_generate_api_config, resolve_status_api_config,
+        resolve_user_configured_endpoint,
     };
 
     struct TestSecretRepository {
@@ -931,7 +902,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(endpoint.as_deref(), Some("http://192.168.1.2:11434/v1"));
+        assert_eq!(
+            endpoint.as_ref().map(Url::as_str),
+            Some("http://192.168.1.2:11434/v1")
+        );
         assert_eq!(
             resolve_user_configured_endpoint(ChatCompletionSource::OpenAi, "   ", "").unwrap(),
             None
@@ -943,7 +917,8 @@ mod tests {
                 "",
             )
             .unwrap()
-            .as_deref(),
+            .as_ref()
+            .map(Url::as_str),
             Some("https://proxy.example.com/base/v1")
         );
     }

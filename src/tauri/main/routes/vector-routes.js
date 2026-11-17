@@ -1,4 +1,5 @@
-import { extractErrorText, resolveHostErrorResponse } from '../kernel/host-error-response.js';
+import { getSillyTavernLocale } from '../adapters/st/sillytavern-i18n.js';
+import { commandErrorResponse } from '../../../scripts/util/command-error-utils.js';
 
 const SUPPORTED_VECTOR_ENDPOINTS = new Set([
     'list',
@@ -24,7 +25,11 @@ function vectorErrorCause(status) {
 
 async function invokeVector(context, jsonResponse, path, request) {
     try {
-        const response = await context.safeInvoke('vector_handle', { path, request });
+        const response = await context.safeInvoke('vector_handle', {
+            path,
+            request,
+            locale: getSillyTavernLocale(),
+        });
         const status = Number(response?.status);
         const safeStatus = Number.isInteger(status) && status >= 100 && status <= 599 ? status : 500;
 
@@ -36,7 +41,7 @@ async function invokeVector(context, jsonResponse, path, request) {
         }
         return jsonResponse({ error: true, cause: 'embedding_unavailable', message: 'Invalid native vector response' }, 500);
     } catch (error) {
-        const resolved = resolveHostErrorResponse(extractErrorText(error));
+        const resolved = commandErrorResponse(error);
         return jsonResponse({
             error: true,
             cause: vectorErrorCause(resolved.status),

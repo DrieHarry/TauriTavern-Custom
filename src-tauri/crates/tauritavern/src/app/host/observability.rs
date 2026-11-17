@@ -5,27 +5,12 @@
 //! tracing; they should not know about windows, events, or dev-log bundles.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::app::backend_errors::BackendErrorHub;
 use crate::app::dev_observability::DevObservabilityHub;
 use crate::infrastructure::logging::{devtools, llm_api_logs, tracing_runtime};
 use crate::infrastructure::paths::RuntimePaths;
 use tauri::Manager;
-
-pub(super) fn purge_old_logs(runtime_paths: &RuntimePaths) {
-    // Purge before tracing opens new appenders. Failure is intentionally
-    // non-fatal: stale logs are inconvenient, but startup should continue.
-    if let Err(error) = devtools::purge_old_log_files(
-        &runtime_paths.log_root,
-        Duration::from_secs(14 * 24 * 60 * 60),
-    ) {
-        eprintln!(
-            "Failed to purge old log files in {:?}: {}",
-            runtime_paths.log_root, error
-        );
-    }
-}
 
 pub(super) fn install(
     app: &mut tauri::App,
@@ -39,7 +24,7 @@ pub(super) fn install(
     app.manage(backend_error_hub.clone());
 
     // LLM API logs are both a managed command dependency and the runtime sink
-    // used by chat-completion repositories built later in AppState.
+    // used by the generation repositories built later in AppState.
     let llm_api_log_store = Arc::new(llm_api_logs::LlmApiLogStore::new(
         app_handle.clone(),
         runtime_paths.log_root.clone(),

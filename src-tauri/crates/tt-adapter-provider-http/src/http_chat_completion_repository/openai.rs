@@ -2,15 +2,15 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{Map, Value};
 
 use tt_domain::errors::DomainError;
+use tt_ports::generation_stream::{GenerationCancelReceiver, GenerationStreamSender};
 use tt_ports::repositories::chat_completion_repository::{
-    ChatCompletionApiConfig, ChatCompletionCancelReceiver,
-    ChatCompletionRepositoryGenerateResponse, ChatCompletionStreamDelta,
-    ChatCompletionStreamSender,
+    ChatCompletionApiConfig, ChatCompletionRepositoryGenerateResponse, ChatCompletionStreamDelta,
 };
 
 use super::HttpChatCompletionRepository;
-use super::context_overflow::context_overflow_or;
-use super::response_body::{provider_error, provider_error_message, read_upstream_json_body};
+use crate::provider_response::{
+    self, context_overflow_or, provider_error, provider_error_message, read_upstream_json_body,
+};
 
 pub(super) async fn list_models(
     repository: &HttpChatCompletionRepository,
@@ -35,8 +35,7 @@ pub(super) async fn list_models_with_path(
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
     let response =
-        HttpChatCompletionRepository::send_checked(request, provider_name, "Failed to list models")
-            .await?;
+        provider_response::send_checked(request, provider_name, "Failed to list models").await?;
 
     read_upstream_json_body(provider_name, "list_models", response).await
 }
@@ -61,12 +60,9 @@ pub(super) async fn generate(
     let request = HttpChatCompletionRepository::apply_extra_headers(request, &config.extra_headers);
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
-    let response = HttpChatCompletionRepository::send_checked(
-        request,
-        provider_name,
-        "Generation request failed",
-    )
-    .await?;
+    let response =
+        provider_response::send_checked(request, provider_name, "Generation request failed")
+            .await?;
 
     let mut body = read_upstream_json_body(provider_name, "generate", response).await?;
     if let Some(choices) = body.get_mut("choices").and_then(Value::as_array_mut) {
@@ -91,8 +87,8 @@ pub(super) async fn generate_stream(
     endpoint_path: &str,
     payload: &Value,
     provider_name: &str,
-    sender: ChatCompletionStreamSender,
-    cancel: ChatCompletionCancelReceiver,
+    sender: GenerationStreamSender,
+    cancel: GenerationCancelReceiver,
 ) -> Result<(), DomainError> {
     let response =
         send_stream_request(repository, config, endpoint_path, payload, provider_name).await?;
@@ -112,8 +108,7 @@ pub(super) async fn generate_stream(
         )
         .await
     } else {
-        HttpChatCompletionRepository::stream_sse_response(provider_name, response, sender, cancel)
-            .await
+        provider_response::stream_sse_response(provider_name, response, sender, cancel).await
     }
 }
 
@@ -129,7 +124,7 @@ pub(super) async fn generate_with_deltas(
         send_stream_request(repository, config, endpoint_path, payload, provider_name).await?;
     let mut accumulator = OpenAiChatAccumulator::default();
 
-    HttpChatCompletionRepository::consume_sse_response(provider_name, response, |event| {
+    provider_response::consume_sse_response(provider_name, response, |event| {
         accumulator.apply_event(event, on_delta)
     })
     .await?;
@@ -157,8 +152,7 @@ async fn send_stream_request(
     let request = HttpChatCompletionRepository::apply_extra_headers(request, &config.extra_headers);
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
-    HttpChatCompletionRepository::send_checked(request, provider_name, "Generation request failed")
-        .await
+    provider_response::send_checked(request, provider_name, "Generation request failed").await
 }
 
 #[derive(Default)]

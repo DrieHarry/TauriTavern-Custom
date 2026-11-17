@@ -2,12 +2,11 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{Value, json};
 
 use tt_domain::errors::DomainError;
-use tt_ports::repositories::chat_completion_repository::{
-    ChatCompletionApiConfig, ChatCompletionCancelReceiver, ChatCompletionStreamSender,
-};
+use tt_ports::generation_stream::{GenerationCancelReceiver, GenerationStreamSender};
+use tt_ports::repositories::chat_completion_repository::ChatCompletionApiConfig;
 
 use super::HttpChatCompletionRepository;
-use super::response_body::read_upstream_json_body;
+use crate::provider_response::{self, read_upstream_json_body};
 
 pub(super) async fn list_models(
     repository: &HttpChatCompletionRepository,
@@ -22,8 +21,7 @@ pub(super) async fn list_models(
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
     let response =
-        HttpChatCompletionRepository::send_checked(request, "Cohere", "Failed to list models")
-            .await?;
+        provider_response::send_checked(request, "Cohere", "Failed to list models").await?;
 
     let body = read_upstream_json_body("Cohere", "list_models", response).await?;
 
@@ -51,8 +49,7 @@ pub(super) async fn generate(
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
     let response =
-        HttpChatCompletionRepository::send_checked(request, "Cohere", "Generation request failed")
-            .await?;
+        provider_response::send_checked(request, "Cohere", "Generation request failed").await?;
 
     read_upstream_json_body("Cohere", "generate", response).await
 }
@@ -62,8 +59,8 @@ pub(super) async fn generate_stream(
     config: &ChatCompletionApiConfig,
     endpoint_path: &str,
     payload: &Value,
-    sender: ChatCompletionStreamSender,
-    cancel: ChatCompletionCancelReceiver,
+    sender: GenerationStreamSender,
+    cancel: GenerationCancelReceiver,
 ) -> Result<(), DomainError> {
     let endpoint_path = normalize_endpoint_path(endpoint_path);
     let url = HttpChatCompletionRepository::build_url(&config.base_url, endpoint_path)?;
@@ -80,10 +77,9 @@ pub(super) async fn generate_stream(
     let request = HttpChatCompletionRepository::apply_additional_headers(request, config);
 
     let response =
-        HttpChatCompletionRepository::send_checked(request, "Cohere", "Generation request failed")
-            .await?;
+        provider_response::send_checked(request, "Cohere", "Generation request failed").await?;
 
-    HttpChatCompletionRepository::stream_sse_response("Cohere", response, sender, cancel).await
+    provider_response::stream_sse_response("Cohere", response, sender, cancel).await
 }
 
 fn normalize_endpoint_path(endpoint_path: &str) -> &str {
