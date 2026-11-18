@@ -17,7 +17,7 @@ These are TauriTavern's own documents, from the same source revision as this app
 - `references/API/Macros.md` — Macros through `SillyTavern.getContext().macros`: registering macros and evaluating text against the live context or a captured one.
 - `references/API/ChatSurface.md` — ChatSurface: how chat messages are rendered and virtualized, the renderer participants that JS-Slash-Runner and LittleWhiteBox register, and its errors and events.
 - `references/API/Layout.md` — `api.layout`: the content viewport, system bar areas, and screen capture.
-- `references/API/Extension.md` — `api.extension.store`: the key-value and blob storage extensions use for their data.
+- `references/API/Extension.md` — `api.extension.store`: the key-value and blob storage extensions use for their data; the limits of WebView localStorage and IndexedDB, and where users review and clear them.
 - `references/API/Migration.md` — How an extension can use TauriTavern's optional chat APIs (finding the last message, search, storage, history) instead of scanning `getContext().chat`.
 - `references/API/LlmConnections.md` — `api.llmConnections`: saved model connections that Agent profiles and Model Targets refer to.
 - `references/API/Agent.md` — The Agent API: runs, Sessions, run history, profiles, tool catalogs, and registering extension tools.
@@ -34,6 +34,7 @@ These are TauriTavern's own documents, from the same source revision as this app
 
 - `references/CurrentState/NativeApiFormats.md` — How chat completion payloads and responses translate to provider-native formats (Responses, Claude, Gemini).
 - `references/CurrentState/TextCompletion.md` — Text completion for local backends: supported backend types, routes, prompt/stream handling, error shapes, cancellation and iOS policy.
+- `references/CurrentState/Horde.md` — AI Horde, the crowdsourced network used as a main API: routes, host-side task polling, cancellation, error shapes and iOS policy.
 - `references/CurrentState/ThirdPartyExtensions.md` — Third-party extensions: install and update rules, local and global folders and which wins, supported compatibility, what is not supported (such as server plugins), and regression checks.
 - `references/CurrentState/EmbeddedRuntime.md` — The embedded runtime that manages message iframes for JS-Slash-Runner and LittleWhiteBox: its modes, how it runs, and how to debug it.
 - `references/CurrentState/LoggingObservability.md` — Where logs go, how errors reach the user as notifications, and the developer observability tools.

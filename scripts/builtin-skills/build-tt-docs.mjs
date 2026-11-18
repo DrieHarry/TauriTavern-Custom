@@ -20,7 +20,7 @@ const GROUPS = [
             ['API/Macros.md', 'Macros through `SillyTavern.getContext().macros`: registering macros and evaluating text against the live context or a captured one.'],
             ['API/ChatSurface.md', 'ChatSurface: how chat messages are rendered and virtualized, the renderer participants that JS-Slash-Runner and LittleWhiteBox register, and its errors and events.'],
             ['API/Layout.md', '`api.layout`: the content viewport, system bar areas, and screen capture.'],
-            ['API/Extension.md', '`api.extension.store`: the key-value and blob storage extensions use for their data.'],
+            ['API/Extension.md', '`api.extension.store`: the key-value and blob storage extensions use for their data; the limits of WebView localStorage and IndexedDB, and where users review and clear them.'],
             ['API/Migration.md', 'How an extension can use TauriTavern\'s optional chat APIs (finding the last message, search, storage, history) instead of scanning `getContext().chat`.'],
             ['API/LlmConnections.md', '`api.llmConnections`: saved model connections that Agent profiles and Model Targets refer to.'],
             ['API/Agent.md', 'The Agent API: runs, Sessions, run history, profiles, tool catalogs, and registering extension tools.'],
@@ -41,6 +41,7 @@ const GROUPS = [
         documents: [
             ['CurrentState/NativeApiFormats.md', 'How chat completion payloads and responses translate to provider-native formats (Responses, Claude, Gemini).'],
             ['CurrentState/TextCompletion.md', 'Text completion for local backends: supported backend types, routes, prompt/stream handling, error shapes, cancellation and iOS policy.'],
+            ['CurrentState/Horde.md', 'AI Horde, the crowdsourced network used as a main API: routes, host-side task polling, cancellation, error shapes and iOS policy.'],
             ['CurrentState/ThirdPartyExtensions.md', 'Third-party extensions: install and update rules, local and global folders and which wins, supported compatibility, what is not supported (such as server plugins), and regression checks.'],
             ['CurrentState/EmbeddedRuntime.md', 'The embedded runtime that manages message iframes for JS-Slash-Runner and LittleWhiteBox: its modes, how it runs, and how to debug it.'],
             ['CurrentState/LoggingObservability.md', 'Where logs go, how errors reach the user as notifications, and the developer observability tools.'],
