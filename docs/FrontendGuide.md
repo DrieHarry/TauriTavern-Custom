@@ -190,6 +190,7 @@ src/
 - 结构 reconcile 与纯 range projection 分离：前者只在 canonical `chat[]` 结构改变时 O(N) 执行，后者携带 epoch/revision token 并保持 O(M)。
 - mount lease 与 content lease 分离；streaming 中间帧只提交内容，最终帧才恢复 decorator/runtime。
 - streaming 中间帧（含思考中的 reasoning）按顶层块格式化和写入：regex 仍作用于整条文本，切块见 [message-blocks.js](../src/scripts/tauri/message/message-blocks.js)；未变的块沿用 HTML 与节点，变化的块原地 morph。最终帧用 `messageFormatting` 整体写入。
+- 聊天中的流式预览只有一条路径：普通流式与 Agent 实时写入共用 `createStreamingMesTextWriter()`、补齐未闭合标记的 `balanceStreamingMarkup()`，停止串每次生成只算一次。刷新不超过 `streaming_fps`；由推送驱动的预览（Agent 实时写入、Agent Timeline）用 `createStreamingRenderScheduler()` 按同一间隔排到下一帧。
 - `chat_virtualization_enabled=false` 是默认值并保持上游 Show More 语义；TauriTavern Settings 的“聊天 DOM 虚拟化”开关直接绑定这个布尔值并在保存后 reload。用户显式开启后，experimental bounded 使用 TanStack 几何提交 `V ∪ T`，true tail 常驻且 `.mes` 上界为 `32 + 1`。
 - TanStack symbols 由 `lib.js` vendor facade 在 composition root 注入单一 adapter；原生 ESM 源码不直接解析 bare package。virtualizer 的 `scrollToFn` 也注入既有 ChatScrollAdapter，因此 `#chat` 的物理滚动写入仍只有一个 owner。
 - bounded 的 runtime candidate 由独立 grant lease 管理；viewport 滚动可以 revoke/re-grant，而不会伪造 content commit 或消息业务事件。
@@ -238,6 +239,7 @@ src/
   - 不要为了绕开 `:has()` 改用已知类名的白名单，扩展插入的控件会漏掉。
 - 兄弟组合子不要以 `*` 或纯伪类结尾、左侧又没有特征（如 `* + *`），否则 `body` 的子元素一有增删，整个 `body` 都要重算。`> * + *` 写成 `> :not(:first-child)`。
 - WebKit 中，`:has()` 后面接兄弟组合子、参数又检查状态伪类时（如 `#a:has(#b:checked) ~ #c`），页面上任何该状态的变化都会引起整页重查。改写成后代关系：`#共同父元素:has(#b:checked) #c`。
+- 运行中的 CSS 动画让合成器每帧出图，`steps()` 只减少取值变化，不减少帧数。长时间显示的循环指示改由低频节拍切换属性，帧数随节拍；节拍只在元素可见且未要求减少动态时运行。
 - 成批出现的控件不要成为滚动容器，每个可见的滚动容器都会增加每一帧的合成成本。世界书标题因此按内容自适应高度，设为 `overflow: hidden`。
 - WebKit 有两种情况会重算整个文档的样式：内存占用较高时（macOS 上约 1.5 GB 以上）每 30 s 一次，以及每次打开、关闭模态 `<dialog>`。成本随渲染树里的元素数增长；原生下拉框还要重新测量选项文字，含 U+FE0F（emoji 表现选择符）的文字尤其慢。所以成批出现的下拉框，选项文字不带 U+FE0F；长列表里远离可见区域的行，不留在渲染树里。
 - 长列表的条目用 `content-visibility: auto`，并按实际高度给出 `contain-intrinsic-block-size`。WebKit 的 `content-visibility` 不省样式计算，所以世界书还会让远离可见区域的条目休眠：由 `IntersectionObserver` 判断远近，休眠条目设为 `content-visibility: hidden`，标题栏 `display: none`。休眠要守住两点：
