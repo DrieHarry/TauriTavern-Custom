@@ -4,6 +4,7 @@ version = "2.4.0"
 description = "SillyTavern backend rebuilt with Tauri and Rust"
 authors = ["TauriTavern Team"]
 edition = "2024"
+rust-version.workspace = true
 default-run = "tauritavern"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -57,7 +58,6 @@ url = { workspace = true }
 percent-encoding = "2"
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 mime_guess = "2.0.5"
-filetime = "0.2"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 dunce = "1"
 rayon = "1.10"
@@ -87,6 +87,7 @@ ttsync-core = { workspace = true }
 [dev-dependencies]
 tt-application = { path = "../tt-application", features = ["test-support"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -125,8 +126,8 @@ block2 = "0.6.2"
 dispatch2 = "0.3.1"
 objc2-background-tasks = "0.3.2"
 objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["std", "UTType"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSError", "NSFileManager", "NSData", "NSGeometry", "objc2-core-foundation", "NSItemProvider", "NSString", "NSURL"] }
-objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-core-foundation", "objc2-uniform-type-identifiers", "NSLayoutAnchor", "NSLayoutConstraint", "UIKeyboardLayoutGuide", "UILayoutGuide", "UITrackingLayoutGuide", "UIColor", "UIImage", "UIImageView", "UIScreen", "UIActivity", "UIActivityItemsConfiguration", "UIActivityItemsConfigurationReading", "UIActivityViewController", "UIAlertController", "UIApplication", "UIControl", "UIDocumentPickerViewController", "UIPopoverPresentationController", "UIPresentationController", "UIResponder", "UIScrollView", "UIGestureRecognizer", "UIPanGestureRecognizer", "UITextField", "UIView", "UIViewController", "UIWindow", "UIGeometry", "UIAccessibility", "UIAction", "UIButton", "UIButtonConfiguration", "UICornerConfiguration", "UIGlassEffect", "UIImageConfiguration", "UIImageSymbolConfiguration", "UIInteraction", "UIInterface", "UILargeContentViewer", "UIMenuElement", "UIStackView", "UITraitCollection", "UIViewLayoutRegion", "UIVisualEffect", "UIVisualEffectView"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSError", "NSData", "NSGeometry", "objc2-core-foundation", "NSProgress", "NSString", "NSURL"] }
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-core-foundation", "objc2-uniform-type-identifiers", "NSLayoutAnchor", "NSLayoutConstraint", "UIKeyboardLayoutGuide", "UILayoutGuide", "UITrackingLayoutGuide", "UIColor", "UIImage", "UIImageView", "UIScreen", "UIActivity", "UIActivityViewController", "UIAlertController", "UIApplication", "UIControl", "UIDocumentPickerViewController", "UIPopoverPresentationController", "UIPresentationController", "UIResponder", "UIScrollView", "UIGestureRecognizer", "UIPanGestureRecognizer", "UITextField", "UIView", "UIViewController", "UIWindow", "UIGeometry", "UIAccessibility", "UIAction", "UIButton", "UIButtonConfiguration", "UICornerConfiguration", "UIGlassEffect", "UIImageConfiguration", "UIImageSymbolConfiguration", "UIInteraction", "UIInterface", "UILargeContentViewer", "UIMenuElement", "UIStackView", "UITraitCollection", "UIViewLayoutRegion", "UIVisualEffect", "UIVisualEffectView"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

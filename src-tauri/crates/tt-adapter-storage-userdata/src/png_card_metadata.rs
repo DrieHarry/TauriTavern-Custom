@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use image::ImageFormat;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(test)]
 use tt_adapter_storage_core::png_metadata::write_chunk;
 #[cfg(test)]
@@ -14,8 +14,8 @@ use tt_adapter_storage_core::png_metadata::{
 };
 pub use tt_adapter_storage_core::png_metadata::{TextChunk, read_text_chunks_from_png};
 use tt_domain::errors::DomainError;
+use tt_ports::avatar_images::AvatarImageProcessor;
 use tt_ports::external_import::CharacterCardEmbedder;
-use tt_ports::repositories::character_repository::ImageCrop;
 
 /// PNG text keys used for character data.
 const CHUNK_NAME_V2: &str = "chara";
@@ -80,7 +80,15 @@ pub(crate) fn is_png_bytes(image_data: &[u8]) -> bool {
     image_data.starts_with(&PNG_SIGNATURE)
 }
 
-pub struct PngCharacterCardEmbedder;
+pub struct PngCharacterCardEmbedder {
+    avatar_images: Arc<dyn AvatarImageProcessor>,
+}
+
+impl PngCharacterCardEmbedder {
+    pub fn new(avatar_images: Arc<dyn AvatarImageProcessor>) -> Self {
+        Self { avatar_images }
+    }
+}
 
 #[async_trait]
 impl CharacterCardEmbedder for PngCharacterCardEmbedder {
@@ -88,81 +96,12 @@ impl CharacterCardEmbedder for PngCharacterCardEmbedder {
         let image_data = tokio::fs::read(image).await.map_err(|error| {
             DomainError::InternalError(format!("Failed to read card image: {error}"))
         })?;
-        let png = if is_png_bytes(&image_data) {
-            image_data
-        } else {
-            process_avatar_image(image_data, None).await?
-        };
+        let png = self.avatar_images.process(image_data, None).await?;
         let card = write_character_data_to_png(&png, card_json)?;
         tokio::fs::write(image, card).await.map_err(|error| {
             DomainError::InternalError(format!("Failed to write character card: {error}"))
         })
     }
-}
-
-/// Process an image for use as a character avatar.
-pub async fn process_avatar_image(
-    image_data: Vec<u8>,
-    crop: Option<ImageCrop>,
-) -> Result<Vec<u8>, DomainError> {
-    tracing::debug!("Processing avatar image");
-
-    tokio::task::spawn_blocking(move || process_avatar_image_sync(&image_data, crop))
-        .await
-        .map_err(|error| {
-            DomainError::InternalError(format!("Failed to join avatar image processor: {}", error))
-        })?
-}
-
-fn process_avatar_image_sync(
-    image_data: &[u8],
-    crop: Option<ImageCrop>,
-) -> Result<Vec<u8>, DomainError> {
-    // Load the image
-    let mut img = image::load_from_memory(image_data)
-        .map_err(|e| DomainError::InvalidData(format!("Failed to load image: {}", e)))?;
-
-    // Apply crop if defined
-    if let Some(crop_params) = crop {
-        if crop_params.x >= 0
-            && crop_params.y >= 0
-            && crop_params.width > 0
-            && crop_params.height > 0
-            && (crop_params.x as u32 + crop_params.width as u32) <= img.width()
-            && (crop_params.y as u32 + crop_params.height as u32) <= img.height()
-        {
-            img = img.crop(
-                crop_params.x as u32,
-                crop_params.y as u32,
-                crop_params.width as u32,
-                crop_params.height as u32,
-            );
-
-            // Apply standard resize if requested
-            if crop_params.want_resize {
-                // Use the standard avatar dimensions from SillyTavern
-                const AVATAR_WIDTH: u32 = 400;
-                const AVATAR_HEIGHT: u32 = 600;
-
-                img = img.resize_to_fill(
-                    AVATAR_WIDTH,
-                    AVATAR_HEIGHT,
-                    image::imageops::FilterType::Lanczos3,
-                );
-            }
-        } else {
-            tracing::warn!("Invalid crop parameters, ignoring crop");
-        }
-    }
-
-    // Convert to PNG
-    let mut output = Vec::new();
-    let mut cursor = Cursor::new(&mut output);
-
-    img.write_to(&mut cursor, ImageFormat::Png)
-        .map_err(|e| DomainError::InternalError(format!("Failed to write PNG image: {}", e)))?;
-
-    Ok(output)
 }
 
 fn encode_base64(data: &str) -> String {
@@ -213,9 +152,9 @@ mod tests {
     };
     use flate2::{Compression, write::ZlibEncoder};
     use image::{DynamicImage, ImageFormat, RgbaImage};
-    use rand::random;
     use serde_json::Value;
     use std::io::{Cursor, Write};
+    use std::path::Path;
     use tokio::fs;
 
     fn build_minimal_png() -> Vec<u8> {
@@ -228,14 +167,14 @@ mod tests {
         output
     }
 
-    async fn read_streamed_temp(png: &[u8]) -> Result<String, tt_domain::errors::DomainError> {
-        let path =
-            std::env::temp_dir().join(format!("tauritavern-png-stream-{}.png", random::<u64>()));
+    async fn read_streamed_temp(
+        dir: &Path,
+        png: &[u8],
+    ) -> Result<String, tt_domain::errors::DomainError> {
+        let path = dir.join("card.png");
 
         fs::write(&path, png).await.expect("write png");
-        let result = read_character_data_from_png_file(&path).await;
-        let _ = fs::remove_file(&path).await;
-        result
+        read_character_data_from_png_file(&path).await
     }
 
     fn inject_raw_chunks_before_iend(base_png: &[u8], raw_chunks: &[Vec<u8>]) -> Vec<u8> {
@@ -296,13 +235,16 @@ mod tests {
         let base_png = build_minimal_png();
         let json = r#"{"spec":"chara_card_v3","spec_version":"3.0","name":"Streamed"}"#;
         let encoded = encode_base64(json);
+        let temp = tempfile::tempdir().expect("create temp dir");
 
         for chunk in [
             build_ztxt_chunk("ccv3", &encoded),
             build_itxt_chunk("ccv3", &encoded),
         ] {
             let png = inject_raw_chunks_before_iend(&base_png, &[chunk]);
-            let streamed = read_streamed_temp(&png).await.expect("stream metadata");
+            let streamed = read_streamed_temp(temp.path(), &png)
+                .await
+                .expect("stream metadata");
             assert_eq!(streamed, json);
         }
     }
@@ -315,7 +257,8 @@ mod tests {
         let mut broken = Vec::new();
         write_chunk(&mut broken, CHUNK_TYPE_ZTXT, b"chara\0\0broken");
         let png = inject_raw_chunks_before_iend(&build_minimal_png(), &[preferred, broken]);
-        assert_eq!(read_streamed_temp(&png).await.unwrap(), json);
+        let temp = tempfile::tempdir().expect("create temp dir");
+        assert_eq!(read_streamed_temp(temp.path(), &png).await.unwrap(), json);
     }
 
     #[tokio::test]
@@ -325,7 +268,8 @@ mod tests {
         png.extend_from_slice(b"IDAT");
         png.extend_from_slice(&[1, 2]);
 
-        let error = read_streamed_temp(&png)
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let error = read_streamed_temp(temp.path(), &png)
             .await
             .expect_err("truncated chunk should fail");
         assert!(error.to_string().contains("truncated PNG chunk"), "{error}");

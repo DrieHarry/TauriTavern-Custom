@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 use tokio::fs;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use tt_adapter_http::HttpClientPool;
 use tt_adapter_storage_core::chat_directory_identity::new_shared_chat_alias_store_for_user_dir;
@@ -108,13 +107,6 @@ struct AgentRuntimeFixture {
     extension_tools: Arc<crate::infrastructure::agent_extension_tools::AgentExtensionTools>,
 }
 
-fn temp_root(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "tauritavern-contract-{label}-{}",
-        Uuid::new_v4().simple()
-    ))
-}
-
 async fn character_service(root: &Path) -> CharacterService {
     character_service_with_world_repository(root).await.0
 }
@@ -146,6 +138,7 @@ async fn character_service_with_world_repository(
         default_user.join("characters"),
         default_user.join("chats"),
         default_avatar,
+        Arc::new(tt_adapter_media::MediaAvatarImageProcessor),
         aliases,
         file_chat_repository.clone(),
     ));

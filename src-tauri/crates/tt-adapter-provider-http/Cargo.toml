@@ -2,6 +2,7 @@
 name = "tt-adapter-provider-http"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 publish = false
 
 [dependencies]
@@ -27,3 +28,4 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 http = "1"
+tempfile = { workspace = true }

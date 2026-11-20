@@ -1320,9 +1320,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.2"
+version = "1.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
 dependencies = [
  "cfg-if",
 ]
@@ -4682,9 +4682,9 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "11.0.0"
+version = "11.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
+checksum = "e75fe14a82d81e5f5af639997db37d8b96045938a7ac6ab18cdbe1c7467e05e1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -5015,9 +5015,9 @@ dependencies = [
 
 [[package]]
 name = "mdns-sd"
-version = "0.21.6"
+version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8562654710f72a9cbce4b0d5b7c366a2f94330ba1ce3740f15e932ea2d37b161"
+checksum = "e6743ed743ff2bada2b8651ef298d3f98addb0b74844f19cdd57137d8bd0219e"
 dependencies = [
  "fastrand",
  "flume",
@@ -5901,12 +5901,6 @@ name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
-
-[[package]]
-name = "path-clean"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17359afc20d7ab31fdb42bb844c8b3bb1dabd7dcf7e68428492da7f16966fcef"
 
 [[package]]
 name = "pem"
@@ -8621,7 +8615,6 @@ dependencies = [
  "chrono",
  "dispatch2",
  "dunce",
- "filetime",
  "image",
  "jni 0.21.1",
  "libc",
@@ -8650,6 +8643,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-window-state",
  "tauri-winrt-notification",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -9228,9 +9222,9 @@ dependencies = [
  "base64 0.23.1",
  "encoding_rs",
  "flate2",
- "rand 0.10.3",
  "serde_json",
  "tar",
+ "tempfile",
  "tracing",
  "tt-contracts",
  "tt-domain",
@@ -9247,10 +9241,10 @@ dependencies = [
  "async-trait",
  "gix",
  "gix-transport",
- "rand 0.10.3",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tt-adapter-http",
@@ -9325,6 +9319,7 @@ dependencies = [
  "image",
  "mime_guess",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tt-adapter-storage-core",
@@ -9350,6 +9345,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -9373,11 +9369,11 @@ dependencies = [
  "icu_locale_core",
  "indexmap 2.14.2",
  "percent-encoding",
- "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "sys-locale",
+ "tempfile",
  "tokio",
  "tracing",
  "tt-contracts",
@@ -9394,15 +9390,14 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "chrono",
- "crc32fast",
  "flate2",
  "image",
  "memchr",
  "mime_guess",
- "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tempfile",
  "tokio",
  "tracing",
  "tt-adapter-storage-core",
@@ -9433,6 +9428,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tt-contracts",
@@ -9457,6 +9453,7 @@ dependencies = [
  "miktik",
  "serde_json",
  "sha2 0.11.1",
+ "tempfile",
  "tokio",
  "tracing",
  "tt-adapter-http",
@@ -9490,11 +9487,11 @@ dependencies = [
  "redb",
  "serde_json",
  "sha2 0.11.1",
+ "tempfile",
  "tokenizers",
  "tokio",
  "tt-domain",
  "tt-ports",
- "uuid",
 ]
 
 [[package]]
@@ -9503,7 +9500,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bashkit",
- "path-clean",
  "rquickjs",
  "serde_json",
  "tokio",
