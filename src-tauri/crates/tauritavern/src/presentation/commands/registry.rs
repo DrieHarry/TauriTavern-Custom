@@ -143,6 +143,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::dev_logging_commands::devlog_set_llm_api_log_stream_enabled,
         super::dev_logging_commands::devlog_get_llm_api_log_index,
         super::dev_logging_commands::devlog_get_llm_api_log_preview,
+        super::dev_logging_commands::devlog_get_llm_api_log_view,
         super::dev_logging_commands::devlog_get_llm_api_log_raw,
         // World info commands
         super::world_info_commands::list_world_info,
@@ -394,6 +395,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::chat_completion_commands::get_chat_completions_status,
         super::chat_completion_commands::generate_chat_completion,
         super::chat_completion_commands::start_chat_completion_stream,
+        super::chat_completion_commands::preview_chat_completion_request,
         // Text completion commands
         super::text_completion_commands::get_text_completions_status,
         super::text_completion_commands::get_text_completions_props,
