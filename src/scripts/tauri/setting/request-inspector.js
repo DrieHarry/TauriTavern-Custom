@@ -10,6 +10,27 @@ const STYLE_ID = 'tauritavern-request-inspector-style';
 const POPUP_CLASS = 'tt-request-inspector-popup';
 const PREVIEW_BUTTON_SELECTOR = '.tt-request-preview-button';
 
+/**
+ * The last preview and the one before it that differed. They outlive the popup:
+ * a preset is edited with the popup closed, and the comparison is across that edit.
+ */
+const previews = { latest: null, earlier: null };
+
+async function assemblePreview(dev) {
+    const preview = await dev.requestInspector.preview();
+    const { latest } = previews;
+    if (latest && latest.requestRaw !== preview.requestRaw) {
+        previews.earlier = latest.kept;
+    }
+    const { requestRaw, view, promptSources, toolSources, promptNames, chatHistory } = preview;
+    const timestampMs = Date.now();
+    previews.latest = {
+        requestRaw,
+        kept: { view, promptSources, toolSources, promptNames, chatHistory, timestampMs },
+    };
+    return { preview, timestampMs, earlier: previews.earlier };
+}
+
 function ensureStyle() {
     if (document.getElementById(STYLE_ID)) {
         return;
@@ -52,7 +73,7 @@ export async function openRequestInspector({ select }) {
             getRaw: (id) => dev.llmApiLogs.getRaw(id),
             subscribeIndex: (handler) => dev.llmApiLogs.subscribeIndex(handler),
             setKeep: (value) => dev.llmApiLogs.setKeep(value),
-            preview: () => dev.requestInspector.preview(),
+            preview: () => assemblePreview(dev),
         },
         actions: {
             copyText: (text) => runTaskOrPopup(async () => {
@@ -70,8 +91,6 @@ export async function openRequestInspector({ select }) {
     const popup = createTauriTavernPanelPopup(mount, POPUP_TYPE.TEXT, '', {
         okButton: translate('Close'),
         allowVerticalScrolling: false,
-        wide: true,
-        large: true,
     });
     popup.dlg.classList.add(POPUP_CLASS);
     try {
