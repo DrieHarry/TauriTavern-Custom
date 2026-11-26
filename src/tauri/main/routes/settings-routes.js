@@ -73,8 +73,8 @@ export function registerSettingsRoutes(router, context, { jsonResponse }) {
 
     router.post('/api/settings/load-snapshot', async ({ body }) => {
         const name = body?.name || '';
-        const snapshot = await context.safeInvoke('load_settings_snapshot', { name });
-        return jsonResponse(snapshot?.data || snapshot || {});
+        const bytes = await context.safeInvoke('load_settings_snapshot', { name });
+        return new Response(bytes, { headers: { 'Content-Type': 'application/json' } });
     });
 
     router.post('/api/settings/restore-snapshot', async ({ body }) => {
@@ -152,7 +152,7 @@ export function registerSettingsRoutes(router, context, { jsonResponse }) {
             dto: {
                 name: body?.name || '',
                 apiId: body?.apiId || '',
-                preset: body?.preset || {},
+                preset_json: JSON.stringify(body?.preset ?? null),
             },
         });
 
