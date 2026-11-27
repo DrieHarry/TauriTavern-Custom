@@ -31,7 +31,7 @@ import {
 } from '../script.js';
 import { getGroupNames, selected_group } from './group-chats.js';
 import { extension_prompt_roles, extension_prompt_types } from './extension-prompts.js';
-import { allowlistSettingAllows, getActiveIosPolicyCapabilities } from './tauritavern/ios-policy.js';
+import { chatCompletionSources } from '../tauri/main/adapters/st/host-availability.js';
 import { projectToolTurns } from './tauritavern/tool-turn-projection.js';
 import { canReplayProviderMetadata, getChatCompletionRequestContext } from './tauritavern/provider-replay.js';
 import { applyParamOmissions, getEffectiveGenerationSettings } from './tauri/generation-params/omission.js';
@@ -82,6 +82,7 @@ import {
 } from './utils.js';
 import { countOpenAIMessageTokensBatchAsync, getTokenizerModel } from './tokenizers.js';
 import { getOpenAIConversationTokenCount } from './util/openai-token-count.js';
+import { modelAcceptsImages } from './util/model-image-input.js';
 import { isMobile } from './RossAscends-mods.js';
 import { saveLogprobsForActiveMessage } from './logprobs.js';
 import { SlashCommandParser } from './slash-commands/SlashCommandParser.js';
@@ -96,7 +97,7 @@ import { ToolManager } from './tool-calling.js';
 import { accountStorage } from './util/AccountStorage.js';
 import { COMETAPI_IGNORE_PATTERNS, IGNORE_SYMBOL, MEDIA_DISPLAY, MEDIA_TYPE } from './constants.js';
 import { macros } from './macros/macro-system.js';
-import { syncNanoGptProvidersForModel, syncOpenRouterProvidersForModel, updateNanoGptProvidersWarning, updateOpenRouterProvidersWarning } from './textgen-models.js';
+import { applySavedModelProviders, syncModelProviders, updateModelProvidersWarning } from './textgen-models.js';
 
 export {
     openai_messages_count,
@@ -3051,7 +3052,7 @@ function getElectronHubModelTemplate(option) {
     const outputPrice = model.pricing?.output;
     const price = inputPrice && outputPrice ? `$${inputPrice}/$${outputPrice} in/out Mtoken` : 'Unknown';
 
-    const visionIcon = model.metadata?.vision ? '<i class="fa-solid fa-eye fa-sm" title="This model supports vision"></i>' : '';
+    const visionIcon = modelAcceptsImages(chat_completion_sources.ELECTRONHUB, model) ? '<i class="fa-solid fa-eye fa-sm" title="This model supports vision"></i>' : '';
     const reasoningIcon = model.metadata?.reasoning ? '<i class="fa-solid fa-brain fa-sm" title="This model supports reasoning"></i>' : '';
     const toolCallsIcon = model.metadata?.function_call ? '<i class="fa-solid fa-wrench fa-sm" title="This model supports function tools"></i>' : '';
     const premiumIcon = model?.premium_model ? '<i class="fa-solid fa-crown fa-sm" title="This model requires a subscription"></i>' : '';
@@ -3114,7 +3115,7 @@ function getChutesModelTemplate(option) {
     }
 
     const contextLength = model.context_length || model.max_model_len || 'Unknown';
-    const visionIcon = model.input_modalities?.includes('image') ? '<i class="fa-solid fa-eye fa-sm" title="This model supports vision"></i>' : '';
+    const visionIcon = modelAcceptsImages(chat_completion_sources.CHUTES, model) ? '<i class="fa-solid fa-eye fa-sm" title="This model supports vision"></i>' : '';
     const reasoningIcon = model.supported_features?.includes('reasoning') ? '<i class="fa-solid fa-brain fa-sm" title="This model supports reasoning"></i>' : '';
     const toolCallsIcon = model.supported_features?.includes('structured_outputs') ? '<i class="fa-solid fa-wrench fa-sm" title="This model supports function tools"></i>' : '';
 
@@ -3903,23 +3904,20 @@ function saveModelList(data) {
 
     if (oai_settings.chat_completion_source === chat_completion_sources.FIREWORKS) {
         $('#model_fireworks_select').empty();
+        model_list.sort((a, b) => (a?.name || a?.id || '').localeCompare(b?.name || b?.id || ''));
         model_list.forEach((model) => {
-            if (!model?.supports_chat) {
-                return;
-            }
             $('#model_fireworks_select').append(
                 $('<option>', {
                     value: model.id,
-                    text: model.id,
+                    text: model.name || model.id,
                 }));
         });
 
-        const chatModels = model_list.filter(model => model?.supports_chat);
         oai_settings.fireworks_model = chooseModelOrCurrentCustom(
             chat_completion_sources.FIREWORKS,
-            chatModels.map(model => model.id),
+            model_list.map(model => model.id),
             oai_settings.fireworks_model,
-            chatModels[0]?.id || '',
+            model_list[0]?.id || '',
         );
 
         setModelSelectValue(chat_completion_sources.FIREWORKS, oai_settings.fireworks_model);
@@ -4304,6 +4302,7 @@ function getReasoningEffort(settings = null, model = null) {
         chat_completion_sources.ELECTRONHUB,
         chat_completion_sources.CHUTES,
         chat_completion_sources.AWS_BEDROCK,
+        chat_completion_sources.FIREWORKS,
     ];
 
     if (!reasoningEffortSources.includes(settings.chat_completion_source)) {
@@ -4322,7 +4321,7 @@ function getReasoningEffort(settings = null, model = null) {
         }
 
         function resolveMaximumReasoningEffort() {
-            if (settings.chat_completion_source === chat_completion_sources.AWS_BEDROCK) {
+            if ([chat_completion_sources.AWS_BEDROCK, chat_completion_sources.FIREWORKS].includes(settings.chat_completion_source)) {
                 return reasoning_effort_types.max;
             }
             return reasoning_effort_types.high;
@@ -5102,7 +5101,7 @@ export function getStreamingReply(data, state, { chatCompletionSource = null, mo
             }
         });
         return data.choices?.[0]?.delta?.content ?? data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text ?? '';
-    } else if ([chat_completion_sources.OPENAI, chat_completion_sources.OPENCODE, chat_completion_sources.CUSTOM, chat_completion_sources.POLLINATIONS, chat_completion_sources.AIMLAPI, chat_completion_sources.MOONSHOT, chat_completion_sources.COMETAPI, chat_completion_sources.ELECTRONHUB, chat_completion_sources.NANOGPT, chat_completion_sources.ZAI, chat_completion_sources.MINIMAX, chat_completion_sources.SILICONFLOW, chat_completion_sources.CHUTES, chat_completion_sources.WORKERS_AI].includes(chat_completion_source)) {
+    } else if ([chat_completion_sources.OPENAI, chat_completion_sources.OPENCODE, chat_completion_sources.CUSTOM, chat_completion_sources.POLLINATIONS, chat_completion_sources.AIMLAPI, chat_completion_sources.MOONSHOT, chat_completion_sources.COMETAPI, chat_completion_sources.ELECTRONHUB, chat_completion_sources.NANOGPT, chat_completion_sources.ZAI, chat_completion_sources.MINIMAX, chat_completion_sources.SILICONFLOW, chat_completion_sources.CHUTES, chat_completion_sources.WORKERS_AI, chat_completion_sources.FIREWORKS].includes(chat_completion_source)) {
         if (show_thoughts) {
             state.reasoning +=
                 data.choices?.filter(x => x?.delta?.reasoning_content)?.[0]?.delta?.reasoning_content ??
@@ -6323,63 +6322,13 @@ function resolveChatCompletionSourceSelectValue(settings) {
 }
 
 function syncChatCompletionSourceSelector() {
-    const value = resolveChatCompletionSourceSelectValue(oai_settings);
+    const requested = resolveChatCompletionSourceSelectValue(oai_settings);
+    const value = chatCompletionSources.resolve(requested);
+    if (value !== requested) {
+        applyChatCompletionSourceSelection(value);
+    }
     $('#chat_completion_source').val(value);
     $('#chat_completion_source').find(`option[value="${CSS.escape(value)}"]`).prop('selected', true);
-}
-
-function normalizeIosPolicyChatCompletionSourceKey(value) {
-    const normalized = String(value || '').trim().toLowerCase();
-    if (normalized.startsWith('custom_')) {
-        return chat_completion_sources.CUSTOM;
-    }
-    return normalized;
-}
-
-function enforceIosPolicyChatCompletionSourceSelector() {
-    const caps = getActiveIosPolicyCapabilities();
-    if (!caps) {
-        return;
-    }
-
-    const select = document.getElementById('chat_completion_source');
-    if (!(select instanceof HTMLSelectElement)) {
-        throw new Error('[TauriTavern][iOSPolicy] Chat completion source selector not found');
-    }
-
-    const allowlist = caps.llm?.chat_completion_sources?.allowlist;
-    const endpointOverridesAllowed = caps.llm?.endpoint_overrides !== false;
-
-    const isAllowed = (value) => {
-        const key = normalizeIosPolicyChatCompletionSourceKey(value);
-        if (!key) {
-            return false;
-        }
-
-        if (!endpointOverridesAllowed && key === chat_completion_sources.CUSTOM) {
-            return false;
-        }
-
-        return allowlistSettingAllows(allowlist, key);
-    };
-
-    const currentValue = String(select.value || '').trim();
-    if (currentValue && isAllowed(currentValue)) {
-        return;
-    }
-
-    const fallback = Array.from(select.options)
-        .map((option) => option.value)
-        .find(isAllowed);
-
-    if (!fallback) {
-        throw new Error('[TauriTavern][iOSPolicy] No allowed chat completion source remains after applying policy');
-    }
-
-    if (fallback !== currentValue) {
-        select.value = fallback;
-        globalThis.toastr?.warning?.('Chat Completion Source was reset due to your iOS policy.');
-    }
 }
 
 function updateCustomEndpointPreview() {
@@ -6511,11 +6460,10 @@ function loadOpenAISettings(data, settings) {
     setToolReasoningControls();
     ToolManager.RECURSE_LIMIT = oai_settings.tool_call_recurse_limit;
 
-    $('#openrouter_providers_chat').trigger('change');
+    applySavedModelProviders('#openrouter_providers_chat', oai_settings.openrouter_providers);
     $('#openrouter_quantizations_chat').trigger('change');
-    $('#nanogpt_provider').trigger('change');
+    applySavedModelProviders('#nanogpt_provider', [oai_settings.nanogpt_provider]);
     syncChatCompletionSourceSelector();
-    enforceIosPolicyChatCompletionSourceSelector();
     applyCustomModelOptionsToAllSources();
     $('#chat_completion_source').trigger('change');
     updateCustomEndpointPreview();
@@ -7234,12 +7182,12 @@ function onSettingsPresetChange() {
 
         // These cannot be changed via preset if unbound to connection
         if (oai_settings.bind_preset_to_connection) {
+            applySavedModelProviders('#openrouter_providers_chat', oai_settings.openrouter_providers);
+            applySavedModelProviders('#nanogpt_provider', [oai_settings.nanogpt_provider]);
             syncChatCompletionSourceSelector();
             applyCustomModelOptionsToAllSources();
             $('#chat_completion_source').trigger('change');
-            $('#openrouter_providers_chat').trigger('change');
             $('#openrouter_quantizations_chat').trigger('change');
-            $('#nanogpt_provider').trigger('change');
         }
 
         $('#openai_logit_bias_preset').trigger('change');
@@ -7702,7 +7650,7 @@ async function onModelChange() {
 
         console.log('OpenRouter model changed to', value);
         oai_settings.openrouter_model = value;
-        syncOpenRouterProvidersForModel(value, '#openrouter_providers_chat');
+        syncModelProviders('#openrouter_providers_chat', value);
     }
 
     if ($(this).is('#model_ai21_select')) {
@@ -7812,7 +7760,7 @@ async function onModelChange() {
 
         console.log('NanoGPT model changed to', value);
         oai_settings.nanogpt_model = value;
-        syncNanoGptProvidersForModel(value, '#nanogpt_provider');
+        syncModelProviders('#nanogpt_provider', value);
     }
 
     if ($(this).is('#model_deepseek_select')) {
@@ -8670,30 +8618,12 @@ export function isImageInliningSupported(settings = oai_settings) {
             return visionSupportedModels.some(model => settings.claude_model.includes(model));
         case chat_completion_sources.DEEPSEEK:
             return ['deepseek-v4-flash-vision-exp', 'deepseek-flash'].includes(settings.deepseek_model);
-        case chat_completion_sources.OPENROUTER:
-            return (Array.isArray(model_list) && model_list.find(m => m.id === settings.openrouter_model)?.architecture?.input_modalities?.includes('image'));
         case chat_completion_sources.CUSTOM:
             return true;
-        case chat_completion_sources.MISTRALAI:
-            return (Array.isArray(model_list) && model_list.find(m => m.id === settings.mistralai_model)?.capabilities?.vision);
         case chat_completion_sources.COHERE:
             return visionSupportedModels.some(model => settings.cohere_model.includes(model));
-        case chat_completion_sources.XAI:
-            return (Array.isArray(model_list) && model_list.find(m => m.id === settings.xai_model)?.input_modalities?.includes('image'));
-        case chat_completion_sources.AIMLAPI:
-            return (Array.isArray(model_list) && model_list.find(m => m.id === settings.aimlapi_model)?.features?.includes('openai/chat-completion.vision'));
-        case chat_completion_sources.CHUTES:
-            return (Array.isArray(model_list) && model_list.find(m => m.id === settings.chutes_model)?.input_modalities?.includes('image'));
-        case chat_completion_sources.ELECTRONHUB:
-            return (Array.isArray(model_list) && model_list.find(m => m.id === settings.electronhub_model)?.metadata?.vision);
-        case chat_completion_sources.POLLINATIONS:
-            return (Array.isArray(model_list) && model_list.find(m => m.id === settings.pollinations_model)?.input_modalities?.includes('image'));
         case chat_completion_sources.COMETAPI:
             return true;
-        case chat_completion_sources.MOONSHOT:
-            return (Array.isArray(model_list) && model_list.find(m => m.id === settings.moonshot_model)?.supports_image_in);
-        case chat_completion_sources.NANOGPT:
-            return (Array.isArray(model_list) && model_list.find(m => m.id === settings.nanogpt_model)?.capabilities?.vision);
         case chat_completion_sources.AWS_BEDROCK:
             return Boolean(getAwsBedrockModelCapabilities(settings.aws_bedrock_model)?.images);
         case chat_completion_sources.ZAI:
@@ -8702,12 +8632,10 @@ export function isImageInliningSupported(settings = oai_settings) {
             return visionSupportedModels.some(model => settings.minimax_model.includes(model));
         case chat_completion_sources.SILICONFLOW:
             return visionSupportedModels.some(model => settings.siliconflow_model.includes(model));
-        case chat_completion_sources.WORKERS_AI: {
-            const model = Array.isArray(model_list) && model_list.find(m => m.id === settings.workers_ai_model);
-            return Boolean(model && Array.isArray(model.properties) && model.properties.some(p => p.property_id === 'vision' && p.value === 'true'));
+        default: {
+            const modelId = getChatCompletionModel(settings);
+            return modelAcceptsImages(settings.chat_completion_source, model_list.find(model => model.id === modelId));
         }
-        default:
-            return false;
     }
 }
 
@@ -9391,7 +9319,6 @@ export function initOpenAI() {
     });
 
     $('#chat_completion_source').on('change', function () {
-        enforceIosPolicyChatCompletionSourceSelector();
         cancelStatusCheck('Chat Completion source changed');
         model_list = [];
         applyChatCompletionSourceSelection(String($(this).find(':selected').val()));
@@ -9456,7 +9383,7 @@ export function initOpenAI() {
 
     $('#openrouter_allow_fallbacks').on('input', function () {
         oai_settings.openrouter_allow_fallbacks = !!$(this).prop('checked');
-        updateOpenRouterProvidersWarning('#openrouter_providers_chat');
+        updateModelProvidersWarning('#openrouter_providers_chat');
         saveSettingsDebounced();
     });
 
@@ -9742,7 +9669,7 @@ export function initOpenAI() {
 
         oai_settings.openrouter_providers = selectedProviders;
 
-        updateOpenRouterProvidersWarning('#openrouter_providers_chat');
+        updateModelProvidersWarning('#openrouter_providers_chat');
         saveSettingsDebounced();
     });
 
@@ -9761,7 +9688,7 @@ export function initOpenAI() {
 
     $('#nanogpt_provider').on('change', function () {
         oai_settings.nanogpt_provider = String($(this).val() || '');
-        updateNanoGptProvidersWarning('#nanogpt_provider');
+        updateModelProvidersWarning('#nanogpt_provider');
         saveSettingsDebounced();
     });
 

@@ -53,6 +53,7 @@ import {
     saveCharacterChatMetadata,
 } from './scripts/chat-payload-transport.js';
 import { getActiveChatSnapshot } from './tauri/main/adapters/st/active-chat-ref.js';
+import { chatCompletionSources, textCompletionTypes } from './tauri/main/adapters/st/host-availability.js';
 import { composeAuthorsNote, extension_prompt_roles, extension_prompt_types, isWorldInfoInjection } from './scripts/extension-prompts.js';
 import {
     ChatInputFocusIntent,
@@ -318,7 +319,7 @@ import {
     tag_import_setting,
     applyCharacterTagsToMessageDivs,
 } from './scripts/tags.js';
-import { checkOpenRouterAuth, initSecrets, primeSecretStateSnapshot, readSecretState, resolveSecretKey, secret_state } from './scripts/secrets.js';
+import { initSecrets, primeSecretStateSnapshot, readSecretState, resolveSecretKey, secret_state } from './scripts/secrets.js';
 import { markdownExclusionExt } from './scripts/showdown-exclusion.js';
 import { markdownUnderscoreExt } from './scripts/showdown-underscore.js';
 import { NOTE_MODULE_NAME, initAuthorsNote, setFloatingPrompt, shouldWIAddPrompt } from './scripts/authors-note.js';
@@ -1226,6 +1227,8 @@ async function firstLoadInit() {
         } else if (window.__TAURITAVERN__ && typeof window.__TAURITAVERN__ === 'object') {
             window.__TAURITAVERN__.iosPolicy = bootstrapMetadata.ios_policy;
         }
+        chatCompletionSources.install(bootstrapMetadata.available_chat_completion_sources);
+        textCompletionTypes.install(bootstrapMetadata.available_text_completion_types);
         applyIosPolicyUiProjection();
         const extensionsEnabled = Boolean(settingsSnapshot?.enable_extensions)
             && settingsSnapshot?.result != 'file not find'
@@ -1251,7 +1254,6 @@ async function firstLoadInit() {
         await initSystemMessages();
         await applySettingsSnapshot(settingsSnapshot);
         void prefetchBackgrounds();
-        await checkOpenRouterAuth();
         syncMobileImmersiveFullscreenUi();
         initKeyboard();
         initDrawers();

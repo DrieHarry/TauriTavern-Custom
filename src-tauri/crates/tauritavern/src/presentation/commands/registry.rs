@@ -168,13 +168,12 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         super::secret_commands::rotate_secret,
         super::secret_commands::rename_secret,
         // Provider metadata commands
+        super::provider_metadata_commands::get_openrouter_providers,
         super::provider_metadata_commands::get_openrouter_model_providers,
         super::provider_metadata_commands::get_openrouter_credits,
+        super::provider_metadata_commands::exchange_openrouter_code,
         super::provider_metadata_commands::get_nanogpt_model_providers,
         super::provider_metadata_commands::get_nanogpt_credits,
-        super::provider_metadata_commands::get_siliconflow_embedding_models,
-        super::provider_metadata_commands::get_workers_ai_embedding_models,
-        super::provider_metadata_commands::get_workers_ai_multimodal_models,
         // LLM connection commands
         super::llm_connection_commands::list_llm_connections,
         super::llm_connection_commands::load_llm_connection,
